@@ -1,0 +1,8 @@
+build/
+vcpkg_installed/
+*.log
+*.exe
+*.pdb
+*.ilk
+compile_commands.json
+.vs/

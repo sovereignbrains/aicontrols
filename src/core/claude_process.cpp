@@ -126,12 +126,15 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     }
     std::wstring cmd = QuoteArg(exe) +
                        L" --output-format stream-json --verbose --input-format stream-json"
-                       L" --permission-prompt-tool stdio --tools \"\" --setting-sources \"\"";
+                       L" --permission-prompt-tool stdio --tools \"\"";
     if (options.includePartial) {
         cmd += L" --include-partial-messages";
     }
     if (!options.model.empty()) {
         cmd += L" --model " + QuoteArg(ToWide(options.model));
+    }
+    if (!options.effort.empty()) {
+        cmd += L" --effort " + QuoteArg(ToWide(options.effort));
     }
     if (!options.resume.empty()) {
         cmd += L" --resume " + QuoteArg(ToWide(options.resume));

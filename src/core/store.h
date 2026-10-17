@@ -1,0 +1,42 @@
+#pragma once
+
+#include <windows.h>
+
+#include <string>
+#include <vector>
+
+namespace aic {
+
+// A chat as claude.exe keeps it: ~\.claude\projects\<workspace>\<id>.jsonl.
+struct SessionInfo {
+    std::string id;
+    std::wstring title;  // the CLI's own title (custom, else the generated one); may be empty
+    FILETIME modified{};
+};
+
+enum class EntryKind { User, Assistant, Tool };
+
+struct TranscriptEntry {
+    EntryKind kind = EntryKind::User;
+    std::wstring text;  // the tool's name for EntryKind::Tool
+};
+
+struct Settings {
+    std::string model;   // a value from the CLI's model list; empty: its default
+    std::string effort;  // low … max; empty: the model's default
+};
+
+// The old SSH Client's workspace while both clients live side by side: Claude's memory and the
+// chat history are keyed by this folder. Falls back to the profile folder.
+std::wstring DefaultWorkspace();
+
+std::vector<SessionInfo> ListSessions(const std::wstring& workspace);  // newest first
+std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);
+// The last `limit` entries of a chat, for showing it again before it is resumed.
+std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
+                                            bool& truncated);
+
+Settings LoadSettings();
+void SaveSettings(const Settings& settings);
+
+}  // namespace aic

@@ -22,6 +22,7 @@ struct ClaudeOptions {
     std::wstring cwd;     // the session's working directory; empty: ours
     std::wstring proxy;   // http://host:port for the CLI's HTTPS; empty: direct
     std::string model;    // empty: the CLI's default
+    std::string effort;   // low … max; empty: the model's default
     std::string resume;   // a session id to continue; empty: a new chat
     bool includePartial = true;  // stream_event deltas while a message is written
 };

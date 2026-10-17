@@ -1,0 +1,274 @@
+#include "core/store.h"
+
+#include <shlobj.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <string_view>
+#include <utility>
+
+#include "core/claude_process.h"
+
+namespace aic {
+namespace {
+
+namespace fs = std::filesystem;
+
+std::wstring KnownFolder(REFKNOWNFOLDERID id) {
+    PWSTR path = nullptr;
+    if (FAILED(SHGetKnownFolderPath(id, 0, nullptr, &path))) {
+        return {};
+    }
+    std::wstring result(path);
+    CoTaskMemFree(path);
+    return result;
+}
+
+// The CLI's folder name for a workspace: every character but [A-Za-z0-9] becomes '-'.
+fs::path ProjectDir(const std::wstring& workspace) {
+    std::wstring name = workspace;
+    for (wchar_t& c : name) {
+        const bool keep = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9');
+        if (!keep) {
+            c = L'-';
+        }
+    }
+    return fs::path(KnownFolder(FOLDERID_Profile)) / L".claude" / L"projects" / name;
+}
+
+fs::path SessionFile(const std::wstring& workspace, const std::string& id) {
+    return ProjectDir(workspace) / (ToWide(id) + L".jsonl");
+}
+
+std::string ReadRange(const fs::path& file, uint64_t offset, uint64_t size) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    in.seekg(static_cast<std::streamoff>(offset));
+    std::string data(static_cast<size_t>(size), '\0');
+    in.read(data.data(), static_cast<std::streamsize>(size));
+    data.resize(static_cast<size_t>(in.gcount()));
+    return data;
+}
+
+template <typename Fn>
+void ForEachLine(std::string_view text, Fn&& fn) {
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        if (end == std::string_view::npos) {
+            end = text.size();
+        }
+        if (end > start) {
+            fn(text.substr(start, end - start));
+        }
+        start = end + 1;
+    }
+}
+
+void ScanTitles(std::string_view text, std::wstring& custom, std::wstring& generated) {
+    ForEachLine(text, [&](std::string_view line) {
+        if (line.find("\"custom-title\"") == std::string_view::npos &&
+            line.find("\"ai-title\"") == std::string_view::npos) {
+            return;
+        }
+        const Json entry = Json::parse(line, nullptr, false);  // a line cut by a chunk edge fails: skipped
+        const std::string type = JsonStr(entry, "type");
+        if (type == "custom-title" && !JsonStr(entry, "customTitle").empty()) {
+            custom = ToWide(JsonStr(entry, "customTitle"));
+        } else if (type == "ai-title" && !JsonStr(entry, "aiTitle").empty()) {
+            generated = ToWide(JsonStr(entry, "aiTitle"));
+        }
+    });
+}
+
+// Titles are appended as the chat goes on, so the latest is near the end; long chats are read
+// only at the head and the tail.
+std::wstring ReadTitle(const fs::path& file, uint64_t size) {
+    constexpr uint64_t kChunk = 512 * 1024;
+    std::wstring custom;
+    std::wstring generated;
+    if (size <= 2 * kChunk) {
+        ScanTitles(ReadRange(file, 0, size), custom, generated);
+    } else {
+        ScanTitles(ReadRange(file, 0, kChunk), custom, generated);
+        ScanTitles(ReadRange(file, size - kChunk, kChunk), custom, generated);
+    }
+    return !custom.empty() ? custom : generated;
+}
+
+uint64_t ToTicks(const FILETIME& time) {
+    return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+}
+
+struct CachedTitle {
+    uint64_t modified = 0;
+    uint64_t size = 0;
+    std::wstring title;
+};
+
+// UI thread only.
+std::wstring CachedReadTitle(const fs::path& file, const WIN32_FILE_ATTRIBUTE_DATA& data) {
+    static std::map<std::wstring, CachedTitle> cache;
+    const uint64_t modified = ToTicks(data.ftLastWriteTime);
+    const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    CachedTitle& entry = cache[file.wstring()];
+    if (entry.modified != modified || entry.size != size) {
+        entry = {modified, size, ReadTitle(file, size)};
+    }
+    return entry.title;
+}
+
+std::wstring TextOf(const Json& content) {
+    if (content.is_string()) {
+        return ToWide(content.get<std::string>());
+    }
+    std::wstring text;
+    if (content.is_array()) {
+        for (const Json& block : content) {
+            if (JsonStr(block, "type") == "text") {
+                if (!text.empty()) {
+                    text += L"\n\n";
+                }
+                text += ToWide(JsonStr(block, "text"));
+            }
+        }
+    }
+    return text;
+}
+
+bool IsTrue(const Json& value) {
+    return value.is_boolean() && value.get<bool>();
+}
+
+fs::path SettingsFile() {
+    return fs::path(KnownFolder(FOLDERID_RoamingAppData)) / L"AIControls" / L"settings.json";
+}
+
+}  // namespace
+
+std::wstring DefaultWorkspace() {
+    const fs::path old = fs::path(KnownFolder(FOLDERID_RoamingAppData)) / L"ssh-desktop-app" / L"claude-workspace";
+    std::error_code error;
+    if (fs::is_directory(old, error)) {
+        return old.wstring();
+    }
+    return KnownFolder(FOLDERID_Profile);
+}
+
+std::vector<SessionInfo> ListSessions(const std::wstring& workspace) {
+    std::vector<SessionInfo> sessions;
+    std::error_code error;
+    for (const fs::directory_entry& item : fs::directory_iterator(ProjectDir(workspace), error)) {
+        if (!item.is_regular_file(error) || item.path().extension() != L".jsonl") {
+            continue;
+        }
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (!GetFileAttributesExW(item.path().c_str(), GetFileExInfoStandard, &data)) {
+            continue;
+        }
+        SessionInfo session;
+        session.id = ToUtf8(item.path().stem().wstring());
+        session.title = CachedReadTitle(item.path(), data);
+        session.modified = data.ftLastWriteTime;
+        sessions.push_back(std::move(session));
+    }
+    std::ranges::sort(sessions, [](const SessionInfo& a, const SessionInfo& b) {
+        return ToTicks(a.modified) > ToTicks(b.modified);
+    });
+    return sessions;
+}
+
+std::wstring SessionTitle(const std::wstring& workspace, const std::string& id) {
+    const fs::path file = SessionFile(workspace, id);
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data)) {
+        return {};
+    }
+    return CachedReadTitle(file, data);
+}
+
+std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
+                                            bool& truncated) {
+    std::vector<TranscriptEntry> entries;
+    const fs::path file = SessionFile(workspace, id);
+    std::error_code error;
+    const uint64_t size = fs::file_size(file, error);
+    if (error) {
+        truncated = false;
+        return entries;
+    }
+    std::string lastAssistant;  // one API message arrives as a line per content block
+    ForEachLine(ReadRange(file, 0, size), [&](std::string_view line) {
+        const Json entry = Json::parse(line, nullptr, false);
+        if (entry.is_discarded() || IsTrue(JsonAt(entry, "isSidechain")) || IsTrue(JsonAt(entry, "isMeta"))) {
+            return;
+        }
+        const std::string type = JsonStr(entry, "type");
+        const Json& message = JsonAt(entry, "message");
+        if (type == "user") {
+            lastAssistant.clear();
+            std::wstring text = TextOf(JsonAt(message, "content"));
+            // Tool results carry no text; "<command-…>" and the like are the CLI's own bookkeeping.
+            if (!text.empty() && text.front() != L'<') {
+                entries.push_back({EntryKind::User, std::move(text)});
+            }
+        } else if (type == "assistant") {
+            const std::string messageId = JsonStr(message, "id");
+            const Json& content = JsonAt(message, "content");
+            if (!content.is_array()) {
+                return;
+            }
+            for (const Json& block : content) {
+                const std::string blockType = JsonStr(block, "type");
+                if (blockType == "text") {
+                    std::wstring text = ToWide(JsonStr(block, "text"));
+                    if (text.empty()) {
+                        continue;
+                    }
+                    if (!entries.empty() && entries.back().kind == EntryKind::Assistant &&
+                        lastAssistant == messageId && !messageId.empty()) {
+                        entries.back().text += L"\n\n" + text;
+                    } else {
+                        entries.push_back({EntryKind::Assistant, std::move(text)});
+                    }
+                    lastAssistant = messageId;
+                } else if (blockType == "tool_use") {
+                    entries.push_back({EntryKind::Tool, ToWide(JsonStr(block, "name"))});
+                    lastAssistant.clear();
+                }
+            }
+        }
+    });
+    truncated = entries.size() > limit;
+    if (truncated) {
+        entries.erase(entries.begin(), entries.end() - static_cast<std::ptrdiff_t>(limit));
+    }
+    return entries;
+}
+
+Settings LoadSettings() {
+    Settings settings;
+    std::ifstream in(SettingsFile(), std::ios::binary);
+    if (!in) {
+        return settings;
+    }
+    const Json data = Json::parse(in, nullptr, false);
+    settings.model = JsonStr(data, "model");
+    settings.effort = JsonStr(data, "effort");
+    return settings;
+}
+
+void SaveSettings(const Settings& settings) {
+    const fs::path file = SettingsFile();
+    std::error_code error;
+    fs::create_directories(file.parent_path(), error);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << Json{{"model", settings.model}, {"effort", settings.effort}}.dump(2) << "\n";
+}
+
+}  // namespace aic

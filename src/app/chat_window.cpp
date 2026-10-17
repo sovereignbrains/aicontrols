@@ -12,10 +12,10 @@
 #include <wil/result.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cwctype>
 #include <exception>
 #include <format>
 #include <memory>
@@ -49,9 +49,14 @@ constexpr float kToolbar = 38.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 32.f;
-constexpr float kPopoverWidth = 380.f;
-constexpr float kRow = 36.f;
-constexpr size_t kRowsShown = 12;
+constexpr float kHistoryWidth = 380.f;
+constexpr float kHistoryRow = 36.f;
+constexpr size_t kHistoryRows = 12;
+constexpr float kMenuRow = 30.f;
+constexpr float kModelsWidth = 270.f;
+constexpr float kMoreWidth = 230.f;
+constexpr float kEffortWidth = 250.f;
+constexpr float kEffortHeight = 112.f;
 
 // Sovereign's palette (src/tray/ui_style.h): dark only, one blue accent.
 constexpr uint32_t kWindow = 0x0e0e0f;
@@ -96,11 +101,28 @@ struct FeedItem {
     float top = 0;  // where it was last painted, for hit tests
 };
 
-enum class Target { None, History, NewChat, Model, Send, Row, Popover };
+// The panels that open over the window; one at a time.
+enum class Popup { None, History, Models, Effort };
+
+enum class Target {
+    None,
+    History,
+    NewChat,
+    ModelChip,
+    EffortChip,
+    Send,
+    HistoryRow,   // row: an index into the filtered history
+    ModelRow,     // row: an index into the main models
+    MoreModels,   // the row that opens the other models
+    MoreRow,      // row: an index into the other models
+    EffortTrack,
+    EffortReset,
+    InsidePopup,  // on a panel, nothing to click
+};
 
 struct Hit {
     Target target = Target::None;
-    size_t row = 0;  // Target::Row: an index into the filtered list
+    size_t row = 0;
     bool operator==(const Hit&) const = default;
 };
 
@@ -114,11 +136,21 @@ struct Geometry {
     D2D1_RECT_F feed{};
     D2D1_RECT_F box{};
     D2D1_RECT_F text{};
+    D2D1_RECT_F limits{};
     D2D1_RECT_F model{};
+    D2D1_RECT_F effort{};  // empty when the model has no effort levels
     D2D1_RECT_F send{};
-    D2D1_RECT_F popover{};
+    D2D1_RECT_F popup{};   // the open panel
+    // History.
     D2D1_RECT_F search{};
     float listTop = 0;
+    // Models.
+    float modelsTop = 0;
+    D2D1_RECT_F more{};
+    D2D1_RECT_F submenu{};
+    // Effort.
+    D2D1_RECT_F track{};
+    D2D1_RECT_F reset{};
 };
 
 std::wstring LastLines(const std::string& text, int count) {
@@ -166,6 +198,21 @@ std::wstring Lowercase(std::wstring text) {
     return text;
 }
 
+std::wstring ClipboardText(HWND owner) {
+    std::wstring text;
+    if (!OpenClipboard(owner)) {
+        return text;
+    }
+    if (HANDLE data = GetClipboardData(CF_UNICODETEXT); data != nullptr) {
+        if (const auto* chars = static_cast<const wchar_t*>(GlobalLock(data)); chars != nullptr) {
+            text = chars;
+            GlobalUnlock(data);
+        }
+    }
+    CloseClipboard();
+    return text;
+}
+
 std::wstring Age(const FILETIME& time) {
     FILETIME now{};
     GetSystemTimeAsFileTime(&now);
@@ -190,24 +237,16 @@ std::wstring Age(const FILETIME& time) {
     return days < 30 ? std::format(L"{} дн", days) : std::format(L"{} мес", days / 30);
 }
 
-// Dark native menus (the model picker): uxtheme's SetPreferredAppMode(ForceDark), as in Sovereign.
-void UseDarkMenus() {
-    HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (uxtheme == nullptr) {
-        return;
+std::wstring EffortName(const std::string& level) {
+    if (level.empty()) {
+        return L"Auto";
     }
-    using SetPreferredAppModeFn = int(WINAPI*)(int);
-    using FlushMenuThemesFn = void(WINAPI*)();
-    const auto setMode = reinterpret_cast<SetPreferredAppModeFn>(  // NOLINT(performance-no-int-to-ptr)
-        reinterpret_cast<std::uintptr_t>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(135))));
-    const auto flush = reinterpret_cast<FlushMenuThemesFn>(  // NOLINT(performance-no-int-to-ptr)
-        reinterpret_cast<std::uintptr_t>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(136))));
-    if (setMode != nullptr) {
-        setMode(2);
+    if (level == "xhigh") {
+        return L"XHigh";
     }
-    if (flush != nullptr) {
-        flush();
-    }
+    std::wstring name = ToWide(level);
+    name[0] = static_cast<wchar_t>(std::towupper(name[0]));
+    return name;
 }
 
 class ChatWindow {
@@ -219,11 +258,12 @@ private:
     static LRESULT CALLBACK Proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK InputProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id,
                                       DWORD_PTR self);
-    static LRESULT CALLBACK SearchProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id,
-                                       DWORD_PTR self);
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT OnInputFilter(const MSGFILTER& filter);
     void OnCommand(WPARAM wParam, LPARAM lParam);
+    void OnClick(float x, float y);
+    void OnPopupKey(WPARAM key);
+    void OnPopupChar(wchar_t c);
 
     float Dpi() const { return static_cast<float>(GetDpiForWindow(hwnd_)); }
     float ToDip(int px) const { return static_cast<float>(px) * 96.f / Dpi(); }
@@ -248,23 +288,33 @@ private:
     void PaintFeed(const Geometry& g);
     void PaintHeader(const Geometry& g);
     void PaintInput(const Geometry& g);
-    void PaintPopover(const Geometry& g);
+    void PaintPanel(const D2D1_RECT_F& rect);
+    void PaintHistory(const Geometry& g);
+    void PaintModels(const Geometry& g);
+    void PaintEffort(const Geometry& g);
     void Text(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect, uint32_t color);
     void Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha = 1.f);
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width = 1.6f);
+    void Check(D2D1_POINT_2F center, uint32_t color);
     void MeasureFeed(float column);
     float FeedHeight() const;
     void ScrollBy(float delta);
     void CopyItemAt(float y);
     void Flash(std::wstring status);
 
-    void OpenPopover();
-    void ClosePopover();
+    void OpenPopup(Popup popup);
+    void ClosePopup();
     void FilterSessions();
     void MoveSelection(int delta);
     void OpenSession(size_t filteredIndex);
-    void ShowModelMenu(const Geometry& g);
-    std::wstring ModelLabel() const;
+
+    void IndexModels();
+    const Json* CurrentModel() const;
+    std::wstring ModelName() const;
+    std::vector<std::string> EffortLevels() const;
+    void SetEffortAt(float x);
+    void ChooseModel(size_t index);
+    void Apply(const Settings& next);
 
     bool StartClaude();
     void Restart();
@@ -280,11 +330,8 @@ private:
     HINSTANCE instance_;
     HWND hwnd_ = nullptr;
     HWND input_ = nullptr;
-    HWND search_ = nullptr;
     wil::unique_hmodule richEdit_;
     wil::unique_hfont uiFont_;
-    wil::unique_hbrush raisedBrush_;
-    wil::unique_hbrush cardBrush_;
 
     wil::com_ptr<ID2D1Factory> d2d_;
     wil::com_ptr<IDWriteFactory> dwrite_;
@@ -295,7 +342,9 @@ private:
     wil::com_ptr<IDWriteTextFormat> notice_;
     wil::com_ptr<IDWriteTextFormat> header_;
     wil::com_ptr<IDWriteTextFormat> ui_;
+    wil::com_ptr<IDWriteTextFormat> uiBold_;
     wil::com_ptr<IDWriteTextFormat> uiRight_;
+    wil::com_ptr<IDWriteTextFormat> badge_;
     wil::com_ptr<IDWriteTextFormat> greeting_;
 
     std::vector<FeedItem> feed_;
@@ -309,11 +358,21 @@ private:
     Hit hover_;
     bool trackingMouse_ = false;
 
-    bool popoverOpen_ = false;
+    Popup popup_ = Popup::None;
+    // History.
     std::vector<SessionInfo> sessions_;
     std::vector<size_t> filtered_;
+    std::wstring searchText_;
     size_t firstRow_ = 0;
     size_t selected_ = 0;
+    // Models: indexes into models_.
+    std::vector<size_t> mainModels_;
+    std::vector<size_t> moreModels_;
+    std::string defaultResolved_;  // what the CLI's "default" stands for
+    bool moreOpen_ = false;
+    // Effort, applied when its panel closes.
+    std::string pendingEffort_;
+    bool draggingEffort_ = false;
 
     std::wstring workspace_;
     Settings settings_;
@@ -336,7 +395,6 @@ private:
 int ChatWindow::Run(int show) {
     workspace_ = DefaultWorkspace();
     settings_ = LoadSettings();
-    UseDarkMenus();
     THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d_.put()));
     THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                         reinterpret_cast<IUnknown**>(dwrite_.put())));
@@ -347,11 +405,11 @@ int ChatWindow::Run(int show) {
     body_ = MakeFormat(15.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     notice_ = MakeFormat(12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
     header_ = MakeFormat(13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    ui_ = MakeFormat(12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    ui_ = MakeFormat(13.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    uiBold_ = MakeFormat(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     uiRight_ = MakeFormat(12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
+    badge_ = MakeFormat(11.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, true);
     greeting_ = MakeFormat(24.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
-    raisedBrush_.reset(CreateSolidBrush(ToColorRef(kRaised)));
-    cardBrush_.reset(CreateSolidBrush(ToColorRef(kCard)));
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -438,36 +496,6 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
     return result;
 }
 
-// The history search: arrows pick a chat, Enter opens it, Esc closes the list.
-LRESULT CALLBACK ChatWindow::SearchProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR,
-                                        DWORD_PTR self) {
-    auto* window = reinterpret_cast<ChatWindow*>(self);
-    if (message == WM_KEYDOWN) {
-        switch (wParam) {
-        case VK_ESCAPE:
-            window->ClosePopover();
-            return 0;
-        case VK_RETURN:
-            if (window->selected_ < window->filtered_.size()) {
-                window->OpenSession(window->selected_);
-            }
-            return 0;
-        case VK_DOWN:
-            window->MoveSelection(1);
-            return 0;
-        case VK_UP:
-            window->MoveSelection(-1);
-            return 0;
-        default:
-            break;
-        }
-    }
-    if (message == WM_CHAR && (wParam == VK_RETURN || wParam == VK_ESCAPE)) {
-        return 0;  // no beep
-    }
-    return DefSubclassProc(hwnd, message, wParam, lParam);
-}
-
 LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
@@ -500,7 +528,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_GETMINMAXINFO:
         if (hwnd_ != nullptr) {
-            reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {ToPx(520.f), ToPx(460.f)};
+            reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {ToPx(560.f), ToPx(480.f)};
         }
         return 0;
     case WM_ERASEBKGND:
@@ -512,24 +540,24 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         EndPaint(hwnd_, &paint);
         return 0;
     }
-    case WM_CTLCOLOREDIT:
-        if (reinterpret_cast<HWND>(lParam) == search_) {
-            const auto dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, ToColorRef(kPrimary));
-            SetBkColor(dc, ToColorRef(kRaised));
-            return reinterpret_cast<LRESULT>(raisedBrush_.get());
-        }
-        break;
     case WM_MOUSEMOVE: {
         if (!trackingMouse_) {
             TRACKMOUSEEVENT track{sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd_, 0};
             trackingMouse_ = TrackMouseEvent(&track) != FALSE;
         }
         const D2D1_POINT_2F at = CursorDip(lParam);
+        if (draggingEffort_) {
+            SetEffortAt(at.x);
+            return 0;
+        }
         if (const Hit hit = HitTest(at.x, at.y); !(hit == hover_)) {
             hover_ = hit;
-            if (hit.target == Target::Row) {
+            if (hit.target == Target::HistoryRow) {
                 selected_ = hit.row;
+            } else if (hit.target == Target::MoreModels) {
+                moreOpen_ = true;
+            } else if (hit.target == Target::ModelRow) {
+                moreOpen_ = false;
             }
             Refresh();
         }
@@ -542,46 +570,28 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT && reinterpret_cast<HWND>(wParam) == hwnd_) {
-            const bool clickable = hover_.target != Target::None && hover_.target != Target::Popover;
+            const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup;
             SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         break;
-    case WM_LBUTTONUP: {
+    case WM_LBUTTONDOWN: {
         const D2D1_POINT_2F at = CursorDip(lParam);
-        const Hit hit = HitTest(at.x, at.y);
-        if (popoverOpen_ && hit.target != Target::Row && hit.target != Target::Popover &&
-            hit.target != Target::History) {
-            ClosePopover();
+        if (HitTest(at.x, at.y).target == Target::EffortTrack) {
+            draggingEffort_ = true;
+            SetCapture(hwnd_);
+            SetEffortAt(at.x);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (draggingEffort_) {
+            draggingEffort_ = false;
+            ReleaseCapture();
             return 0;
         }
-        switch (hit.target) {
-        case Target::History:
-            popoverOpen_ ? ClosePopover() : OpenPopover();
-            break;
-        case Target::NewChat:
-            NewChat();
-            break;
-        case Target::Model:
-            ShowModelMenu(Layout());
-            break;
-        case Target::Send:
-            if (busy_) {
-                claude_.Interrupt();
-                Flash(L"останавливаю…");
-            } else {
-                Submit();
-            }
-            break;
-        case Target::Row:
-            OpenSession(hit.row);
-            break;
-        default:
-            break;
-        }
-        if (!popoverOpen_) {
-            SetFocus(input_);
-        }
+        const D2D1_POINT_2F at = CursorDip(lParam);
+        OnClick(at.x, at.y);
         return 0;
     }
     case WM_MOUSEWHEEL: {
@@ -589,21 +599,35 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         ScreenToClient(hwnd_, &at);
         const float steps = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
         const Geometry g = Layout();
-        if (popoverOpen_ && Inside(g.popover, ToDip(at.x), ToDip(at.y))) {
-            const size_t maxFirst = filtered_.size() > kRowsShown ? filtered_.size() - kRowsShown : 0;
+        if (popup_ == Popup::History && Inside(g.popup, ToDip(at.x), ToDip(at.y))) {
+            const size_t maxFirst = filtered_.size() > kHistoryRows ? filtered_.size() - kHistoryRows : 0;
             const auto moved = static_cast<long long>(firstRow_) + static_cast<long long>(std::lround(steps * 3));
             firstRow_ = static_cast<size_t>(std::clamp<long long>(moved, 0, static_cast<long long>(maxFirst)));
             Refresh();
-        } else {
+        } else if (popup_ == Popup::None) {
             ScrollBy(steps * 64.f);
         }
         return 0;
     }
     case WM_RBUTTONUP:
-        CopyItemAt(CursorDip(lParam).y);
+        if (popup_ == Popup::None) {
+            CopyItemAt(CursorDip(lParam).y);
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (popup_ != Popup::None) {
+            OnPopupKey(wParam);
+        }
+        return 0;
+    case WM_CHAR:
+        if (popup_ != Popup::None) {
+            OnPopupChar(static_cast<wchar_t>(wParam));
+        }
         return 0;
     case WM_SETFOCUS:
-        SetFocus(popoverOpen_ ? search_ : input_);
+        if (popup_ == Popup::None) {  // with a panel open the keys stay here
+            SetFocus(input_);
+        }
         return 0;
     case WM_TIMER:
         if (wParam == kStatusTimer) {
@@ -661,20 +685,147 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd_, message, wParam, lParam);
 }
 
-void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
-    const auto from = reinterpret_cast<HWND>(lParam);
-    const WORD code = HIWORD(wParam);
-    if (from == input_) {
-        if (code == EN_CHANGE) {
-            hasText_ = GetWindowTextLengthW(input_) > 0;
-            InvalidateRect(input_, nullptr, TRUE);  // the placeholder comes and goes
+void ChatWindow::OnClick(float x, float y) {
+    const Hit hit = HitTest(x, y);
+    if (popup_ != Popup::None) {
+        switch (hit.target) {
+        case Target::HistoryRow:
+            OpenSession(hit.row);
+            return;
+        case Target::ModelRow:
+            ChooseModel(mainModels_[hit.row]);
+            return;
+        case Target::MoreRow:
+            ChooseModel(moreModels_[hit.row]);
+            return;
+        case Target::MoreModels:
+            moreOpen_ = !moreOpen_;
             Refresh();
-        } else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
-            inputFocused_ = code == EN_SETFOCUS;
+            return;
+        case Target::EffortReset:
+            pendingEffort_.clear();
+            Refresh();
+            return;
+        case Target::EffortTrack:
+        case Target::InsidePopup:
+            return;
+        default:
+            break;
+        }
+        // A click outside closes the panel; on the button that opened it, that is all it does.
+        const Popup was = popup_;
+        ClosePopup();
+        const bool sameButton = (hit.target == Target::History && was == Popup::History) ||
+                                (hit.target == Target::ModelChip && was == Popup::Models) ||
+                                (hit.target == Target::EffortChip && was == Popup::Effort);
+        if (sameButton) {
+            return;
+        }
+    }
+    switch (hit.target) {
+    case Target::History:
+        OpenPopup(Popup::History);
+        break;
+    case Target::ModelChip:
+        OpenPopup(Popup::Models);
+        break;
+    case Target::EffortChip:
+        OpenPopup(Popup::Effort);
+        break;
+    case Target::NewChat:
+        NewChat();
+        break;
+    case Target::Send:
+        if (busy_) {
+            claude_.Interrupt();
+            Flash(L"останавливаю…");
+        } else {
+            Submit();
+        }
+        break;
+    default:
+        break;
+    }
+    if (popup_ == Popup::None) {
+        SetFocus(input_);
+    }
+}
+
+void ChatWindow::OnPopupKey(WPARAM key) {
+    const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (key == VK_ESCAPE) {
+        ClosePopup();
+        return;
+    }
+    switch (popup_) {
+    case Popup::History:
+        if (key == VK_RETURN && selected_ < filtered_.size()) {
+            OpenSession(selected_);
+        } else if (key == VK_DOWN || key == VK_UP) {
+            MoveSelection(key == VK_DOWN ? 1 : -1);
+        } else if (key == 'V' && control) {
+            searchText_ += ClipboardText(hwnd_);
+            std::erase_if(searchText_, [](wchar_t c) { return c == L'\r' || c == L'\n'; });
+            FilterSessions();
+        }
+        break;
+    case Popup::Effort:
+        if (key == VK_RETURN) {
+            ClosePopup();
+        } else if (key == VK_LEFT || key == VK_RIGHT) {
+            const std::vector<std::string> levels = EffortLevels();
+            const auto at = std::ranges::find(levels, pendingEffort_);
+            long long index = at == levels.end() ? -1 : at - levels.begin();
+            index = std::clamp<long long>(index + (key == VK_RIGHT ? 1 : -1), 0,
+                                          static_cast<long long>(levels.size()) - 1);
+            pendingEffort_ = levels[static_cast<size_t>(index)];
             Refresh();
         }
-    } else if (from == search_ && code == EN_CHANGE) {
-        FilterSessions();
+        break;
+    default:
+        break;
+    }
+}
+
+void ChatWindow::OnPopupChar(wchar_t c) {
+    if (popup_ == Popup::Models && c >= L'1' && c <= L'9') {
+        if (const auto index = static_cast<size_t>(c - L'1'); index < mainModels_.size()) {
+            ChooseModel(mainModels_[index]);
+        }
+        return;
+    }
+    if (popup_ != Popup::History) {
+        return;
+    }
+    if (c == L'\b') {
+        if (!searchText_.empty()) {
+            searchText_.pop_back();
+        }
+    } else if (c == 0x7f) {  // Ctrl+Backspace
+        searchText_.clear();
+    } else if (c >= L' ') {
+        searchText_ += c;
+    } else {
+        return;
+    }
+    FilterSessions();
+}
+
+void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
+    if (reinterpret_cast<HWND>(lParam) != input_) {
+        return;
+    }
+    const WORD code = HIWORD(wParam);
+    if (code == EN_CHANGE) {
+        hasText_ = GetWindowTextLengthW(input_) > 0;
+        InvalidateRect(input_, nullptr, TRUE);  // the placeholder comes and goes
+        Refresh();
+    } else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
+        inputFocused_ = code == EN_SETFOCUS;
+        if (inputFocused_) {
+            ClosePopup();  // a click into the input
+        }
+        Refresh();
     }
 }
 
@@ -697,7 +848,7 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             return 1;
         }
         if (filter.wParam == 'H' && control) {
-            OpenPopover();
+            OpenPopup(Popup::History);
             return 1;
         }
     }
@@ -727,31 +878,105 @@ Geometry ChatWindow::Layout() const {
     g.text = D2D1::RectF(left + 14, boxTop + kBoxPad, right - 14, boxTop + kBoxPad + textHeight_);
     const float toolTop = boxBottom - kToolbar + 4;
     const float toolBottom = boxBottom - 6;
-    const float modelWidth = TextWidth(ModelLabel() + L"  ▾", ui_.get()) + 20;
-    g.model = D2D1::RectF(left + 8, toolTop, left + 8 + modelWidth, toolBottom);
     g.send = D2D1::RectF(right - 8 - (toolBottom - toolTop), toolTop, right - 8, toolBottom);
+    float chipsRight = g.send.left - 8;
+    if (!EffortLevels().empty()) {
+        const float width = TextWidth(EffortName(settings_.effort), ui_.get()) + 18;
+        g.effort = D2D1::RectF(chipsRight - width, toolTop + 3, chipsRight, toolBottom - 3);
+        chipsRight = g.effort.left - 4;
+    }
+    const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
+    g.model = D2D1::RectF(chipsRight - modelWidth, toolTop + 3, chipsRight, toolBottom - 3);
+    g.limits = D2D1::RectF(left + 14, toolTop, g.model.left - 10, toolBottom);
     g.feed = D2D1::RectF(0, kHeader, g.width, boxTop - 8);
 
-    const float popoverWidth = std::min(kPopoverWidth, g.width - 20);
-    const float popoverLeft = g.width - 10 - popoverWidth;
-    const float popoverTop = kHeader + 4;
-    g.search = D2D1::RectF(popoverLeft + 10, popoverTop + 10, g.width - 20, popoverTop + 42);
-    g.listTop = g.search.bottom + 8;
-    const size_t rows = std::max<size_t>(1, std::min(kRowsShown, filtered_.size()));
-    g.popover = D2D1::RectF(popoverLeft, popoverTop, g.width - 10, g.listTop + static_cast<float>(rows) * kRow + 8);
+    switch (popup_) {
+    case Popup::History: {
+        const float width = std::min(kHistoryWidth, g.width - 20);
+        const float top = kHeader + 4;
+        g.search = D2D1::RectF(g.width - 10 - width + 10, top + 10, g.width - 20, top + 42);
+        g.listTop = g.search.bottom + 8;
+        const size_t rows = std::max<size_t>(1, std::min(kHistoryRows, filtered_.size()));
+        g.popup = D2D1::RectF(g.width - 10 - width, top, g.width - 10,
+                              g.listTop + static_cast<float>(rows) * kHistoryRow + 8);
+        break;
+    }
+    case Popup::Models: {
+        const float rows = static_cast<float>(mainModels_.size());
+        const float height = 12 + rows * kMenuRow + (moreModels_.empty() ? 0 : 9 + kMenuRow);
+        const float popupLeft = std::clamp(g.model.left, 10.f, g.width - 10 - kModelsWidth);
+        g.popup = D2D1::RectF(popupLeft, g.box.top - 6 - height, popupLeft + kModelsWidth, g.box.top - 6);
+        g.modelsTop = g.popup.top + 6;
+        if (!moreModels_.empty()) {
+            const float moreTop = g.modelsTop + rows * kMenuRow + 9;
+            g.more = D2D1::RectF(g.popup.left + 6, moreTop, g.popup.right - 6, moreTop + kMenuRow);
+            const float subHeight = 12 + static_cast<float>(moreModels_.size()) * kMenuRow;
+            const bool roomLeft = g.popup.left - 4 - kMoreWidth >= 10;
+            const float subLeft = roomLeft ? g.popup.left - 4 - kMoreWidth : g.popup.right + 4;
+            const float subBottom = g.more.bottom + 6;
+            const float subTop = std::max(kHeader + 4, subBottom - subHeight);
+            g.submenu = D2D1::RectF(subLeft, subTop, subLeft + kMoreWidth, subTop + subHeight);
+        }
+        break;
+    }
+    case Popup::Effort: {
+        const float popupRight = std::clamp(g.effort.right, 10.f + kEffortWidth, g.width - 10);
+        g.popup = D2D1::RectF(popupRight - kEffortWidth, g.box.top - 6 - kEffortHeight, popupRight, g.box.top - 6);
+        g.track = D2D1::RectF(g.popup.left + 14, g.popup.top + 62, g.popup.right - 14, g.popup.top + 86);
+        const float resetWidth = TextWidth(L"по умолчанию", uiRight_.get());
+        g.reset = D2D1::RectF(g.popup.right - 14 - resetWidth, g.popup.top + 10, g.popup.right - 14,
+                              g.popup.top + 34);
+        break;
+    }
+    case Popup::None:
+        break;
+    }
     return g;
 }
 
 Hit ChatWindow::HitTest(float x, float y) const {
     const Geometry g = Layout();
-    if (popoverOpen_ && Inside(g.popover, x, y)) {
-        if (y >= g.listTop) {
-            const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kRow);
-            if (row < filtered_.size() && row < firstRow_ + kRowsShown) {
-                return {Target::Row, row};
+    switch (popup_) {
+    case Popup::History:
+        if (Inside(g.popup, x, y)) {
+            if (y >= g.listTop) {
+                const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
+                if (row < filtered_.size() && row < firstRow_ + kHistoryRows) {
+                    return {Target::HistoryRow, row};
+                }
             }
+            return {Target::InsidePopup};
         }
-        return {Target::Popover};
+        break;
+    case Popup::Models:
+        if (moreOpen_ && Inside(g.submenu, x, y)) {
+            const auto row = static_cast<size_t>(std::max(0.f, y - g.submenu.top - 6) / kMenuRow);
+            return row < moreModels_.size() ? Hit{Target::MoreRow, row} : Hit{Target::InsidePopup};
+        }
+        if (Inside(g.popup, x, y)) {
+            if (Inside(g.more, x, y)) {
+                return {Target::MoreModels};
+            }
+            if (y >= g.modelsTop) {
+                const auto row = static_cast<size_t>((y - g.modelsTop) / kMenuRow);
+                if (row < mainModels_.size()) {
+                    return {Target::ModelRow, row};
+                }
+            }
+            return {Target::InsidePopup};
+        }
+        break;
+    case Popup::Effort:
+        if (Inside(g.popup, x, y)) {
+            if (!pendingEffort_.empty() && Inside(g.reset, x, y)) {
+                return {Target::EffortReset};
+            }
+            const D2D1_RECT_F grab = D2D1::RectF(g.track.left, g.track.top - 8, g.track.right, g.track.bottom + 8);
+            return Inside(grab, x, y) ? Hit{Target::EffortTrack} : Hit{Target::InsidePopup};
+        }
+        break;
+    case Popup::None:
+        break;
     }
     if (Inside(g.history, x, y)) {
         return {Target::History};
@@ -760,7 +985,10 @@ Hit ChatWindow::HitTest(float x, float y) const {
         return {Target::NewChat};
     }
     if (Inside(g.model, x, y)) {
-        return {Target::Model};
+        return {Target::ModelChip};
+    }
+    if (Inside(g.effort, x, y)) {
+        return {Target::EffortChip};
     }
     if (Inside(g.send, x, y)) {
         return {Target::Send};
@@ -779,9 +1007,6 @@ void ChatWindow::CreateFonts() {
     font.lfQuality = CLEARTYPE_QUALITY;
     wcscpy_s(font.lfFaceName, L"Segoe UI");
     uiFont_.reset(CreateFontIndirectW(&font));
-    if (search_ != nullptr) {
-        SendMessageW(search_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_.get()), TRUE);
-    }
 }
 
 void ChatWindow::CreateInput() {
@@ -814,12 +1039,8 @@ void ChatWindow::PlaceChildren() {
     if (input_ == nullptr) {
         return;
     }
-    const Geometry g = Layout();
-    MoveChild(input_, g.text);
+    MoveChild(input_, Layout().text);
     SendMessageW(input_, EM_REQUESTRESIZE, 0, 0);
-    if (search_ != nullptr) {
-        MoveChild(search_, D2D1::RectF(g.search.left + 10, g.search.top + 7, g.search.right - 10, g.search.bottom - 6));
-    }
 }
 
 void ChatWindow::EnsureTarget() {
@@ -852,6 +1073,11 @@ void ChatWindow::Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, flo
 void ChatWindow::Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width) {
     brush_->SetColor(Color(color));
     target_->DrawLine(a, b, brush_.get(), width, round_.get());
+}
+
+void ChatWindow::Check(D2D1_POINT_2F c, uint32_t color) {
+    Line({c.x - 5.f, c.y}, {c.x - 1.5f, c.y + 3.5f}, color, 1.6f);
+    Line({c.x - 1.5f, c.y + 3.5f}, {c.x + 5.f, c.y - 3.5f}, color, 1.6f);
 }
 
 void ChatWindow::MeasureFeed(float column) {
@@ -898,8 +1124,18 @@ void ChatWindow::Paint() {
     PaintFeed(g);
     PaintHeader(g);
     PaintInput(g);
-    if (popoverOpen_) {
-        PaintPopover(g);
+    switch (popup_) {
+    case Popup::History:
+        PaintHistory(g);
+        break;
+    case Popup::Models:
+        PaintModels(g);
+        break;
+    case Popup::Effort:
+        PaintEffort(g);
+        break;
+    case Popup::None:
+        break;
     }
     if (target_->EndDraw() == D2DERR_RECREATE_TARGET) {
         target_.reset();
@@ -967,7 +1203,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     brush_->SetColor(Color(kLine));
     target_->FillRectangle(D2D1::RectF(0, kHeader - 1, g.width, kHeader), brush_.get());
 
-    std::wstring title = title_.empty() ? L"Новый чат" : title_;
+    const std::wstring title = title_.empty() ? L"Новый чат" : title_;
     const float titleRight = g.history.left - 12;
     Text(title, header_.get(), D2D1::RectF(16, 0, titleRight, kHeader), kPrimary);
     std::wstring state = busy_ ? L"отвечает…" : L"";
@@ -981,7 +1217,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
 
     for (const Target button : {Target::History, Target::NewChat}) {
         const D2D1_RECT_F& r = button == Target::History ? g.history : g.newChat;
-        const bool active = hover_.target == button || (button == Target::History && popoverOpen_);
+        const bool active = hover_.target == button || (button == Target::History && popup_ == Popup::History);
         if (active) {
             Fill(r, 6.f, kRaised);
         }
@@ -1004,15 +1240,27 @@ void ChatWindow::PaintInput(const Geometry& g) {
     brush_->SetColor(inputFocused_ ? Color(kAccent, 0.75f) : Color(kLine));
     target_->DrawRoundedRectangle(D2D1::RoundedRect(g.box, 12.f, 12.f), brush_.get(), 1.f);
 
-    if (hover_.target == Target::Model) {
+    if (!limits_.empty()) {
+        Text(limits_, ui_.get(), g.limits, kSecondary);
+    }
+
+    // The model, then its effort in a box of its own, as in Claude's app.
+    const bool modelActive = hover_.target == Target::ModelChip || popup_ == Popup::Models;
+    if (modelActive) {
         Fill(g.model, 6.f, kRaised);
     }
-    Text(ModelLabel() + L"  ▾", ui_.get(), D2D1::RectF(g.model.left + 10, g.model.top, g.model.right, g.model.bottom),
-         hover_.target == Target::Model ? kPrimary : kSecondary);
-
-    if (!limits_.empty()) {
-        Text(limits_, uiRight_.get(), D2D1::RectF(g.model.right + 8, g.send.top, g.send.left - 10, g.send.bottom),
-             kSecondary);
+    Text(ModelName(), ui_.get(), D2D1::RectF(g.model.left + 9, g.model.top, g.model.right, g.model.bottom),
+         modelActive ? kPrimary : kSecondary);
+    if (g.effort.right > g.effort.left) {
+        const bool effortActive = hover_.target == Target::EffortChip || popup_ == Popup::Effort;
+        Fill(g.effort, 6.f, kRaised);
+        if (effortActive) {
+            brush_->SetColor(Color(kLine));
+            target_->DrawRoundedRectangle(D2D1::RoundedRect(g.effort, 6.f, 6.f), brush_.get(), 1.f);
+        }
+        Text(EffortName(settings_.effort), ui_.get(),
+             D2D1::RectF(g.effort.left + 9, g.effort.top, g.effort.right, g.effort.bottom),
+             effortActive ? kPrimary : kSecondary);
     }
 
     const bool live = hasText_ || busy_;
@@ -1030,25 +1278,34 @@ void ChatWindow::PaintInput(const Geometry& g) {
     }
 }
 
-void ChatWindow::PaintPopover(const Geometry& g) {
-    Fill(D2D1::RectF(g.popover.left + 2, g.popover.top + 4, g.popover.right + 2, g.popover.bottom + 6), 10.f, 0x000000,
-         0.35f);  // a soft shadow
-    Fill(g.popover, 10.f, kCard);
+void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {
+    Fill(D2D1::RectF(rect.left + 2, rect.top + 4, rect.right + 2, rect.bottom + 6), 10.f, 0x000000, 0.35f);
+    Fill(rect, 10.f, kCard);
     brush_->SetColor(Color(kLine));
-    target_->DrawRoundedRectangle(D2D1::RoundedRect(g.popover, 10.f, 10.f), brush_.get(), 1.f);
+    target_->DrawRoundedRectangle(D2D1::RoundedRect(rect, 10.f, 10.f), brush_.get(), 1.f);
+}
+
+void ChatWindow::PaintHistory(const Geometry& g) {
+    PaintPanel(g.popup);
     Fill(g.search, 6.f, kRaised);
+    const D2D1_RECT_F field = D2D1::RectF(g.search.left + 10, g.search.top, g.search.right - 10, g.search.bottom);
+    if (searchText_.empty()) {
+        Text(L"Поиск по чатам — просто начни печатать", ui_.get(), field, kSecondary);
+    } else {
+        Text(searchText_, ui_.get(), field, kPrimary);
+    }
 
     if (filtered_.empty()) {
         const std::wstring empty = sessions_.empty() ? L"Чатов пока нет" : L"Ничего не нашлось";
-        Text(empty, ui_.get(), D2D1::RectF(g.search.left + 10, g.listTop, g.search.right, g.listTop + kRow),
+        Text(empty, ui_.get(), D2D1::RectF(g.search.left + 10, g.listTop, g.search.right, g.listTop + kHistoryRow),
              kSecondary);
         return;
     }
-    const size_t last = std::min(filtered_.size(), firstRow_ + kRowsShown);
+    const size_t last = std::min(filtered_.size(), firstRow_ + kHistoryRows);
     for (size_t row = firstRow_; row < last; ++row) {
         const SessionInfo& session = sessions_[filtered_[row]];
-        const float top = g.listTop + static_cast<float>(row - firstRow_) * kRow;
-        const D2D1_RECT_F r = D2D1::RectF(g.popover.left + 6, top, g.popover.right - 6, top + kRow);
+        const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
+        const D2D1_RECT_F r = D2D1::RectF(g.popup.left + 6, top, g.popup.right - 6, top + kHistoryRow);
         if (row == selected_) {
             Fill(r, 6.f, kRaised);
         }
@@ -1059,6 +1316,98 @@ void ChatWindow::PaintPopover(const Geometry& g) {
              D2D1::RectF(r.left + 10, r.top, r.right - ageWidth - 22, r.bottom), current ? kAccent : kPrimary);
         Text(age, uiRight_.get(), D2D1::RectF(r.right - ageWidth - 12, r.top, r.right - 10, r.bottom), kSecondary);
     }
+}
+
+void ChatWindow::PaintModels(const Geometry& g) {
+    const Json* current = CurrentModel();
+    const auto rowFor = [&](size_t modelIndex, const D2D1_RECT_F& r, bool hovered, const std::wstring& key) {
+        const Json& model = models_[modelIndex];
+        if (hovered) {
+            Fill(r, 6.f, kRaised);
+        }
+        const std::wstring name = ToWide(JsonStr(model, "displayName"));
+        Text(name, ui_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 30, r.bottom), kPrimary);
+        if (JsonStr(model, "resolvedModel") == defaultResolved_ && !defaultResolved_.empty()) {
+            const float x = r.left + 10 + TextWidth(name, ui_.get()) + 8;
+            const float width = TextWidth(L"Default", badge_.get()) + 12;
+            const D2D1_RECT_F badge = D2D1::RectF(x, r.top + 7, x + width, r.bottom - 7);
+            Fill(badge, 4.f, kRaised);
+            Text(L"Default", badge_.get(), badge, kSecondary);
+        }
+        if (&model == current) {
+            Check({r.right - 16, (r.top + r.bottom) / 2}, kAccent);
+        } else if (!key.empty()) {
+            Text(key, uiRight_.get(), D2D1::RectF(r.left, r.top, r.right - 10, r.bottom), kSecondary);
+        }
+    };
+
+    PaintPanel(g.popup);
+    for (size_t i = 0; i < mainModels_.size(); ++i) {
+        const float top = g.modelsTop + static_cast<float>(i) * kMenuRow;
+        const D2D1_RECT_F r = D2D1::RectF(g.popup.left + 6, top, g.popup.right - 6, top + kMenuRow);
+        const bool hovered = hover_.target == Target::ModelRow && hover_.row == i;
+        rowFor(mainModels_[i], r, hovered, i < 9 ? std::to_wstring(i + 1) : L"");
+    }
+    if (moreModels_.empty()) {
+        return;
+    }
+    brush_->SetColor(Color(kLine));
+    target_->FillRectangle(D2D1::RectF(g.popup.left + 10, g.more.top - 5, g.popup.right - 10, g.more.top - 4),
+                           brush_.get());
+    if (moreOpen_ || hover_.target == Target::MoreModels) {
+        Fill(g.more, 6.f, kRaised);
+    }
+    Text(L"Ещё модели", ui_.get(), D2D1::RectF(g.more.left + 10, g.more.top, g.more.right - 30, g.more.bottom),
+         kPrimary);
+    const D2D1_POINT_2F c{g.more.right - 16, (g.more.top + g.more.bottom) / 2};
+    Line({c.x - 2.f, c.y - 4.f}, {c.x + 2.f, c.y}, kSecondary, 1.5f);
+    Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.5f);
+
+    if (moreOpen_) {
+        PaintPanel(g.submenu);
+        for (size_t i = 0; i < moreModels_.size(); ++i) {
+            const float top = g.submenu.top + 6 + static_cast<float>(i) * kMenuRow;
+            const D2D1_RECT_F r = D2D1::RectF(g.submenu.left + 6, top, g.submenu.right - 6, top + kMenuRow);
+            rowFor(moreModels_[i], r, hover_.target == Target::MoreRow && hover_.row == i, L"");
+        }
+    }
+}
+
+void ChatWindow::PaintEffort(const Geometry& g) {
+    PaintPanel(g.popup);
+    const float titleLeft = g.popup.left + 14;
+    const D2D1_RECT_F titleRow = D2D1::RectF(titleLeft, g.popup.top + 10, g.reset.left - 8, g.popup.top + 34);
+    Text(L"Effort", ui_.get(), titleRow, kSecondary);
+    const float labelLeft = titleLeft + TextWidth(L"Effort", ui_.get()) + 8;
+    Text(EffortName(pendingEffort_), uiBold_.get(), D2D1::RectF(labelLeft, titleRow.top, titleRow.right, titleRow.bottom),
+         kPrimary);
+    if (!pendingEffort_.empty()) {
+        Text(L"по умолчанию", uiRight_.get(), g.reset, hover_.target == Target::EffortReset ? kPrimary : kSecondary);
+    }
+    Text(L"Быстрее", ui_.get(), D2D1::RectF(titleLeft, g.popup.top + 38, g.popup.right - 14, g.popup.top + 56),
+         kSecondary);
+    Text(L"Умнее", uiRight_.get(), D2D1::RectF(titleLeft, g.popup.top + 38, g.popup.right - 14, g.popup.top + 56),
+         kSecondary);
+
+    Fill(g.track, 7.f, kRaised);
+    const std::vector<std::string> levels = EffortLevels();
+    const float first = g.track.left + 14;
+    const float span = g.track.right - 14 - first;
+    const float middle = (g.track.top + g.track.bottom) / 2;
+    for (size_t i = 0; i < levels.size(); ++i) {
+        const float x = levels.size() > 1 ? first + span * static_cast<float>(i) / static_cast<float>(levels.size() - 1)
+                                          : first + span / 2;
+        if (levels[i] == pendingEffort_) {
+            Fill(D2D1::RectF(x - 7, g.track.top + 3, x + 7, g.track.bottom - 3), 5.f, kPrimary);
+        } else {
+            brush_->SetColor(Color(kSecondary));
+            target_->FillEllipse(D2D1::Ellipse({x, middle}, 2.f, 2.f), brush_.get());
+        }
+    }
+    const std::wstring note = pendingEffort_.empty() ? L"Auto — решает модель · ← → на клавиатуре"
+                                                     : L"Применится, когда закроешь панель";
+    Text(note, ui_.get(), D2D1::RectF(titleLeft, g.track.bottom + 4, g.popup.right - 14, g.popup.bottom - 4),
+         kSecondary);
 }
 
 void ChatWindow::ScrollBy(float delta) {
@@ -1099,39 +1448,52 @@ void ChatWindow::Flash(std::wstring status) {
     Refresh();
 }
 
-void ChatWindow::OpenPopover() {
-    sessions_ = ListSessions(workspace_);
-    popoverOpen_ = true;
-    if (search_ == nullptr) {
-        search_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd_, nullptr,
-                                  instance_, nullptr);
-        SendMessageW(search_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_.get()), TRUE);
-        SendMessageW(search_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Поиск по чатам"));
-        SetWindowSubclass(search_, &ChatWindow::SearchProc, kSubclassId, reinterpret_cast<DWORD_PTR>(this));
+void ChatWindow::OpenPopup(Popup popup) {
+    if ((popup == Popup::Models || popup == Popup::Effort) && busy_) {
+        Flash(L"модель меняется между ответами");
+        return;
     }
-    SetWindowTextW(search_, L"");
-    FilterSessions();
-    PlaceChildren();
-    SetFocus(search_);
+    ClosePopup();
+    popup_ = popup;
+    hover_ = {};
+    switch (popup) {
+    case Popup::History:
+        sessions_ = ListSessions(workspace_);
+        searchText_.clear();
+        FilterSessions();
+        break;
+    case Popup::Models:
+        moreOpen_ = false;
+        break;
+    case Popup::Effort:
+        pendingEffort_ = settings_.effort;
+        break;
+    case Popup::None:
+        break;
+    }
+    SetFocus(hwnd_);  // the panel's keys: typing to search, digits, arrows
     Refresh();
 }
 
-void ChatWindow::ClosePopover() {
-    if (!popoverOpen_) {
+void ChatWindow::ClosePopup() {
+    if (popup_ == Popup::None) {
         return;
     }
-    popoverOpen_ = false;
-    if (search_ != nullptr) {
-        RemoveWindowSubclass(search_, &ChatWindow::SearchProc, kSubclassId);
-        DestroyWindow(search_);
-        search_ = nullptr;
+    const Popup was = popup_;
+    popup_ = Popup::None;
+    moreOpen_ = false;
+    hover_ = {};
+    if (was == Popup::Effort && pendingEffort_ != settings_.effort) {
+        Settings next = settings_;
+        next.effort = pendingEffort_;
+        Apply(next);
     }
     SetFocus(input_);
     Refresh();
 }
 
 void ChatWindow::FilterSessions() {
-    const std::wstring query = search_ != nullptr ? Lowercase(WindowText(search_)) : L"";
+    const std::wstring query = Lowercase(searchText_);
     filtered_.clear();
     for (size_t i = 0; i < sessions_.size(); ++i) {
         if (query.empty() || Lowercase(sessions_[i].title).find(query) != std::wstring::npos) {
@@ -1140,7 +1502,6 @@ void ChatWindow::FilterSessions() {
     }
     firstRow_ = 0;
     selected_ = 0;
-    PlaceChildren();
     Refresh();
 }
 
@@ -1153,8 +1514,8 @@ void ChatWindow::MoveSelection(int delta) {
     selected_ = static_cast<size_t>(next);
     if (selected_ < firstRow_) {
         firstRow_ = selected_;
-    } else if (selected_ >= firstRow_ + kRowsShown) {
-        firstRow_ = selected_ + 1 - kRowsShown;
+    } else if (selected_ >= firstRow_ + kHistoryRows) {
+        firstRow_ = selected_ + 1 - kHistoryRows;
     }
     Refresh();
 }
@@ -1164,7 +1525,7 @@ void ChatWindow::OpenSession(size_t filteredIndex) {
         return;
     }
     const SessionInfo session = sessions_[filtered_[filteredIndex]];
-    ClosePopover();
+    ClosePopup();
     if (session.id == sessionId_) {
         return;
     }
@@ -1192,78 +1553,93 @@ void ChatWindow::OpenSession(size_t filteredIndex) {
     StartClaude();
 }
 
-std::wstring ChatWindow::ModelLabel() const {
-    const std::string wanted = settings_.model.empty() ? "default" : settings_.model;
-    std::wstring label = ToWide(wanted);
-    for (const Json& model : models_) {
-        if (JsonStr(model, "value") == wanted) {
-            label = ToWide(JsonStr(model, "displayName"));
-            if (const size_t cut = label.find(L" ("); cut != std::wstring::npos) {
-                label.resize(cut);  // "Default (recommended)"
-            }
+// The CLI lists aliases (opus, sonnet…) and pinned versions (claude-opus-4-8…): the aliases are the
+// main list, the versions go under "more"; "default" itself is shown as a badge on what it means.
+void ChatWindow::IndexModels() {
+    mainModels_.clear();
+    moreModels_.clear();
+    defaultResolved_.clear();
+    for (size_t i = 0; i < models_.size(); ++i) {
+        const std::string value = JsonStr(models_[i], "value");
+        if (value == "default") {
+            defaultResolved_ = JsonStr(models_[i], "resolvedModel");
+        } else if (value.find('-') == std::string::npos) {
+            mainModels_.push_back(i);
+        } else {
+            moreModels_.push_back(i);
         }
     }
-    if (!settings_.effort.empty()) {
-        label += L" · " + ToWide(settings_.effort);
-    }
-    return label;
 }
 
-void ChatWindow::ShowModelMenu(const Geometry& g) {
-    constexpr UINT kModelBase = 100;
-    constexpr UINT kEffortBase = 300;
-    const std::string current = settings_.model.empty() ? "default" : settings_.model;
-    const UINT disabled = busy_ ? MF_GRAYED : 0;
-
-    wil::unique_hmenu menu(CreatePopupMenu());
-    HMENU efforts = CreatePopupMenu();
-    std::vector<std::string> levels = {"low", "medium", "high", "xhigh", "max"};
-    for (size_t i = 0; i < models_.size(); ++i) {
+const Json* ChatWindow::CurrentModel() const {
+    for (const size_t i : mainModels_) {
         const Json& model = models_[i];
-        const std::string value = JsonStr(model, "value");
-        std::wstring text = ToWide(JsonStr(model, "displayName"));
-        if (const std::string about = JsonStr(model, "description"); !about.empty()) {
-            text += L"\t" + ToWide(about);
-        }
-        AppendMenuW(menu.get(), MF_STRING | disabled | (value == current ? MF_CHECKED : 0),
-                    kModelBase + static_cast<UINT>(i), text.c_str());
-        if (value == current && JsonAt(model, "supportedEffortLevels").is_array()) {
-            levels.clear();
-            for (const Json& level : JsonAt(model, "supportedEffortLevels")) {
-                if (level.is_string()) {
-                    levels.push_back(level.get<std::string>());
-                }
-            }
+        if (settings_.model.empty() ? JsonStr(model, "resolvedModel") == defaultResolved_
+                                    : JsonStr(model, "value") == settings_.model) {
+            return &model;
         }
     }
-    if (models_.empty()) {
-        AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 0, L"Список моделей ещё не пришёл от CLI");
+    for (const size_t i : moreModels_) {
+        if (JsonStr(models_[i], "value") == settings_.model) {
+            return &models_[i];
+        }
     }
-    AppendMenuW(efforts, MF_STRING | disabled | (settings_.effort.empty() ? MF_CHECKED : 0), kEffortBase,
-                L"по умолчанию");
-    for (size_t i = 0; i < levels.size(); ++i) {
-        AppendMenuW(efforts, MF_STRING | disabled | (levels[i] == settings_.effort ? MF_CHECKED : 0),
-                    kEffortBase + 1 + static_cast<UINT>(i), ToWide(levels[i]).c_str());
-    }
-    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu.get(), MF_POPUP, reinterpret_cast<UINT_PTR>(efforts), L"Effort");
+    return nullptr;
+}
 
-    POINT at{ToPx(g.model.left), ToPx(g.model.top) - 4};
-    ClientToScreen(hwnd_, &at);
-    const UINT chosen = static_cast<UINT>(
-        TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN, at.x, at.y, 0, hwnd_, nullptr));
-    if (chosen == 0) {
+std::wstring ChatWindow::ModelName() const {
+    if (const Json* model = CurrentModel(); model != nullptr) {
+        return ToWide(JsonStr(*model, "displayName"));
+    }
+    return settings_.model.empty() ? L"Модель" : ToWide(settings_.model);
+}
+
+std::vector<std::string> ChatWindow::EffortLevels() const {
+    std::vector<std::string> levels;
+    const Json* model = CurrentModel();
+    if (model == nullptr) {
+        return models_.empty() ? std::vector<std::string>{"low", "medium", "high", "xhigh", "max"} : levels;
+    }
+    for (const Json& level : JsonAt(*model, "supportedEffortLevels")) {
+        if (level.is_string()) {
+            levels.push_back(level.get<std::string>());
+        }
+    }
+    return levels;
+}
+
+void ChatWindow::SetEffortAt(float x) {
+    const std::vector<std::string> levels = EffortLevels();
+    if (levels.empty()) {
         return;
     }
-    Settings next = settings_;
-    if (chosen >= kModelBase && chosen < kModelBase + models_.size()) {
-        const std::string value = JsonStr(models_[chosen - kModelBase], "value");
-        next.model = value == "default" ? "" : value;
-    } else if (chosen == kEffortBase) {
-        next.effort.clear();
-    } else if (chosen > kEffortBase && chosen <= kEffortBase + levels.size()) {
-        next.effort = levels[chosen - kEffortBase - 1];
+    const Geometry g = Layout();
+    const float first = g.track.left + 14;
+    const float span = std::max(1.f, g.track.right - 14 - first);
+    const float position = std::clamp((x - first) / span, 0.f, 1.f) * static_cast<float>(levels.size() - 1);
+    const std::string& level = levels[static_cast<size_t>(std::lround(position))];
+    if (level != pendingEffort_) {
+        pendingEffort_ = level;
+        Refresh();
     }
+}
+
+void ChatWindow::ChooseModel(size_t index) {
+    Settings next = settings_;
+    next.model = JsonStr(models_[index], "value");
+    // An effort the new model does not have would be refused: back to its default.
+    bool supported = false;
+    for (const Json& level : JsonAt(models_[index], "supportedEffortLevels")) {
+        supported = supported || (level.is_string() && level.get<std::string>() == next.effort);
+    }
+    if (!supported) {
+        next.effort.clear();
+    }
+    ClosePopup();
+    Apply(next);
+}
+
+void ChatWindow::Apply(const Settings& next) {
     if (next.model == settings_.model && next.effort == settings_.effort) {
         return;
     }
@@ -1336,7 +1712,7 @@ void ChatWindow::ResetChat() {
 }
 
 void ChatWindow::NewChat() {
-    ClosePopover();
+    ClosePopup();
     ResetChat();
     StartClaude();
 }
@@ -1441,10 +1817,10 @@ void ChatWindow::OnClaude(const Json& message) {
             const Json& answer = JsonAt(response, "response");
             if (JsonAt(answer, "models").is_array()) {
                 models_ = JsonAt(answer, "models");
+                IndexModels();
             }
             const std::string email = JsonStr(JsonAt(answer, "account"), "email");
             userName_ = email.substr(0, email.find('@'));
-            PlaceChildren();  // the model chip's width
         }
     } else if (type == "control_request") {
         const std::string id = JsonStr(message, "request_id");

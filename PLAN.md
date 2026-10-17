@@ -39,6 +39,24 @@ aicontrols.exe ──stdin/stdout (stream-json)── claude.exe (нативны
 - Переезд 8 секретов (GITHUB, CLAUDEFLARE, SERVER, CFTOKENAEZA, ROUTER, BRR, GROC, AEZA):
   скрипт из старого клиента через env_secrets → новый файл. Значения нигде не печатаются.
 
+## Протокол claude.exe — проверено 17.10.2026 (CLI 2.1.287, tools\probe-protocol.ps1)
+
+Запуск: `claude.exe --output-format stream-json --verbose --input-format stream-json
+--permission-prompt-tool stdio --mcp-config {"mcpServers":{"aic":{"type":"sdk","name":"aic"}}} --tools ""`
++ `HTTPS_PROXY` на мост. Флаг `-p` не нужен. Всё — JSON по строке в stdin/stdout.
+
+1. Мы → `{"type":"control_request","request_id":"…","request":{"subtype":"initialize","hooks":null}}`.
+2. CLI → `control_request` `mcp_message` (initialize, notifications/initialized, tools/list), мы отвечаем
+   `control_response` с `{"mcp_response":{JSON-RPC}}`. Ответ на initialize CLI шлёт после нашего MCP-рукопожатия.
+3. Мы → `{"type":"user","session_id":"default","parent_tool_use_id":null,"message":{"role":"user","content":"…"}}`.
+4. CLI → `system/init` (session_id), `assistant` (thinking/text/tool_use), `rate_limit_event` (лимиты 5 ч / 7 дн!).
+5. Вызов инструмента: CLI → `can_use_tool` (tool_name, input, display_name, tool_use_id) → мы
+   `{"behavior":"allow","updatedInput":…}` или `{"behavior":"deny","message":"…"}` → при allow CLI → `mcp_message`
+   tools/call → мы результат. Отказ модель видит как tool_result с is_error.
+6. Конец хода — `{"type":"result",…}` (стоимость, usage). Закрыть stdin — CLI выходит.
+Прочее: `interrupt`, `set_model`, `set_permission_mode` — наши control_request; `--resume=<id>` для старого чата.
+Без `--tools ""` у модели будут и встроенные Bash/Read/Edit — решить, нужны ли (наши инструменты их заменяют).
+Подключаются и коннекторы claude.ai (Notion, GitBook…) даже с `--setting-sources ""` — найти, как отключить.
 ## Вариант A: C++23 (Win32 + Direct2D/DirectWrite) — ВЫБРАН
 
 Плюсы:
@@ -80,7 +98,7 @@ aicontrols.exe ──stdin/stdout (stream-json)── claude.exe (нативны
 
 ## Этапы (для варианта A; для B такие же)
 
-0. Разведка, 1 день: запустить claude.exe в stream-json из маленькой консольной программы,
+0. ✅ Разведка (17.10, протокол работает целиком): запустить claude.exe в stream-json из маленькой консольной программы,
    проверить control-протокол (инструмент + can_use_tool + resume). Если не взлетает — запасной путь.
 1. Окно: лента сообщений (простой текст), RichEdit-ввод, стриминг, «Стоп», выбор модели.
 2. Markdown + код + выделение/копирование. Самый долгий этап.

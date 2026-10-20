@@ -35,9 +35,11 @@
 #include "core/attachment.h"
 #include "core/claude_process.h"
 #include "core/markdown.h"
+#include "core/pty.h"
 #include "core/secrets.h"
 #include "core/store.h"
 #include "core/tools.h"
+#include "core/vt_screen.h"
 
 namespace aic {
 namespace {
@@ -46,6 +48,8 @@ namespace {
 constexpr UINT kClaudeMessage = WM_APP + 1;  // Json*
 constexpr UINT kClaudeExit = WM_APP + 2;     // ExitInfo*
 constexpr UINT kSecretKey = WM_APP + 3;      // from a secrets field: wParam the key, lParam the field's HWND
+constexpr UINT kTermData = WM_APP + 4;       // std::string* of terminal output (wParam: the terminal's generation)
+constexpr UINT kTermExit = WM_APP + 5;       // lParam: the shell's exit code
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
@@ -71,6 +75,8 @@ constexpr float kUsageRow = 58.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 32.f;
+constexpr float kTerminal = 480.f;  // the right column: PowerShell
+constexpr uint32_t kTermFg = 0xd4d4d8;
 constexpr float kSidebar = 252.f;  // the left column: search, secrets, the chats
 constexpr float kHistoryRow = 34.f;
 constexpr float kNavRow = 34.f;
@@ -157,6 +163,9 @@ enum class Target {
     None,
     SidebarToggle,
     SidebarSearch,
+    TerminalToggle,
+    TermClose,
+    TermScreen,
     NewChat,
     Attach,
     AttachmentChip,    // row: an index into the attachments; shows its remove button
@@ -196,7 +205,11 @@ struct Geometry {
     float area = 0;      // ... and its right edge
     float left = 0;      // where the chat column starts
     D2D1_RECT_F sidebar{};
-    D2D1_RECT_F sideToggle{};  // the header's button that shows or hides the sidebar
+    D2D1_RECT_F term{};  // the terminal column (empty when closed)
+    D2D1_RECT_F termClose{};
+    D2D1_RECT_F termScreen{};
+    D2D1_RECT_F terminalBtn{};  // the header's button that shows or hides the terminal
+    D2D1_RECT_F sideToggle{};   // the header's button that shows or hides the sidebar
     D2D1_RECT_F secrets{};     // the sidebar's entry for the secrets
     D2D1_RECT_F panel{};       // the secrets view: the sidebar itself while it is open
     D2D1_RECT_F panelClose{};
@@ -388,6 +401,28 @@ private:
     void PaintEffort(const Geometry& g);
     void PaintUsage(const Geometry& g);
 
+    // The terminal at the right: PowerShell in a pseudo console, drawn from the emulator's screen.
+    struct TermPoint {
+        size_t line = 0;  // an index into the emulator's lines (the scrollback first)
+        int col = 0;
+    };
+    void PaintTerminal(const Geometry& g);
+    void StartTerminal();
+    void SetTerminalOpen(bool open);
+    void SyncTerminalSize();
+    void OnTermData(const std::string& bytes);
+    void OnTermExit(DWORD code);
+    void OnTermKey(WPARAM key);
+    void OnTermChar(wchar_t c);
+    void TermSend(std::string_view bytes);
+    void PasteToTerminal();
+    void CopyTermSelection();
+    bool HasTermSelection() const;
+    bool TermSelected(size_t line, int col) const;
+    size_t TermFirstLine() const;
+    TermPoint TermCellAt(const Geometry& g, float x, float y) const;
+    void ScrollTerminal(long long lines);
+
     // The sidebar: search, the way to the secrets, the chats (or the secrets view in their place).
     void PaintSidebar(const Geometry& g);
     static size_t SidebarRows(const Geometry& g);
@@ -473,6 +508,22 @@ private:
     HWND input_ = nullptr;
     wil::unique_hmodule richEdit_;
     wil::unique_hfont uiFont_;
+    bool terminalOpen_ = false;
+    bool termFocus_ = false;         // typing goes to the shell
+    bool termExited_ = false;
+    bool termSwallowChar_ = false;   // the key that was just handled would also make a character
+    bool selecting_ = false;
+    wchar_t pendingHigh_ = 0;        // a UTF-16 high surrogate waiting for its pair
+    size_t termScroll_ = 0;          // lines scrolled back from the bottom
+    float cellW_ = 8.f;
+    float cellH_ = 18.f;
+    std::optional<TermPoint> selAnchor_;
+    std::optional<TermPoint> selEnd_;
+    WPARAM termGeneration_ = 0;      // bumped per shell; stale posts are dropped
+    std::unique_ptr<VtScreen> term_;
+    Pty pty_;                        // after term_: its threads end before the screen goes
+    wil::com_ptr<IDWriteTextFormat> termFont_;
+    wil::com_ptr<IDWriteTextFormat> termBold_;
     bool sidebarOpen_ = true;
     bool searchFocus_ = false;  // typing goes to the sidebar's search (drawn here, no caret)
     bool secretsOpen_ = false;  // the sidebar shows the secrets instead of the chats
@@ -589,6 +640,10 @@ int ChatWindow::Run(int show) {
     small_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     mono_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     button_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+    termFont_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    termBold_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    cellW_ = TextWidth(L"MMMMMMMMMM", termFont_.get()) / 10.f;
+    cellH_ = 18.f;
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -718,6 +773,18 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return reinterpret_cast<LRESULT>(fieldBrush_.get());
         }
         break;
+    case kTermData: {
+        const std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lParam));
+        if (wParam == termGeneration_) {
+            OnTermData(*payload);
+        }
+        return 0;
+    }
+    case kTermExit:
+        if (wParam == termGeneration_) {
+            OnTermExit(static_cast<DWORD>(lParam));
+        }
+        return 0;
     case kSecretKey: {
         const auto from = reinterpret_cast<HWND>(lParam);
         if (wParam == VK_ESCAPE) {
@@ -784,6 +851,17 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             SetEffortAt(at.x);
             return 0;
         }
+        if (selecting_) {  // dragging a selection in the terminal; past its edge the view scrolls
+            const Geometry g = Layout();
+            if (at.y < g.termScreen.top) {
+                ScrollTerminal(1);
+            } else if (at.y > g.termScreen.bottom) {
+                ScrollTerminal(-1);
+            }
+            selEnd_ = TermCellAt(g, at.x, at.y);
+            Refresh();
+            return 0;
+        }
         if (const Hit hit = HitTest(at.x, at.y); !(hit == hover_)) {
             hover_ = hit;
             if (hit.target == Target::HistoryRow) {
@@ -805,13 +883,25 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT && reinterpret_cast<HWND>(wParam) == hwnd_) {
             const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup &&
-                                   hover_.target != Target::AttachmentChip;
-            SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
+                                   hover_.target != Target::AttachmentChip && hover_.target != Target::TermScreen;
+            SetCursor(LoadCursorW(nullptr, hover_.target == Target::TermScreen ? IDC_IBEAM
+                                                                                : (clickable ? IDC_HAND : IDC_ARROW)));
             return TRUE;
         }
         break;
     case WM_LBUTTONDOWN: {
         const D2D1_POINT_2F at = CursorDip(lParam);
+        if (popup_ == Popup::None && term_ && HitTest(at.x, at.y).target == Target::TermScreen) {
+            termFocus_ = true;  // a click into the terminal: keys go to the shell, a drag selects
+            searchFocus_ = false;
+            SetFocus(hwnd_);
+            selEnd_ = TermCellAt(Layout(), at.x, at.y);
+            selAnchor_ = selEnd_;
+            selecting_ = true;
+            SetCapture(hwnd_);
+            Refresh();
+            return 0;
+        }
         if (HitTest(at.x, at.y).target == Target::EffortTrack) {
             draggingEffort_ = true;
             SetCapture(hwnd_);
@@ -820,6 +910,16 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_LBUTTONUP: {
+        if (selecting_) {
+            selecting_ = false;
+            ReleaseCapture();
+            if (!HasTermSelection()) {  // a plain click: no selection
+                selAnchor_.reset();
+                selEnd_.reset();
+            }
+            Refresh();
+            return 0;
+        }
         if (draggingEffort_) {
             draggingEffort_ = false;
             ReleaseCapture();
@@ -834,7 +934,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         ScreenToClient(hwnd_, &at);
         const float steps = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
         const Geometry g = Layout();
-        if (popup_ == Popup::None && !secretsOpen_ && Inside(g.sidebar, ToDip(at.x), ToDip(at.y))) {
+        if (popup_ == Popup::None && Inside(g.term, ToDip(at.x), ToDip(at.y))) {
+            ScrollTerminal(-static_cast<long long>(std::lround(steps * 3)));
+        } else if (popup_ == Popup::None && !secretsOpen_ && Inside(g.sidebar, ToDip(at.x), ToDip(at.y))) {
             const size_t rows = SidebarRows(g);
             const size_t maxFirst = filtered_.size() > rows ? filtered_.size() - rows : 0;
             const auto moved = static_cast<long long>(firstRow_) + static_cast<long long>(std::lround(steps * 3));
@@ -846,6 +948,15 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_RBUTTONUP:
+        if (popup_ == Popup::None && term_ &&
+            HitTest(CursorDip(lParam).x, CursorDip(lParam).y).target == Target::TermScreen) {
+            if (HasTermSelection()) {  // as in Windows Terminal: a right click copies a selection, else pastes
+                CopyTermSelection();
+            } else {
+                PasteToTerminal();
+            }
+            return 0;
+        }
         if (popup_ == Popup::None) {
             const D2D1_POINT_2F at = CursorDip(lParam);
             POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -862,6 +973,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             OnPopupKey(wParam);
         } else if (searchFocus_) {
             OnSearchKey(wParam);
+        } else if (termFocus_) {
+            OnTermKey(wParam);
         }
         return 0;
     case WM_CHAR:
@@ -869,10 +982,18 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             OnPopupChar(static_cast<wchar_t>(wParam));
         } else if (searchFocus_) {
             OnSearchChar(static_cast<wchar_t>(wParam));
+        } else if (termFocus_) {
+            OnTermChar(static_cast<wchar_t>(wParam));
         }
         return 0;
+    case WM_SYSCHAR:  // Alt+key in the shell
+        if (termFocus_ && popup_ == Popup::None && !termExited_) {
+            TermSend("\x1b" + ToUtf8(std::wstring(1, static_cast<wchar_t>(wParam))));
+            return 0;
+        }
+        break;
     case WM_SETFOCUS:
-        if (popup_ == Popup::None && !searchFocus_) {  // with a panel open or the search active the keys stay here
+        if (popup_ == Popup::None && !searchFocus_ && !termFocus_) {  // with a panel open, the search or the shell active the keys stay here
             SetFocus(input_);
         }
         return 0;
@@ -923,6 +1044,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_DESTROY:
         ++generation_;
+        ++termGeneration_;
+        pty_.Stop();
         host_.CancelAll();
         claude_.Stop();
         PostQuitMessage(0);
@@ -935,10 +1058,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
 
 void ChatWindow::OnClick(float x, float y) {
     const Hit hit = HitTest(x, y);
-    bool keepFocus = false;  // the secrets view's and the search's own clicks keep focus where they put it
+    bool keepFocus = false;  // the secrets view's, the search's and the terminal's own clicks keep focus where they put it
     if (hit.target != Target::SidebarSearch) {
         searchFocus_ = false;
     }
+    termFocus_ = false;  // a click anywhere but into the screen (those never get here) ends typing into the shell
     if (popup_ != Popup::None) {
         switch (hit.target) {
         case Target::ModelRow:
@@ -974,6 +1098,13 @@ void ChatWindow::OnClick(float x, float y) {
     switch (hit.target) {
     case Target::SidebarToggle:
         SetSidebarOpen(!sidebarOpen_);
+        break;
+    case Target::TerminalToggle:
+        SetTerminalOpen(!terminalOpen_);
+        keepFocus = true;
+        break;
+    case Target::TermClose:
+        SetTerminalOpen(false);
         break;
     case Target::SidebarSearch:
         searchFocus_ = true;
@@ -1111,6 +1242,7 @@ void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
         inputFocused_ = code == EN_SETFOCUS;
         if (inputFocused_) {
             searchFocus_ = false;
+            termFocus_ = false;
             ClosePopup();  // a click into the input
         }
         Refresh();
@@ -1166,14 +1298,16 @@ Geometry ChatWindow::Layout() const {
     // The sidebar docks at the left and the chat takes what is left, as in Claude's app.
     const float sidebarWidth = sidebarOpen_ ? std::min(kSidebar, std::max(0.f, g.width - kMinChat)) : 0.f;
     g.areaLeft = sidebarWidth;
-    g.area = g.width;
+    const float termWidth = terminalOpen_ ? std::min(kTerminal, std::max(0.f, g.width - sidebarWidth - kMinChat)) : 0.f;
+    g.area = g.width - termWidth;
     g.column = std::max(0.f, std::min(g.area - g.areaLeft - 2 * kSide, kColumnMax));
     const float left = g.areaLeft + (g.area - g.areaLeft - g.column) / 2;
     g.left = left;
     const float right = left + g.column;
 
     const float buttonTop = (kHeader - kButton) / 2;
-    g.newChat = D2D1::RectF(g.width - 10 - kButton, buttonTop, g.width - 10, buttonTop + kButton);
+    g.terminalBtn = D2D1::RectF(g.width - 10 - kButton, buttonTop, g.width - 10, buttonTop + kButton);
+    g.newChat = D2D1::RectF(g.terminalBtn.left - 4 - kButton, buttonTop, g.terminalBtn.left - 4, buttonTop + kButton);
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
@@ -1212,6 +1346,11 @@ Geometry ChatWindow::Layout() const {
         g.search = D2D1::RectF(10, kHeader + 10, sidebarWidth - 10, kHeader + 10 + kFieldHeight);
         g.secrets = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
         g.listTop = g.secrets.bottom + 8 + 26;  // under the "chats" label
+    }
+    if (termWidth > 0) {
+        g.term = D2D1::RectF(g.area, kHeader, g.width, g.height);
+        g.termClose = D2D1::RectF(g.term.right - 12 - 28, g.term.top + 8, g.term.right - 12, g.term.top + 36);
+        g.termScreen = D2D1::RectF(g.term.left + 14, g.term.top + 44, g.term.right - 8, g.term.bottom - 12);
     }
     if (secretsOpen_ && sidebarWidth > 0) {
         g.panel = g.sidebar;
@@ -1338,8 +1477,17 @@ Hit ChatWindow::HitTest(float x, float y) const {
         }
         return {};
     }
+    if (Inside(g.term, x, y)) {
+        if (Inside(g.termClose, x, y)) {
+            return {Target::TermClose};
+        }
+        return Inside(g.termScreen, x, y) ? Hit{Target::TermScreen} : Hit{};
+    }
     if (Inside(g.sideToggle, x, y)) {
         return {Target::SidebarToggle};
+    }
+    if (Inside(g.terminalBtn, x, y)) {
+        return {Target::TerminalToggle};
     }
     if (Inside(g.feed, x, y)) {
         for (size_t i = 0; i < feed_.size(); ++i) {
@@ -1436,6 +1584,7 @@ void ChatWindow::PlaceChildren() {
     MoveChild(input_, Layout().text);
     SendMessageW(input_, EM_REQUESTRESIZE, 0, 0);
     PlaceSecretFields();
+    SyncTerminalSize();
 }
 
 void ChatWindow::EnsureTarget() {
@@ -1568,6 +1717,7 @@ void ChatWindow::Paint() {
     PaintHeader(g);
     PaintInput(g);
     PaintSidebar(g);
+    PaintTerminal(g);
     switch (popup_) {
     case Popup::Models:
         PaintModels(g);
@@ -1786,9 +1936,12 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Text(state, ui_.get(), D2D1::RectF(titleLeft + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
     }
 
-    for (const Target button : {Target::SidebarToggle, Target::NewChat}) {
-        const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle : g.newChat;
-        const bool active = hover_.target == button || (button == Target::SidebarToggle && sidebarOpen_);
+    for (const Target button : {Target::SidebarToggle, Target::NewChat, Target::TerminalToggle}) {
+        const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle
+                               : button == Target::NewChat    ? g.newChat
+                                                              : g.terminalBtn;
+        const bool active = hover_.target == button || (button == Target::SidebarToggle && sidebarOpen_) ||
+                            (button == Target::TerminalToggle && terminalOpen_);
         if (active) {
             Fill(r, 6.f, kRaised);
         }
@@ -1799,6 +1952,10 @@ void ChatWindow::PaintHeader(const Geometry& g) {
             target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 8.f, c.y - 6.5f, c.x + 8.f, c.y + 6.5f), 2.5f, 2.5f),
                                           brush_.get(), 1.4f);
             Line({c.x - 3.f, c.y - 6.5f}, {c.x - 3.f, c.y + 6.5f}, color, 1.4f);
+        } else if (button == Target::TerminalToggle) {  // a prompt: > and a cursor
+            Line({c.x - 6.f, c.y - 4.f}, {c.x - 1.5f, c.y}, color, 1.5f);
+            Line({c.x - 1.5f, c.y}, {c.x - 6.f, c.y + 4.f}, color, 1.5f);
+            Line({c.x + 1.f, c.y + 5.f}, {c.x + 7.f, c.y + 5.f}, color, 1.5f);
         } else {  // a plus
             Line({c.x - 6.5f, c.y}, {c.x + 6.5f, c.y}, color, 1.6f);
             Line({c.x, c.y - 6.5f}, {c.x, c.y + 6.5f}, color, 1.6f);
@@ -2142,6 +2299,512 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
     const bool replacing = ready && secrets_.Has(ToUtf8(name));
     Fill(g.saveButton, 8.f, ready ? kAccent : kRaised, ready && hover_.target == Target::SecretSave ? 0.85f : 1.f);
     Text(replacing ? L"Обновить" : L"Добавить", button_.get(), g.saveButton, ready ? kPrimary : kSecondary);
+}
+
+// ---- The terminal -------------------------------------------------------------------------------
+
+bool SetClipboardText(HWND owner, const std::wstring& text) {
+    if (!OpenClipboard(owner)) {
+        return false;
+    }
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    bool ok = false;
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes); memory != nullptr) {
+        if (void* data = GlobalLock(memory); data != nullptr) {
+            std::memcpy(data, text.c_str(), bytes);
+            GlobalUnlock(memory);
+            ok = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+        }
+        if (!ok) {
+            GlobalFree(memory);
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
+uint32_t Mix(uint32_t from, uint32_t to, float amount) {
+    const auto channel = [&](int shift) {
+        const float a = static_cast<float>((from >> shift) & 0xff);
+        const float b = static_cast<float>((to >> shift) & 0xff);
+        return static_cast<uint32_t>(a + (b - a) * amount) & 0xff;
+    };
+    return channel(16) << 16 | channel(8) << 8 | channel(0);
+}
+
+void ChatWindow::StartTerminal() {
+    const Geometry g = Layout();
+    const int cols = std::max(10, static_cast<int>((g.termScreen.right - g.termScreen.left) / cellW_));
+    const int rows = std::max(3, static_cast<int>((g.termScreen.bottom - g.termScreen.top) / cellH_));
+    pty_.Stop();
+    term_ = std::make_unique<VtScreen>(cols, rows);
+    term_->SetReply([this](std::string answer) { pty_.Write(answer); });
+    termExited_ = false;
+    termScroll_ = 0;
+    selAnchor_.reset();
+    selEnd_.reset();
+    const WPARAM generation = ++termGeneration_;
+    const HWND hwnd = hwnd_;
+    wchar_t profile[MAX_PATH]{};
+    GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    try {
+        pty_.Start(
+            cols, rows, L"powershell.exe -NoLogo", profile,
+            [hwnd, generation](std::string bytes) {
+                auto payload = std::make_unique<std::string>(std::move(bytes));
+                if (PostMessageW(hwnd, kTermData, generation, reinterpret_cast<LPARAM>(payload.get()))) {
+                    payload.release();
+                }
+            },
+            [hwnd, generation](DWORD code) { PostMessageW(hwnd, kTermExit, generation, static_cast<LPARAM>(code)); });
+    } catch (const std::exception& e) {
+        term_->Feed("\x1b[31m" + ToUtf8(L"Не удалось запустить PowerShell: ") + e.what() + "\x1b[0m");
+        termExited_ = true;
+    }
+}
+
+void ChatWindow::SetTerminalOpen(bool open) {
+    if (terminalOpen_ == open) {
+        return;
+    }
+    ClosePopup();
+    terminalOpen_ = open;
+    hover_ = {};
+    PlaceChildren();  // the chat's column moves
+    if (open) {
+        if (!term_) {
+            StartTerminal();
+        }
+        SyncTerminalSize();
+        termFocus_ = true;
+        searchFocus_ = false;
+        SetFocus(hwnd_);
+    } else {
+        termFocus_ = false;
+        selecting_ = false;
+        SetFocus(input_);
+    }
+    Refresh();
+}
+
+// The grid follows the panel: as many columns and rows as fit.
+void ChatWindow::SyncTerminalSize() {
+    if (!terminalOpen_ || !term_) {
+        return;
+    }
+    const Geometry g = Layout();
+    if (g.termScreen.right <= g.termScreen.left) {
+        return;
+    }
+    const int cols = std::max(10, static_cast<int>((g.termScreen.right - g.termScreen.left) / cellW_));
+    const int rows = std::max(3, static_cast<int>((g.termScreen.bottom - g.termScreen.top) / cellH_));
+    if (cols != term_->Cols() || rows != term_->Rows()) {
+        term_->Resize(cols, rows);
+        pty_.Resize(cols, rows);
+        termScroll_ = std::min(termScroll_, term_->ScrollbackSize());
+    }
+}
+
+void ChatWindow::OnTermData(const std::string& bytes) {
+    if (!term_) {
+        return;
+    }
+    const size_t before = term_->ScrollbackSize();
+    term_->Feed(bytes);
+    if (termScroll_ > 0) {  // reading the scrollback: the view stays on its lines while new ones arrive
+        termScroll_ = std::min(termScroll_ + (term_->ScrollbackSize() - std::min(before, term_->ScrollbackSize())),
+                               term_->ScrollbackSize());
+    }
+    Refresh();
+}
+
+void ChatWindow::OnTermExit(DWORD code) {
+    termExited_ = true;
+    if (term_) {
+        term_->Feed("\r\n\x1b[90m" + ToUtf8(std::format(L"[процесс завершён, код {}; любая клавиша запускает заново]", code)) +
+                    "\x1b[0m");
+    }
+    Refresh();
+}
+
+void ChatWindow::TermSend(std::string_view bytes) {
+    pty_.Write(bytes);
+    termScroll_ = 0;
+    selAnchor_.reset();
+    selEnd_.reset();
+    Refresh();
+}
+
+void ChatWindow::OnTermChar(wchar_t c) {
+    if (termSwallowChar_) {
+        termSwallowChar_ = false;
+        return;
+    }
+    if (termExited_) {
+        StartTerminal();
+        return;
+    }
+    if (c >= 0xd800 && c <= 0xdbff) {
+        pendingHigh_ = c;
+        return;
+    }
+    std::wstring text;
+    if (pendingHigh_ != 0) {
+        text += pendingHigh_;
+        pendingHigh_ = 0;
+    }
+    text += c;
+    if (c == 0x08) {
+        TermSend("\x7f");  // Backspace
+    } else if (c == 0x7f) {
+        TermSend("\x17");  // Ctrl+Backspace: delete the word
+    } else if (c == 0) {
+        TermSend(std::string(1, '\0'));
+    } else {
+        TermSend(ToUtf8(text));
+    }
+}
+
+void ChatWindow::OnTermKey(WPARAM key) {
+    if (termExited_) {
+        if (key != VK_SHIFT && key != VK_CONTROL && key != VK_MENU) {
+            StartTerminal();
+            termSwallowChar_ = true;
+        }
+        return;
+    }
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    if (control && key == 'C' && (shift || HasTermSelection())) {
+        CopyTermSelection();
+        termSwallowChar_ = true;
+        return;
+    }
+    if ((control && key == 'V') || (shift && key == VK_INSERT)) {
+        PasteToTerminal();
+        termSwallowChar_ = true;
+        return;
+    }
+    if (control && key == VK_INSERT) {
+        CopyTermSelection();
+        return;
+    }
+    if (shift && (key == VK_PRIOR || key == VK_NEXT)) {
+        ScrollTerminal((key == VK_PRIOR ? 1 : -1) * std::max(1, term_ ? term_->Rows() - 1 : 1));
+        return;
+    }
+    if (key == VK_TAB && shift) {
+        TermSend("\x1b[Z");
+        termSwallowChar_ = true;
+        return;
+    }
+    const int modifier = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (control ? 4 : 0);
+    const auto arrow = [&](char final) {
+        if (modifier == 1) {
+            return std::string(term_ && term_->AppCursorKeys() ? "\x1bO" : "\x1b[") + final;
+        }
+        return "\x1b[1;" + std::to_string(modifier) + final;
+    };
+    const auto tilde = [&](int code) {
+        return "\x1b[" + std::to_string(code) + (modifier == 1 ? "" : ";" + std::to_string(modifier)) + "~";
+    };
+    switch (key) {
+    case VK_UP:
+        TermSend(arrow('A'));
+        break;
+    case VK_DOWN:
+        TermSend(arrow('B'));
+        break;
+    case VK_RIGHT:
+        TermSend(arrow('C'));
+        break;
+    case VK_LEFT:
+        TermSend(arrow('D'));
+        break;
+    case VK_HOME:
+        TermSend(arrow('H'));
+        break;
+    case VK_END:
+        TermSend(arrow('F'));
+        break;
+    case VK_INSERT:
+        TermSend(tilde(2));
+        break;
+    case VK_DELETE:
+        TermSend(tilde(3));
+        break;
+    case VK_PRIOR:
+        TermSend(tilde(5));
+        break;
+    case VK_NEXT:
+        TermSend(tilde(6));
+        break;
+    case VK_F1:
+    case VK_F2:
+    case VK_F3:
+    case VK_F4:
+        TermSend(std::string("\x1bO") + static_cast<char>('P' + (key - VK_F1)));
+        break;
+    case VK_F5:
+        TermSend(tilde(15));
+        break;
+    case VK_F6:
+    case VK_F7:
+    case VK_F8:
+        TermSend(tilde(17 + static_cast<int>(key - VK_F6)));
+        break;
+    case VK_F9:
+    case VK_F10:
+        TermSend(tilde(20 + static_cast<int>(key - VK_F9)));
+        break;
+    case VK_F11:
+    case VK_F12:
+        TermSend(tilde(23 + static_cast<int>(key - VK_F11)));
+        break;
+    default:
+        break;
+    }
+}
+
+void ChatWindow::PasteToTerminal() {
+    if (!term_ || termExited_) {
+        return;
+    }
+    std::wstring text = ClipboardText(hwnd_);
+    if (text.empty()) {
+        return;
+    }
+    std::wstring flat;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') {
+            continue;
+        }
+        if (text[i] != 0x1b) {  // an escape in pasted text could end the bracket early
+            flat += text[i] == L'\n' ? L'\r' : text[i];
+        }
+    }
+    std::string bytes = ToUtf8(flat);
+    if (term_->BracketedPaste()) {
+        bytes = "\x1b[200~" + bytes + "\x1b[201~";
+    }
+    TermSend(bytes);
+}
+
+bool ChatWindow::HasTermSelection() const {
+    return selAnchor_ && selEnd_ && (selAnchor_->line != selEnd_->line || selAnchor_->col != selEnd_->col);
+}
+
+bool ChatWindow::TermSelected(size_t line, int col) const {
+    if (!HasTermSelection()) {
+        return false;
+    }
+    TermPoint a = *selAnchor_;
+    TermPoint b = *selEnd_;
+    if (a.line > b.line || (a.line == b.line && a.col > b.col)) {
+        std::swap(a, b);
+    }
+    const bool afterStart = line > a.line || (line == a.line && col >= a.col);
+    const bool beforeEnd = line < b.line || (line == b.line && col <= b.col);
+    return afterStart && beforeEnd;
+}
+
+void ChatWindow::CopyTermSelection() {
+    if (!term_ || !HasTermSelection()) {
+        return;
+    }
+    TermPoint a = *selAnchor_;
+    TermPoint b = *selEnd_;
+    if (a.line > b.line || (a.line == b.line && a.col > b.col)) {
+        std::swap(a, b);
+    }
+    if (SetClipboardText(hwnd_, term_->TextBetween(a.line, a.col, b.line, b.col + 1))) {
+        Flash(L"Скопировано");
+    }
+    selAnchor_.reset();
+    selEnd_.reset();
+    Refresh();
+}
+
+// The index of the line shown at the top of the screen area.
+size_t ChatWindow::TermFirstLine() const {
+    if (!term_) {
+        return 0;
+    }
+    const size_t rows = static_cast<size_t>(term_->Rows());
+    const size_t scroll = std::min(termScroll_, term_->ScrollbackSize());
+    return term_->LineCount() - rows - scroll;
+}
+
+ChatWindow::TermPoint ChatWindow::TermCellAt(const Geometry& g, float x, float y) const {
+    TermPoint point;
+    if (!term_) {
+        return point;
+    }
+    const int row = std::clamp(static_cast<int>(std::floor((y - g.termScreen.top) / cellH_)), 0, term_->Rows() - 1);
+    point.col = std::clamp(static_cast<int>(std::floor((x - g.termScreen.left) / cellW_)), 0, term_->Cols() - 1);
+    point.line = TermFirstLine() + static_cast<size_t>(row);
+    return point;
+}
+
+void ChatWindow::ScrollTerminal(long long lines) {
+    if (!term_) {
+        return;
+    }
+    const long long most = static_cast<long long>(term_->ScrollbackSize());
+    termScroll_ = static_cast<size_t>(std::clamp(static_cast<long long>(termScroll_) + lines, 0LL, most));
+    Refresh();
+}
+
+void ChatWindow::PaintTerminal(const Geometry& g) {
+    if (g.term.right <= g.term.left) {
+        return;
+    }
+    Fill(g.term, 0.f, kPanel);
+    Line({g.term.left, g.term.top}, {g.term.left, g.term.bottom}, kLine, 1.f);
+    Text(L"Терминал", uiBold_.get(),
+         D2D1::RectF(g.term.left + 14, g.term.top + 8, g.termClose.left - 8, g.term.top + 36), kPrimary);
+    {  // a cross
+        const bool active = hover_.target == Target::TermClose;
+        if (active) {
+            Fill(g.termClose, 6.f, kRaised);
+        }
+        const D2D1_POINT_2F c{(g.termClose.left + g.termClose.right) / 2, (g.termClose.top + g.termClose.bottom) / 2};
+        const uint32_t color = active ? kPrimary : kSecondary;
+        Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.5f);
+        Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.5f);
+    }
+    if (!term_) {
+        return;
+    }
+
+    target_->PushAxisAlignedClip(D2D1::RectF(g.term.left + 1, g.termScreen.top, g.term.right, g.term.bottom - 4),
+                                 D2D1_ANTIALIAS_MODE_ALIASED);
+    const int cols = term_->Cols();
+    const int rows = term_->Rows();
+    const size_t first = TermFirstLine();
+    for (int r = 0; r < rows; ++r) {
+        const size_t index = first + static_cast<size_t>(r);
+        const VtLine& line = term_->Line(index);
+        const float y = g.termScreen.top + static_cast<float>(r) * cellH_;
+        const auto colors = [&](const VtCell& cell, size_t col, uint32_t& fg, uint32_t& bg, bool& hasBg) {
+            fg = cell.fg == kVtDefault ? kTermFg : cell.fg;
+            bg = cell.bg == kVtDefault ? kPanel : cell.bg;
+            hasBg = cell.bg != kVtDefault;
+            if ((cell.attrs & kVtInverse) != 0) {
+                std::swap(fg, bg);
+                hasBg = true;
+            }
+            if ((cell.attrs & kVtDim) != 0) {
+                fg = Mix(fg, bg, 0.45f);
+            }
+            if (TermSelected(index, static_cast<int>(col))) {
+                bg = Mix(bg, kAccent, 0.45f);
+                hasBg = true;
+            }
+        };
+
+        // Backgrounds first, in runs.
+        for (int col = 0; col < cols;) {
+            uint32_t fg = 0, bg = 0;
+            bool hasBg = false;
+            colors(line[static_cast<size_t>(col)], static_cast<size_t>(col), fg, bg, hasBg);
+            int end = col + 1;
+            while (end < cols) {
+                uint32_t fg2 = 0, bg2 = 0;
+                bool hasBg2 = false;
+                colors(line[static_cast<size_t>(end)], static_cast<size_t>(end), fg2, bg2, hasBg2);
+                if (hasBg2 != hasBg || bg2 != bg) {
+                    break;
+                }
+                ++end;
+            }
+            if (hasBg) {
+                Fill(D2D1::RectF(g.termScreen.left + static_cast<float>(col) * cellW_, y,
+                                 g.termScreen.left + static_cast<float>(end) * cellW_, y + cellH_),
+                     0.f, bg);
+            }
+            col = end;
+        }
+
+        // Then the text: a run is a stretch of narrow characters with the same look.
+        std::wstring run;
+        float runX = 0;
+        uint32_t runFg = 0;
+        uint8_t runAttrs = 0;
+        const auto flush = [&] {
+            if (!run.empty() && run.find_first_not_of(L' ') != std::wstring::npos) {
+                brush_->SetColor(Color(runFg));
+                IDWriteTextFormat* format = (runAttrs & kVtBold) != 0 ? termBold_.get() : termFont_.get();
+                const float width = cellW_ * static_cast<float>(run.size() + 1);
+                target_->DrawText(run.c_str(), static_cast<UINT32>(run.size()), format,
+                                  D2D1::RectF(runX, y, runX + width, y + cellH_), brush_.get());
+                if ((runAttrs & kVtUnderline) != 0) {
+                    Line({runX, y + cellH_ - 2.f}, {runX + cellW_ * static_cast<float>(run.size()), y + cellH_ - 2.f},
+                         runFg, 1.f);
+                }
+            }
+            run.clear();
+        };
+        for (int col = 0; col < cols; ++col) {
+            const VtCell& cell = line[static_cast<size_t>(col)];
+            if (cell.ch == 0) {
+                continue;
+            }
+            uint32_t fg = 0, bg = 0;
+            bool hasBg = false;
+            colors(cell, static_cast<size_t>(col), fg, bg, hasBg);
+            const float x = g.termScreen.left + static_cast<float>(col) * cellW_;
+            if (VtCharWidth(cell.ch) == 2 || cell.ch > 0xffff) {  // wide: alone, at its own column
+                flush();
+                std::wstring glyph;
+                if (cell.ch > 0xffff) {
+                    const char32_t v = cell.ch - 0x10000;
+                    glyph += static_cast<wchar_t>(0xd800 + (v >> 10));
+                    glyph += static_cast<wchar_t>(0xdc00 + (v & 0x3ff));
+                } else {
+                    glyph += static_cast<wchar_t>(cell.ch);
+                }
+                brush_->SetColor(Color(fg));
+                target_->DrawText(glyph.c_str(), static_cast<UINT32>(glyph.size()), termFont_.get(),
+                                  D2D1::RectF(x, y, x + 3 * cellW_, y + cellH_), brush_.get());
+                continue;
+            }
+            if (!run.empty() && (fg != runFg || (cell.attrs & (kVtBold | kVtUnderline)) != (runAttrs & (kVtBold | kVtUnderline)))) {
+                flush();
+            }
+            if (run.empty()) {
+                runX = x;
+                runFg = fg;
+                runAttrs = cell.attrs;
+            }
+            run += static_cast<wchar_t>(cell.ch);
+        }
+        flush();
+    }
+
+    if (term_->CursorVisible() && termScroll_ == 0 && !termExited_) {  // a block while typing goes here, an outline otherwise
+        const D2D1_RECT_F block = D2D1::RectF(g.termScreen.left + static_cast<float>(term_->CursorCol()) * cellW_,
+                                              g.termScreen.top + static_cast<float>(term_->CursorRow()) * cellH_,
+                                              g.termScreen.left + static_cast<float>(term_->CursorCol() + 1) * cellW_,
+                                              g.termScreen.top + static_cast<float>(term_->CursorRow() + 1) * cellH_);
+        if (termFocus_) {
+            Fill(block, 0.f, kTermFg, 0.55f);
+        } else {
+            brush_->SetColor(Color(kSecondary));
+            target_->DrawRectangle(block, brush_.get(), 1.f);
+        }
+    }
+    if (term_->ScrollbackSize() > 0) {  // where the view is within the scrollback
+        const float track = g.termScreen.bottom - g.termScreen.top;
+        const float total = static_cast<float>(term_->LineCount());
+        const float thumb = std::max(20.f, track * static_cast<float>(rows) / total);
+        const float shown = static_cast<float>(first) / std::max(1.f, total - static_cast<float>(rows));
+        const float top = g.termScreen.top + (track - thumb) * std::clamp(shown, 0.f, 1.f);
+        Fill(D2D1::RectF(g.term.right - 6.f, top, g.term.right - 3.f, top + thumb), 1.5f, kLine);
+    }
+    target_->PopAxisAlignedClip();
 }
 
 void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {
@@ -2652,6 +3315,7 @@ void ChatWindow::OpenPopup(Popup popup) {
         break;
     }
     searchFocus_ = false;
+    termFocus_ = false;
     SetFocus(hwnd_);  // the panel's keys: digits, arrows
     Refresh();
 }

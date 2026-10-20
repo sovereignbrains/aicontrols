@@ -24,9 +24,11 @@ add_library(aic_core STATIC
   src/core/attachment.cpp
   src/core/claude_process.cpp
   src/core/markdown.cpp
+  src/core/pty.cpp
   src/core/secrets.cpp
   src/core/store.cpp
-  src/core/tools.cpp)
+  src/core/tools.cpp
+  src/core/vt_screen.cpp)
 target_include_directories(aic_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs)
 
@@ -44,6 +46,12 @@ target_link_libraries(aic_tools_test PRIVATE aic_core)
 
 add_executable(aic_markdown_test tests/markdown_test.cpp)
 target_link_libraries(aic_markdown_test PRIVATE aic_core)
+
+add_executable(aic_vt_test tests/vt_screen_test.cpp)
+target_link_libraries(aic_vt_test PRIVATE aic_core)
+
+add_executable(aic_pty_test tests/pty_test.cpp)
+target_link_libraries(aic_pty_test PRIVATE aic_core)
 
 # By hand, spends a request: the real claude.exe calling our tools (see the file's header).
 add_executable(aic_e2e_probe tests/e2e_probe.cpp)

@@ -45,6 +45,7 @@ namespace {
 // Posted from the reader thread; wParam is the chat's generation, lParam owns the payload.
 constexpr UINT kClaudeMessage = WM_APP + 1;  // Json*
 constexpr UINT kClaudeExit = WM_APP + 2;     // ExitInfo*
+constexpr UINT kSecretKey = WM_APP + 3;      // from a secrets field: wParam the key, lParam the field's HWND
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
@@ -62,6 +63,11 @@ constexpr float kChipsBottom = 10.f;
 constexpr float kInputButton = 30.f;  // "+" and send
 constexpr float kRing = 22.f;
 constexpr float kUsageWidth = 380.f;
+constexpr float kSidePanel = 340.f;   // the secrets panel, docked at the right
+constexpr float kPanelPad = 16.f;
+constexpr float kSecretRow = 38.f;
+constexpr float kFieldHeight = 34.f;
+constexpr float kSecretsNote = 50.f;
 constexpr float kUsageRow = 58.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
@@ -157,6 +163,11 @@ enum class Target {
     ModelChip,
     EffortChip,
     UsageChip,
+    Secrets,       // the key in the header
+    SecretsClose,
+    SecretRow,     // row: an index into the secrets' names
+    SecretDelete,  // row: the same
+    SecretSave,
     Send,
     HistoryRow,   // row: an index into the filtered history
     ModelRow,     // row: an index into the main models
@@ -180,6 +191,15 @@ struct Geometry {
     float width = 0;
     float height = 0;
     float column = 0;
+    float area = 0;  // the chat's width: the window's, less the secrets panel when it is open
+    float left = 0;  // where the chat column starts
+    D2D1_RECT_F secrets{};  // the header's key
+    D2D1_RECT_F panel{};    // the secrets panel (empty when closed)
+    D2D1_RECT_F panelClose{};
+    D2D1_RECT_F nameField{};
+    D2D1_RECT_F valueField{};
+    D2D1_RECT_F saveButton{};
+    float secretsTop = 0;  // the first secret's row
     D2D1_RECT_F history{};
     D2D1_RECT_F newChat{};
     D2D1_RECT_F feed{};
@@ -365,6 +385,20 @@ private:
     void PaintModels(const Geometry& g);
     void PaintEffort(const Geometry& g);
     void PaintUsage(const Geometry& g);
+
+    // The secrets panel: names and masked values, delete, and a form to add or replace one.
+    static LRESULT CALLBACK SecretEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id,
+                                           DWORD_PTR self);
+    HWND CreateSecretField(bool password, const wchar_t* hint);
+    void SetSecretsOpen(bool open);
+    void PlaceSecretFields();
+    void SubmitSecret();
+    void DeleteSecret(const std::string& name);
+    void PaintSecrets(const Geometry& g);
+    static D2D1_RECT_F SecretRowRect(const Geometry& g, size_t index);
+    static D2D1_RECT_F SecretDeleteRect(const D2D1_RECT_F& row);
+    static size_t SecretRowsFit(const Geometry& g);
+    std::wstring FieldText(HWND field) const;
     void Ring(D2D1_POINT_2F center, float radius, float fraction, uint32_t color);
     void Text(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect, uint32_t color);
     void Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha = 1.f);
@@ -428,6 +462,10 @@ private:
     HWND input_ = nullptr;
     wil::unique_hmodule richEdit_;
     wil::unique_hfont uiFont_;
+    bool secretsOpen_ = false;
+    HWND nameEdit_ = nullptr;   // the panel's two fields; hidden while it is closed
+    HWND valueEdit_ = nullptr;  // (a password field: the value never shows)
+    wil::unique_hbrush fieldBrush_;
 
     wil::com_ptr<ID2D1Factory> d2d_;
     wil::com_ptr<IDWriteFactory> dwrite_;
@@ -446,6 +484,7 @@ private:
     wil::com_ptr<IDWriteTextFormat> uiRight_;
     wil::com_ptr<IDWriteTextFormat> badge_;
     wil::com_ptr<IDWriteTextFormat> greeting_;
+    wil::com_ptr<IDWriteTextFormat> small_;  // wrapping, left-aligned notes
     wil::com_ptr<IDWriteTextFormat> mono_;
     wil::com_ptr<IDWriteTextFormat> button_;
 
@@ -534,6 +573,7 @@ int ChatWindow::Run(int show) {
     uiRight_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
     badge_ = MakeFormat(kTextFont, 11.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, true);
     greeting_ = MakeFormat(kDisplayFont, 22.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+    small_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     mono_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     button_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, true);
 
@@ -654,6 +694,25 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         CreateFonts();
         CreateInput();
         DragAcceptFiles(hwnd_, TRUE);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT:
+        if (const auto field = reinterpret_cast<HWND>(lParam); field == nameEdit_ || field == valueEdit_) {
+            const auto dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, ToColorRef(kPrimary));
+            SetBkColor(dc, ToColorRef(kRaised));
+            return reinterpret_cast<LRESULT>(fieldBrush_.get());
+        }
+        break;
+    case kSecretKey: {
+        const auto from = reinterpret_cast<HWND>(lParam);
+        if (wParam == VK_ESCAPE) {
+            SetSecretsOpen(false);
+        } else if (wParam == VK_TAB || (wParam == VK_RETURN && from == nameEdit_)) {
+            SetFocus(from == nameEdit_ ? valueEdit_ : nameEdit_);
+        } else {
+            SubmitSecret();
+        }
         return 0;
     }
     case WM_DROPFILES: {
@@ -857,6 +916,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
 
 void ChatWindow::OnClick(float x, float y) {
     const Hit hit = HitTest(x, y);
+    bool keepFocus = false;  // the secrets panel's own clicks leave focus in its fields
     if (popup_ != Popup::None) {
         switch (hit.target) {
         case Target::HistoryRow:
@@ -906,6 +966,36 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::UsageChip:
         OpenPopup(Popup::Usage);
         break;
+    case Target::Secrets:
+        SetSecretsOpen(!secretsOpen_);
+        keepFocus = true;
+        break;
+    case Target::SecretsClose:
+        SetSecretsOpen(false);
+        break;
+    case Target::SecretRow: {  // pick a secret to replace: its name goes into the form, the value is typed anew
+        const std::vector<std::string> names = secrets_.Names();
+        if (hit.row < names.size()) {
+            SetWindowTextW(nameEdit_, ToWide(names[hit.row]).c_str());
+            SetWindowTextW(valueEdit_, L"");
+            SetFocus(valueEdit_);
+            keepFocus = true;
+            Refresh();
+        }
+        break;
+    }
+    case Target::SecretDelete: {
+        const std::vector<std::string> names = secrets_.Names();
+        if (hit.row < names.size()) {
+            DeleteSecret(names[hit.row]);
+        }
+        keepFocus = true;
+        break;
+    }
+    case Target::SecretSave:
+        SubmitSecret();
+        keepFocus = true;
+        break;
     case Target::NewChat:
         NewChat();
         break;
@@ -934,7 +1024,7 @@ void ChatWindow::OnClick(float x, float y) {
     default:
         break;
     }
-    if (popup_ == Popup::None) {
+    if (popup_ == Popup::None && !keepFocus) {
         SetFocus(input_);
     }
 }
@@ -1003,6 +1093,12 @@ void ChatWindow::OnPopupChar(wchar_t c) {
 }
 
 void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
+    if (const auto from = reinterpret_cast<HWND>(lParam); from == nameEdit_ || from == valueEdit_) {
+        if (HIWORD(wParam) == EN_CHANGE) {
+            Refresh();  // the button says "add" or "update" by the name
+        }
+        return;
+    }
     if (reinterpret_cast<HWND>(lParam) != input_) {
         return;
     }
@@ -1066,13 +1162,18 @@ Geometry ChatWindow::Layout() const {
     GetClientRect(hwnd_, &client);
     g.width = ToDip(client.right);
     g.height = ToDip(client.bottom);
-    g.column = std::max(0.f, std::min(g.width - 2 * kSide, kColumnMax));
-    const float left = (g.width - g.column) / 2;
+    // The secrets panel docks at the right and the chat takes what is left, as the terminal does in Claude's app.
+    const float panelWidth = secretsOpen_ ? std::min(kSidePanel, std::max(0.f, g.width - 320.f)) : 0.f;
+    g.area = g.width - panelWidth;
+    g.column = std::max(0.f, std::min(g.area - 2 * kSide, kColumnMax));
+    const float left = (g.area - g.column) / 2;
+    g.left = left;
     const float right = left + g.column;
 
     const float buttonTop = (kHeader - kButton) / 2;
     g.newChat = D2D1::RectF(g.width - 10 - kButton, buttonTop, g.width - 10, buttonTop + kButton);
     g.history = D2D1::RectF(g.newChat.left - 4 - kButton, buttonTop, g.newChat.left - 4, buttonTop + kButton);
+    g.secrets = D2D1::RectF(g.history.left - 4 - kButton, buttonTop, g.history.left - 4, buttonTop + kButton);
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
     // usage ring sit in a row under it, at the right.
@@ -1103,7 +1204,19 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
-    g.feed = D2D1::RectF(0, kHeader, g.width, boxTop - 8);
+    g.feed = D2D1::RectF(0, kHeader, g.area, boxTop - 8);
+
+    if (secretsOpen_) {
+        g.panel = D2D1::RectF(g.area, kHeader, g.width, g.height);
+        g.panelClose = D2D1::RectF(g.panel.right - 12 - 28, g.panel.top + 10, g.panel.right - 12, g.panel.top + 38);
+        const float fieldLeft = g.panel.left + kPanelPad;
+        const float fieldRight = g.panel.right - kPanelPad;
+        g.saveButton = D2D1::RectF(fieldLeft, g.panel.bottom - kPanelPad - kFieldHeight, fieldRight,
+                                   g.panel.bottom - kPanelPad);
+        g.valueField = D2D1::RectF(fieldLeft, g.saveButton.top - 8 - kFieldHeight, fieldRight, g.saveButton.top - 8);
+        g.nameField = D2D1::RectF(fieldLeft, g.valueField.top - 8 - kFieldHeight, fieldRight, g.valueField.top - 8);
+        g.secretsTop = g.panel.top + 46 + kSecretsNote;
+    }
 
     switch (popup_) {
     case Popup::History: {
@@ -1119,7 +1232,7 @@ Geometry ChatWindow::Layout() const {
     case Popup::Models: {
         const float rows = static_cast<float>(mainModels_.size());
         const float height = 12 + rows * kMenuRow + (moreModels_.empty() ? 0 : 9 + kMenuRow);
-        const float popupLeft = ClampTo(g.model.left, 10.f, g.width - 10 - kModelsWidth);
+        const float popupLeft = ClampTo(g.model.left, 10.f, g.area - 10 - kModelsWidth);
         g.popup = D2D1::RectF(popupLeft, g.box.top - 6 - height, popupLeft + kModelsWidth, g.box.top - 6);
         g.modelsTop = g.popup.top + 6;
         if (!moreModels_.empty()) {
@@ -1135,7 +1248,7 @@ Geometry ChatWindow::Layout() const {
         break;
     }
     case Popup::Effort: {
-        const float popupRight = ClampTo(g.effort.right, 10.f + kEffortWidth, g.width - 10);
+        const float popupRight = ClampTo(g.effort.right, 10.f + kEffortWidth, g.area - 10);
         g.popup = D2D1::RectF(popupRight - kEffortWidth, g.box.top - 6 - kEffortHeight, popupRight, g.box.top - 6);
         g.track = D2D1::RectF(g.popup.left + 14, g.popup.top + 62, g.popup.right - 14, g.popup.top + 86);
         const float resetWidth = TextWidth(L"по умолчанию", uiRight_.get());
@@ -1144,7 +1257,7 @@ Geometry ChatWindow::Layout() const {
         break;
     }
     case Popup::Usage: {
-        const float popupRight = ClampTo(g.usage.right + 4, 10.f + kUsageWidth, g.width - 10);
+        const float popupRight = ClampTo(g.usage.right + 4, 10.f + kUsageWidth, g.area - 10);
         const float height = 14 + 24 + 2 * kUsageRow + 4;
         // Above the box, like the other panels: the input's own window would hide whatever lay over it.
         g.popup = D2D1::RectF(popupRight - kUsageWidth, g.box.top - 6 - height, popupRight, g.box.top - 6);
@@ -1204,6 +1317,28 @@ Hit ChatWindow::HitTest(float x, float y) const {
         break;
     case Popup::None:
         break;
+    }
+    if (secretsOpen_ && Inside(g.panel, x, y)) {
+        if (Inside(g.panelClose, x, y)) {
+            return {Target::SecretsClose};
+        }
+        if (Inside(g.saveButton, x, y)) {
+            return {Target::SecretSave};
+        }
+        const size_t shown = std::min(secrets_.Names().size(), SecretRowsFit(g));
+        for (size_t i = 0; i < shown; ++i) {
+            const D2D1_RECT_F row = SecretRowRect(g, i);
+            if (Inside(SecretDeleteRect(row), x, y)) {
+                return {Target::SecretDelete, i};
+            }
+            if (Inside(row, x, y)) {
+                return {Target::SecretRow, i};
+            }
+        }
+        return {};
+    }
+    if (Inside(g.secrets, x, y)) {
+        return {Target::Secrets};
     }
     if (Inside(g.feed, x, y)) {
         for (size_t i = 0; i < feed_.size(); ++i) {
@@ -1277,6 +1412,9 @@ void ChatWindow::CreateInput() {
     SendMessageW(input_, EM_SETEVENTMASK, 0, ENM_KEYEVENTS | ENM_CHANGE | ENM_REQUESTRESIZE);
     SetWindowSubclass(input_, &ChatWindow::InputProc, kSubclassId, reinterpret_cast<DWORD_PTR>(this));
     StyleInput();
+    fieldBrush_.reset(CreateSolidBrush(ToColorRef(kRaised)));
+    nameEdit_ = CreateSecretField(false, L"Имя, например GITHUB");
+    valueEdit_ = CreateSecretField(true, L"Значение");
     PlaceChildren();
     SetFocus(input_);
 }
@@ -1299,6 +1437,7 @@ void ChatWindow::PlaceChildren() {
     }
     MoveChild(input_, Layout().text);
     SendMessageW(input_, EM_REQUESTRESIZE, 0, 0);
+    PlaceSecretFields();
 }
 
 void ChatWindow::EnsureTarget() {
@@ -1430,6 +1569,7 @@ void ChatWindow::Paint() {
     PaintFeed(g);
     PaintHeader(g);
     PaintInput(g);
+    PaintSecrets(g);
     switch (popup_) {
     case Popup::History:
         PaintHistory(g);
@@ -1454,7 +1594,7 @@ void ChatWindow::Paint() {
 }
 
 void ChatWindow::PaintFeed(const Geometry& g) {
-    const float left = (g.width - g.column) / 2;
+    const float left = g.left;
     if (!HasConversation()) {
         const std::wstring hello = userName_.empty() ? L"Что дальше?" : L"Что дальше, " + ToWide(userName_) + L"?";
         const float middle = (g.feed.top + g.feed.bottom) / 2;
@@ -1501,7 +1641,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         const float track = g.feed.bottom - g.feed.top;
         const float thumb = std::max(24.f, track * track / (track + maxScroll_));
         const float top = g.feed.top + (track - thumb) * (scroll_ / maxScroll_);
-        Fill(D2D1::RectF(g.width - 7.f, top, g.width - 3.f, top + thumb), 2.f, kLine);
+        Fill(D2D1::RectF(g.area - 7.f, top, g.area - 3.f, top + thumb), 2.f, kLine);
     }
     target_->PopAxisAlignedClip();
 }
@@ -1589,7 +1729,7 @@ float ChatWindow::ApprovalHeight(const FeedItem& item) {
 }
 
 void ChatWindow::ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& allow, D2D1_RECT_F& deny) {
-    const float left = (g.width - g.column) / 2 + kCardPad;
+    const float left = g.left + kCardPad;
     const float bottom = item.top + item.height - kCardPad;
     allow = D2D1::RectF(left, bottom - kCardButton, left + kCardButtonWidth, bottom);
     deny = D2D1::RectF(allow.right + 8.f, allow.top, allow.right + 8.f + kCardButtonWidth, bottom);
@@ -1639,7 +1779,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         titleLeft = 14 + kLogo + 10;
     }
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
-    const float titleRight = g.history.left - 12;
+    const float titleRight = g.secrets.left - 12;
     Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kPrimary);
     std::wstring state = busy_ ? L"отвечает…" : L"";
     if (!status_.empty()) {
@@ -1650,15 +1790,22 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Text(state, ui_.get(), D2D1::RectF(titleLeft + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
     }
 
-    for (const Target button : {Target::History, Target::NewChat}) {
-        const D2D1_RECT_F& r = button == Target::History ? g.history : g.newChat;
-        const bool active = hover_.target == button || (button == Target::History && popup_ == Popup::History);
+    for (const Target button : {Target::Secrets, Target::History, Target::NewChat}) {
+        const D2D1_RECT_F& r = button == Target::Secrets ? g.secrets : (button == Target::History ? g.history : g.newChat);
+        const bool active = hover_.target == button || (button == Target::History && popup_ == Popup::History) ||
+                            (button == Target::Secrets && secretsOpen_);
         if (active) {
             Fill(r, 6.f, kRaised);
         }
         const D2D1_POINT_2F c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
         const uint32_t color = active ? kPrimary : kSecondary;
-        if (button == Target::History) {  // a clock
+        if (button == Target::Secrets) {  // a key
+            brush_->SetColor(Color(color));
+            target_->DrawEllipse(D2D1::Ellipse({c.x - 3.5f, c.y + 3.5f}, 3.5f, 3.5f), brush_.get(), 1.5f);
+            Line({c.x - 1.f, c.y + 1.f}, {c.x + 6.5f, c.y - 6.5f}, color, 1.5f);
+            Line({c.x + 3.5f, c.y - 3.f}, {c.x + 6.f, c.y - 0.5f}, color, 1.5f);
+            Line({c.x + 5.f, c.y - 4.5f}, {c.x + 7.5f, c.y - 2.f}, color, 1.5f);
+        } else if (button == Target::History) {  // a clock
             brush_->SetColor(Color(color));
             target_->DrawEllipse(D2D1::Ellipse(c, 7.5f, 7.5f), brush_.get(), 1.5f);
             Line(c, {c.x, c.y - 4.5f}, color, 1.5f);
@@ -1812,6 +1959,199 @@ void ChatWindow::PaintUsage(const Geometry& g) {
         }
         top += kUsageRow;
     }
+}
+
+LRESULT CALLBACK ChatWindow::SecretEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR,
+                                            DWORD_PTR self) {
+    auto* window = reinterpret_cast<ChatWindow*>(self);
+    if (message == WM_KEYDOWN && (wParam == VK_RETURN || wParam == VK_ESCAPE || wParam == VK_TAB)) {
+        PostMessageW(window->hwnd_, kSecretKey, wParam, reinterpret_cast<LPARAM>(hwnd));
+        return 0;
+    }
+    if (message == WM_CHAR && (wParam == L'\r' || wParam == L'\t' || wParam == 0x1b)) {
+        return 0;  // no beep for the keys handled above
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+HWND ChatWindow::CreateSecretField(bool password, const wchar_t* hint) {
+    const DWORD style = WS_CHILD | ES_AUTOHSCROLL | (password ? ES_PASSWORD : 0);
+    const HWND field = CreateWindowExW(0, L"EDIT", L"", style, 0, 0, 0, 0, hwnd_, nullptr, instance_, nullptr);
+    THROW_LAST_ERROR_IF_NULL(field);
+    SendMessageW(field, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(hint));
+    SendMessageW(field, EM_SETLIMITTEXT, 8192, 0);
+    SetWindowSubclass(field, &ChatWindow::SecretEditProc, kSubclassId, reinterpret_cast<DWORD_PTR>(this));
+    return field;
+}
+
+std::wstring ChatWindow::FieldText(HWND field) const {
+    std::wstring text(static_cast<size_t>(GetWindowTextLengthW(field)), L'\0');
+    if (!text.empty()) {
+        GetWindowTextW(field, text.data(), static_cast<int>(text.size() + 1));
+    }
+    return text;
+}
+
+std::wstring Trimmed(std::wstring text) {
+    const size_t first = text.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) {
+        return {};
+    }
+    return text.substr(first, text.find_last_not_of(L" \t\r\n") - first + 1);
+}
+
+// The fields sit over the panel's painted slots; while the panel is closed they are hidden.
+void ChatWindow::PlaceSecretFields() {
+    if (nameEdit_ == nullptr || valueEdit_ == nullptr) {
+        return;
+    }
+    if (secretsOpen_) {
+        const Geometry g = Layout();
+        constexpr float kText = 20.f;
+        constexpr float kInset = 10.f;
+        for (const auto& [edit, slot] : {std::pair{nameEdit_, g.nameField}, std::pair{valueEdit_, g.valueField}}) {
+            const float top = slot.top + (slot.bottom - slot.top - kText) / 2;
+            MoveChild(edit, D2D1::RectF(slot.left + kInset, top, slot.right - kInset, top + kText));
+            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_.get()), TRUE);
+        }
+    }
+    ShowWindow(nameEdit_, secretsOpen_ ? SW_SHOW : SW_HIDE);
+    ShowWindow(valueEdit_, secretsOpen_ ? SW_SHOW : SW_HIDE);
+}
+
+void ChatWindow::SetSecretsOpen(bool open) {
+    if (secretsOpen_ == open) {
+        return;
+    }
+    ClosePopup();
+    secretsOpen_ = open;
+    hover_ = {};
+    if (!open) {
+        SetWindowTextW(nameEdit_, L"");
+        SetWindowTextW(valueEdit_, L"");
+    }
+    PlaceChildren();  // the chat's column moves, the fields come or go
+    SetFocus(open ? nameEdit_ : input_);
+    Refresh();
+}
+
+void ChatWindow::SubmitSecret() {
+    const std::wstring name = Trimmed(FieldText(nameEdit_));
+    std::wstring value = Trimmed(FieldText(valueEdit_));
+    const bool validName = !name.empty() && !std::iswdigit(name[0]) &&
+                           std::ranges::all_of(name, [](wchar_t c) { return c < 128 && (std::iswalnum(c) || c == L'_'); });
+    if (!validName) {
+        Flash(L"Имя: латиница, цифры и _, как у переменной окружения", 3500);
+        SetFocus(nameEdit_);
+        return;
+    }
+    if (value.empty()) {
+        Flash(L"Введите значение", 2500);
+        SetFocus(valueEdit_);
+        return;
+    }
+    const std::string key = ToUtf8(name);
+    const bool replaced = secrets_.Has(key);
+    secrets_.Set(key, ToUtf8(value));
+    SecureZeroMemory(value.data(), value.size() * sizeof(wchar_t));
+    if (!secrets_.Save()) {
+        Flash(L"Не удалось сохранить файл секретов", 3500);
+        return;
+    }
+    SetWindowTextW(nameEdit_, L"");
+    SetWindowTextW(valueEdit_, L"");
+    SetFocus(nameEdit_);
+    Flash(replaced ? L"Секрет обновлён" : L"Секрет добавлен");
+    Refresh();
+}
+
+void ChatWindow::DeleteSecret(const std::string& name) {
+    const std::wstring question = L"Удалить секрет " + ToWide(name) + L"?\nЭто нельзя отменить.";
+    if (MessageBoxW(hwnd_, question.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    secrets_.Remove(name);
+    if (!secrets_.Save()) {
+        Flash(L"Не удалось сохранить файл секретов", 3500);
+    } else {
+        Flash(L"Секрет удалён");
+    }
+    hover_ = {};
+    Refresh();
+}
+
+D2D1_RECT_F ChatWindow::SecretRowRect(const Geometry& g, size_t index) {
+    const float top = g.secretsTop + static_cast<float>(index) * kSecretRow;
+    return D2D1::RectF(g.panel.left + 8, top, g.panel.right - 8, top + kSecretRow - 2);
+}
+
+D2D1_RECT_F ChatWindow::SecretDeleteRect(const D2D1_RECT_F& row) {
+    return D2D1::RectF(row.right - 34, row.top + 3, row.right - 6, row.bottom - 3);
+}
+
+size_t ChatWindow::SecretRowsFit(const Geometry& g) {
+    const float room = g.nameField.top - 12 - g.secretsTop;
+    return room <= 0 ? 0 : static_cast<size_t>(room / kSecretRow);
+}
+
+void ChatWindow::PaintSecrets(const Geometry& g) {
+    if (!secretsOpen_) {
+        return;
+    }
+    Fill(g.panel, 0.f, kPanel);
+    Line({g.panel.left, g.panel.top}, {g.panel.left, g.panel.bottom}, kLine, 1.f);
+    Text(L"Секреты", uiBold_.get(),
+         D2D1::RectF(g.panel.left + kPanelPad, g.panel.top + 10, g.panelClose.left - 8, g.panel.top + 38), kPrimary);
+    {  // a cross
+        const bool active = hover_.target == Target::SecretsClose;
+        if (active) {
+            Fill(g.panelClose, 6.f, kRaised);
+        }
+        const D2D1_POINT_2F c{(g.panelClose.left + g.panelClose.right) / 2, (g.panelClose.top + g.panelClose.bottom) / 2};
+        const uint32_t color = active ? kPrimary : kSecondary;
+        Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.5f);
+        Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.5f);
+    }
+    Text(L"Значения шифруются на этом компьютере. Claude видит только имена и подставляет значения сам: "
+         L"в команде, через переменную окружения.",
+         small_.get(),
+         D2D1::RectF(g.panel.left + kPanelPad, g.panel.top + 44, g.panel.right - kPanelPad, g.panel.top + 44 + kSecretsNote),
+         kSecondary);
+
+    const std::vector<std::string> names = secrets_.Names();
+    if (names.empty()) {
+        Text(L"Секретов пока нет.", ui_.get(),
+             D2D1::RectF(g.panel.left + kPanelPad, g.secretsTop, g.panel.right - kPanelPad, g.secretsTop + 28), kSecondary);
+    }
+    const size_t shown = std::min(names.size(), SecretRowsFit(g));
+    for (size_t i = 0; i < shown; ++i) {
+        const D2D1_RECT_F row = SecretRowRect(g, i);
+        const bool onRow = (hover_.target == Target::SecretRow || hover_.target == Target::SecretDelete) && hover_.row == i;
+        if (onRow) {
+            Fill(row, 8.f, kRaised);
+        }
+        Text(ToWide(names[i]), ui_.get(), D2D1::RectF(row.left + 10, row.top, row.right - 140, row.bottom), kPrimary);
+        Text(L"••••••••", uiRight_.get(), D2D1::RectF(row.right - 134, row.top, row.right - 40, row.bottom), kSecondary);
+        if (onRow) {  // a bin
+            const D2D1_RECT_F bin = SecretDeleteRect(row);
+            const bool danger = hover_.target == Target::SecretDelete;
+            const D2D1_POINT_2F c{(bin.left + bin.right) / 2, (bin.top + bin.bottom) / 2};
+            const uint32_t color = danger ? kDanger : kSecondary;
+            Line({c.x - 5.f, c.y - 3.5f}, {c.x + 5.f, c.y - 3.5f}, color, 1.4f);
+            Line({c.x - 2.f, c.y - 5.5f}, {c.x + 2.f, c.y - 5.5f}, color, 1.4f);
+            Line({c.x - 4.f, c.y - 3.5f}, {c.x - 3.2f, c.y + 5.f}, color, 1.4f);
+            Line({c.x + 4.f, c.y - 3.5f}, {c.x + 3.2f, c.y + 5.f}, color, 1.4f);
+            Line({c.x - 3.2f, c.y + 5.f}, {c.x + 3.2f, c.y + 5.f}, color, 1.4f);
+        }
+    }
+
+    Fill(g.nameField, 8.f, kRaised);
+    Fill(g.valueField, 8.f, kRaised);
+    const std::wstring name = Trimmed(FieldText(nameEdit_));
+    const bool ready = !name.empty();
+    const bool replacing = ready && secrets_.Has(ToUtf8(name));
+    Fill(g.saveButton, 8.f, ready ? kAccent : kRaised, ready && hover_.target == Target::SecretSave ? 0.85f : 1.f);
+    Text(replacing ? L"Обновить" : L"Добавить", button_.get(), g.saveButton, ready ? kPrimary : kSecondary);
 }
 
 void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {

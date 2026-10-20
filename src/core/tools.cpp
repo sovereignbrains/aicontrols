@@ -178,10 +178,10 @@ ToolSummary SummarizeTool(const std::string& name, const Json& input) {
     }
     if (name == "write_file") {
         const std::string content = StringArg(input, "content");
-        return {L"Записать файл", path + L"\n\n" + ToWide(Truncated(content, 800))};
+        return {L"Записать файл", path + L"\n" + ToWide(Truncated(content, 800))};
     }
     if (name == "edit_file") {
-        return {L"Изменить файл", path + L"\n\n− " + ToWide(Truncated(StringArg(input, "old_string"), 400)) + L"\n+ " +
+        return {L"Изменить файл", path + L"\n− " + ToWide(Truncated(StringArg(input, "old_string"), 400)) + L"\n+ " +
                                       ToWide(Truncated(StringArg(input, "new_string"), 400))};
     }
     if (name == "read_file") {

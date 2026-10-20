@@ -78,6 +78,8 @@ int wmain(int argc, wchar_t** argv) {
                         std::cout << "[tool_result] " << aic::JsonAt(block, "content").dump().substr(0, 400) << "\n";
                     }
                 }
+            } else if (type == "rate_limit_event") {
+                std::cout << "[rate_limit_event] " << message.dump() << "\n";
             } else if (type == "result") {
                 exitCode = aic::JsonStr(message, "subtype") == "success" ? 0 : 1;
                 std::lock_guard lock(mutex);

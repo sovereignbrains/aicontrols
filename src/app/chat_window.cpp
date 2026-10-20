@@ -21,7 +21,9 @@
 #include <cwctype>
 #include <exception>
 #include <format>
+#include <ctime>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <set>
 #include <string>
@@ -54,9 +56,13 @@ constexpr float kColumnMax = 720.f;
 constexpr float kSide = 24.f;
 constexpr float kGap = 14.f;
 constexpr float kBubblePad = 10.f;
-constexpr float kBoxBottom = 16.f;
-constexpr float kBoxPad = 12.f;
-constexpr float kToolbar = 38.f;
+constexpr float kBoxPadY = 9.f;       // inside the input box, above and below its row
+constexpr float kChipRow = 30.f;      // under the box: model, effort, usage ring
+constexpr float kChipsBottom = 10.f;
+constexpr float kInputButton = 30.f;  // "+" and send
+constexpr float kRing = 22.f;
+constexpr float kUsageWidth = 330.f;
+constexpr float kUsageRow = 58.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 32.f;
@@ -133,7 +139,13 @@ struct FeedItem {
 };
 
 // The panels that open over the window; one at a time.
-enum class Popup { None, History, Models, Effort };
+enum class Popup { None, History, Models, Effort, Usage };
+
+// One of the plan's limit windows, from the CLI's rate_limit_event.
+struct Limit {
+    int percent = -1;  // -1: not reported yet
+    long long resetsAt = 0;  // Unix seconds
+};
 
 enum class Target {
     None,
@@ -144,6 +156,7 @@ enum class Target {
     RemoveAttachment,  // row: the same
     ModelChip,
     EffortChip,
+    UsageChip,
     Send,
     HistoryRow,   // row: an index into the filtered history
     ModelRow,     // row: an index into the main models
@@ -174,7 +187,7 @@ struct Geometry {
     D2D1_RECT_F attachments{};  // the row of attached files above the text
     D2D1_RECT_F text{};
     D2D1_RECT_F attach{};
-    D2D1_RECT_F limits{};
+    D2D1_RECT_F usage{};  // the ring that opens the plan limits
     D2D1_RECT_F model{};
     D2D1_RECT_F effort{};  // empty when the model has no effort levels
     D2D1_RECT_F send{};
@@ -351,6 +364,8 @@ private:
     void PaintHistory(const Geometry& g);
     void PaintModels(const Geometry& g);
     void PaintEffort(const Geometry& g);
+    void PaintUsage(const Geometry& g);
+    void Ring(D2D1_POINT_2F center, float radius, float fraction, uint32_t color);
     void Text(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect, uint32_t color);
     void Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha = 1.f);
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width = 1.6f);
@@ -480,7 +495,8 @@ private:
     std::wstring title_;
     std::string currentMessageId_;
     std::set<std::string> streamed_;  // messages whose text came as deltas
-    std::wstring limits_;
+    Limit session_;  // the five-hour window
+    Limit week_;
     std::wstring route_;
     std::wstring status_;
 };
@@ -863,7 +879,8 @@ void ChatWindow::OnClick(float x, float y) {
         ClosePopup();
         const bool sameButton = (hit.target == Target::History && was == Popup::History) ||
                                 (hit.target == Target::ModelChip && was == Popup::Models) ||
-                                (hit.target == Target::EffortChip && was == Popup::Effort);
+                                (hit.target == Target::EffortChip && was == Popup::Effort) ||
+                                (hit.target == Target::UsageChip && was == Popup::Usage);
         if (sameButton) {
             return;
         }
@@ -877,6 +894,9 @@ void ChatWindow::OnClick(float x, float y) {
         break;
     case Target::EffortChip:
         OpenPopup(Popup::Effort);
+        break;
+    case Target::UsageChip:
+        OpenPopup(Popup::Usage);
         break;
     case Target::NewChat:
         NewChat();
@@ -1046,26 +1066,35 @@ Geometry ChatWindow::Layout() const {
     g.newChat = D2D1::RectF(g.width - 10 - kButton, buttonTop, g.width - 10, buttonTop + kButton);
     g.history = D2D1::RectF(g.newChat.left - 4 - kButton, buttonTop, g.newChat.left - 4, buttonTop + kButton);
 
-    const float boxBottom = g.height - kBoxBottom;
+    // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
+    // usage ring sit in a row under it, at the right.
+    const float chipsBottom = g.height - kChipsBottom;
+    const float chipsTop = chipsBottom - kChipRow;
+    const float boxBottom = chipsTop - 4;
     const float attachmentsHeight = attachments_.empty() ? 0.f : kAttachmentRow + 8;
-    const float boxTop = boxBottom - (kBoxPad + attachmentsHeight + textHeight_ + 4 + kToolbar);
+    const float rowHeight = std::max(textHeight_, kInputButton);
+    const float boxTop = boxBottom - (2 * kBoxPadY + attachmentsHeight + rowHeight);
     g.box = D2D1::RectF(left, boxTop, right, boxBottom);
-    g.attachments = D2D1::RectF(left + 12, boxTop + kBoxPad, right - 12, boxTop + kBoxPad + kAttachmentRow);
-    const float textTop = boxTop + kBoxPad + attachmentsHeight;
-    g.text = D2D1::RectF(left + 14, textTop, right - 14, textTop + textHeight_);
-    const float toolTop = boxBottom - kToolbar + 4;
-    const float toolBottom = boxBottom - 6;
-    g.attach = D2D1::RectF(left + 8, toolTop, left + 8 + (toolBottom - toolTop), toolBottom);
-    g.send = D2D1::RectF(right - 8 - (toolBottom - toolTop), toolTop, right - 8, toolBottom);
-    float chipsRight = g.send.left - 8;
+    g.attachments = D2D1::RectF(left + 12, boxTop + kBoxPadY, right - 12, boxTop + kBoxPadY + kAttachmentRow);
+    const float rowTop = boxTop + kBoxPadY + attachmentsHeight;
+    const float rowBottom = rowTop + rowHeight;
+    g.attach = D2D1::RectF(left + 8, rowBottom - kInputButton, left + 8 + kInputButton, rowBottom);
+    g.send = D2D1::RectF(right - 8 - kInputButton, rowBottom - kInputButton, right - 8, rowBottom);
+    const float textTop = rowTop + (rowHeight - textHeight_) / 2;
+    g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 4, textTop + textHeight_);
+
+    const float ringTop = chipsTop + (kChipRow - kRing) / 2;
+    g.usage = D2D1::RectF(right - 6 - kRing, ringTop, right - 6, ringTop + kRing);
+    const float chipTop = chipsTop + 2;
+    const float chipBottom = chipsBottom - 2;
+    float chipsRight = g.usage.left - 6;
     if (!EffortLevels().empty()) {
         const float width = TextWidth(EffortName(settings_.effort), ui_.get()) + 18;
-        g.effort = D2D1::RectF(chipsRight - width, toolTop + 3, chipsRight, toolBottom - 3);
-        chipsRight = g.effort.left - 4;
+        g.effort = D2D1::RectF(chipsRight - width, chipTop, chipsRight, chipBottom);
+        chipsRight = g.effort.left - 2;
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
-    g.model = D2D1::RectF(chipsRight - modelWidth, toolTop + 3, chipsRight, toolBottom - 3);
-    g.limits = D2D1::RectF(g.attach.right + 10, toolTop, g.model.left - 10, toolBottom);
+    g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
     g.feed = D2D1::RectF(0, kHeader, g.width, boxTop - 8);
 
     switch (popup_) {
@@ -1104,6 +1133,12 @@ Geometry ChatWindow::Layout() const {
         const float resetWidth = TextWidth(L"по умолчанию", uiRight_.get());
         g.reset = D2D1::RectF(g.popup.right - 14 - resetWidth, g.popup.top + 10, g.popup.right - 14,
                               g.popup.top + 34);
+        break;
+    }
+    case Popup::Usage: {
+        const float popupRight = ClampTo(g.usage.right + 4, 10.f + kUsageWidth, g.width - 10);
+        const float height = 14 + 24 + 2 * kUsageRow + 4;
+        g.popup = D2D1::RectF(popupRight - kUsageWidth, g.usage.top - 8 - height, popupRight, g.usage.top - 8);
         break;
     }
     case Popup::None:
@@ -1153,6 +1188,11 @@ Hit ChatWindow::HitTest(float x, float y) const {
             return Inside(grab, x, y) ? Hit{Target::EffortTrack} : Hit{Target::InsidePopup};
         }
         break;
+    case Popup::Usage:
+        if (Inside(g.popup, x, y)) {
+            return {Target::InsidePopup};
+        }
+        break;
     case Popup::None:
         break;
     }
@@ -1195,6 +1235,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.effort, x, y)) {
         return {Target::EffortChip};
+    }
+    if (Inside(g.usage, x, y)) {
+        return {Target::UsageChip};
     }
     if (Inside(g.send, x, y)) {
         return {Target::Send};
@@ -1387,6 +1430,9 @@ void ChatWindow::Paint() {
         break;
     case Popup::Effort:
         PaintEffort(g);
+        break;
+    case Popup::Usage:
+        PaintUsage(g);
         break;
     case Popup::None:
         break;
@@ -1632,10 +1678,6 @@ void ChatWindow::PaintInput(const Geometry& g) {
         Line({c.x, c.y - 6.f}, {c.x, c.y + 6.f}, color, 1.6f);
     }
 
-    if (!limits_.empty()) {
-        Text(limits_, ui_.get(), g.limits, kSecondary);
-    }
-
     // The model, then its effort in a box of its own, as in Claude's app.
     const bool modelActive = hover_.target == Target::ModelChip || popup_ == Popup::Models;
     if (modelActive) {
@@ -1645,14 +1687,25 @@ void ChatWindow::PaintInput(const Geometry& g) {
          modelActive ? kPrimary : kSecondary);
     if (g.effort.right > g.effort.left) {
         const bool effortActive = hover_.target == Target::EffortChip || popup_ == Popup::Effort;
-        Fill(g.effort, 6.f, kRaised);
         if (effortActive) {
-            brush_->SetColor(Color(kLine));
-            target_->DrawRoundedRectangle(D2D1::RoundedRect(g.effort, 6.f, 6.f), brush_.get(), 1.f);
+            Fill(g.effort, 6.f, kRaised);
         }
         Text(EffortName(settings_.effort), ui_.get(),
              D2D1::RectF(g.effort.left + 9, g.effort.top, g.effort.right, g.effort.bottom),
              effortActive ? kPrimary : kSecondary);
+    }
+
+    {  // the plan's limits: a ring filled to the session's share; a click opens the details
+        const bool active = hover_.target == Target::UsageChip || popup_ == Popup::Usage;
+        if (active) {
+            Fill(g.usage, 6.f, kRaised);
+        }
+        const D2D1_POINT_2F center{(g.usage.left + g.usage.right) / 2, (g.usage.top + g.usage.bottom) / 2};
+        brush_->SetColor(Color(kLine));
+        target_->DrawEllipse(D2D1::Ellipse(center, 7.5f, 7.5f), brush_.get(), 2.f);
+        if (session_.percent >= 0) {
+            Ring(center, 7.5f, static_cast<float>(session_.percent) / 100.f, session_.percent >= 90 ? kDanger : kAccent);
+        }
     }
 
     const bool live = hasContent() || busy_;
@@ -1667,6 +1720,87 @@ void ChatWindow::PaintInput(const Geometry& g) {
         Line({c.x, c.y + 5.5f}, {c.x, c.y - 5.5f}, mark, 1.8f);
         Line({c.x - 4.5f, c.y - 1.f}, {c.x, c.y - 5.5f}, mark, 1.8f);
         Line({c.x + 4.5f, c.y - 1.f}, {c.x, c.y - 5.5f}, mark, 1.8f);
+    }
+}
+
+// When a limit window resets: "через 3 ч 56 мин" for the short one, "вт 3:00" for the week.
+std::wstring ResetText(const Limit& limit, bool weekday) {
+    if (limit.resetsAt <= 0) {
+        return {};
+    }
+    if (!weekday) {
+        const long long now = static_cast<long long>(std::time(nullptr));
+        const long long minutes = std::max(0LL, (limit.resetsAt - now + 59) / 60);
+        return minutes >= 60 ? std::format(L"Сброс через {} ч {} мин", minutes / 60, minutes % 60)
+                             : std::format(L"Сброс через {} мин", minutes);
+    }
+    constexpr long long kUnixToFileTime = 11644473600LL;
+    ULARGE_INTEGER ticks{};
+    ticks.QuadPart = static_cast<unsigned long long>(limit.resetsAt + kUnixToFileTime) * 10'000'000ULL;
+    FILETIME utc{ticks.LowPart, ticks.HighPart};
+    FILETIME local{};
+    SYSTEMTIME time{};
+    if (!FileTimeToLocalFileTime(&utc, &local) || !FileTimeToSystemTime(&local, &time)) {
+        return {};
+    }
+    static constexpr const wchar_t* days[] = {L"вс", L"пн", L"вт", L"ср", L"чт", L"пт", L"сб"};
+    return std::format(L"Сброс {} {}:{:02}", days[time.wDayOfWeek % 7], time.wHour, time.wMinute);
+}
+
+// An arc from the top, clockwise, for `fraction` of the circle.
+void ChatWindow::Ring(D2D1_POINT_2F center, float radius, float fraction, uint32_t color) {
+    fraction = std::clamp(fraction, 0.f, 1.f);
+    if (fraction <= 0.f) {
+        return;
+    }
+    brush_->SetColor(Color(color));
+    if (fraction >= 0.995f) {
+        target_->DrawEllipse(D2D1::Ellipse(center, radius, radius), brush_.get(), 2.f);
+        return;
+    }
+    const float angle = fraction * 2.f * std::numbers::pi_v<float>;
+    wil::com_ptr<ID2D1PathGeometry> path;
+    wil::com_ptr<ID2D1GeometrySink> sink;
+    if (FAILED(d2d_->CreatePathGeometry(path.put())) || FAILED(path->Open(sink.put()))) {
+        return;
+    }
+    sink->BeginFigure({center.x, center.y - radius}, D2D1_FIGURE_BEGIN_HOLLOW);
+    sink->AddArc(D2D1::ArcSegment({center.x + radius * std::sin(angle), center.y - radius * std::cos(angle)},
+                                  D2D1::SizeF(radius, radius), 0.f, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                                  fraction > 0.5f ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
+    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    if (SUCCEEDED(sink->Close())) {
+        target_->DrawGeometry(path.get(), brush_.get(), 2.f, round_.get());
+    }
+}
+
+void ChatWindow::PaintUsage(const Geometry& g) {
+    PaintPanel(g.popup);
+    const float left = g.popup.left + 16;
+    const float right = g.popup.right - 16;
+    Text(L"Лимиты использования", ui_.get(), D2D1::RectF(left, g.popup.top + 10, right, g.popup.top + 34), kSecondary);
+    struct Row {
+        const wchar_t* label;
+        const Limit* limit;
+        bool weekday;
+    };
+    const Row rows[] = {{L"Сессия · 5 ч", &session_, false}, {L"Неделя · все модели", &week_, true}};
+    constexpr float kPercentWidth = 40.f;
+    float top = g.popup.top + 14 + 24;
+    for (const Row& row : rows) {
+        const int percent = row.limit->percent;
+        Text(row.label, uiBold_.get(), D2D1::RectF(left, top, left + 140, top + 20), kPrimary);
+        Text(ResetText(*row.limit, row.weekday), uiRight_.get(),
+             D2D1::RectF(left + 140, top, right - kPercentWidth - 8, top + 20), kSecondary);
+        Text(percent >= 0 ? std::format(L"{}%", percent) : std::wstring(L"—"), uiRight_.get(),
+             D2D1::RectF(right - kPercentWidth, top, right, top + 20), kSecondary);
+        const D2D1_RECT_F bar = D2D1::RectF(left, top + 28, right, top + 34);
+        Fill(bar, 3.f, kRaised);
+        if (percent > 0) {
+            const float width = std::max(6.f, (right - left) * static_cast<float>(std::min(percent, 100)) / 100.f);
+            Fill(D2D1::RectF(left, bar.top, left + width, bar.bottom), 3.f, percent >= 90 ? kDanger : kAccent);
+        }
+        top += kUsageRow;
     }
 }
 
@@ -2060,6 +2194,7 @@ void ChatWindow::OpenPopup(Popup popup) {
     case Popup::Effort:
         pendingEffort_ = settings_.effort;
         break;
+    case Popup::Usage:
     case Popup::None:
         break;
     }
@@ -2417,19 +2552,14 @@ void ChatWindow::OnClaude(const Json& message) {
         }
     } else if (type == "rate_limit_event") {
         const Json& windows = JsonAt(JsonAt(message, "rate_limit_info"), "unifiedWindows");
-        const auto percent = [](const Json& window) {
+        const auto limit = [](const Json& window) {
             const Json& used = JsonAt(window, "utilization");
-            return used.is_number() ? static_cast<int>(std::lround(used.get<double>() * 100)) : -1;
+            const Json& resets = JsonAt(window, "resetsAt");
+            return Limit{used.is_number() ? static_cast<int>(std::lround(used.get<double>() * 100)) : -1,
+                         resets.is_number() ? resets.get<long long>() : 0};
         };
-        const int fiveHours = percent(JsonAt(windows, "five_hour"));
-        const int week = percent(JsonAt(windows, "seven_day"));
-        limits_.clear();
-        if (fiveHours >= 0) {
-            limits_ = std::format(L"5 ч {}%", fiveHours);
-        }
-        if (week >= 0) {
-            limits_ += std::format(L"{}неделя {}%", limits_.empty() ? L"" : L"  ·  ", week);
-        }
+        session_ = limit(JsonAt(windows, "five_hour"));
+        week_ = limit(JsonAt(windows, "seven_day"));
     } else if (type == "control_response") {
         const Json& response = JsonAt(message, "response");
         if (JsonStr(response, "request_id") == "aic_init") {

@@ -22,6 +22,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 # Everything that is not UI: claude.exe and its protocol.
 add_library(aic_core STATIC
   src/core/attachment.cpp
+  src/core/auth.cpp
   src/core/claude_process.cpp
   src/core/markdown.cpp
   src/core/pty.cpp
@@ -52,6 +53,9 @@ target_link_libraries(aic_vt_test PRIVATE aic_core)
 
 add_executable(aic_pty_test tests/pty_test.cpp)
 target_link_libraries(aic_pty_test PRIVATE aic_core)
+
+add_executable(aic_auth_test tests/auth_test.cpp)
+target_link_libraries(aic_auth_test PRIVATE aic_core)
 
 # By hand, spends a request: the real claude.exe calling our tools (see the file's header).
 add_executable(aic_e2e_probe tests/e2e_probe.cpp)

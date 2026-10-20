@@ -34,6 +34,7 @@
 #include "app/fonts.h"
 #include "app/resource.h"
 #include "core/attachment.h"
+#include "core/auth.h"
 #include "core/claude_process.h"
 #include "core/markdown.h"
 #include "core/pty.h"
@@ -51,6 +52,18 @@ constexpr UINT kClaudeExit = WM_APP + 2;     // ExitInfo*
 constexpr UINT kSecretKey = WM_APP + 3;      // from a secrets field: wParam the key, lParam the field's HWND
 constexpr UINT kTermData = WM_APP + 4;       // std::string* of terminal output (wParam: the terminal's generation)
 constexpr UINT kTermExit = WM_APP + 5;       // lParam: the shell's exit code
+constexpr UINT kAuthStatus = WM_APP + 6;     // AuthStatus*: what `claude auth status` said
+constexpr UINT kAuthUrl = WM_APP + 7;        // std::string*: the sign-in page, for when the browser did not open
+constexpr UINT kAuthLogin = WM_APP + 8;      // LoginDone*: `claude auth login` ended
+constexpr UINT kAuthLogout = WM_APP + 9;     // `claude auth logout` ended
+
+struct LoginDone {
+    bool cancelled = false;
+    bool timedOut = false;
+    bool started = true;
+    DWORD exitCode = 0;
+    std::string tail;  // the end of the CLI's output, for the failure note
+};
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
@@ -122,6 +135,8 @@ bool Inside(const D2D1_RECT_F& r, float x, float y) {
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
 }
 
+bool SetClipboardText(HWND owner, const std::wstring& text);  // below, with the terminal
+
 struct ExitInfo {
     DWORD code;
     std::string stderrTail;
@@ -163,6 +178,10 @@ enum class Target {
     None,
     SidebarToggle,
     SidebarSearch,
+    SignIn,
+    CancelLogin,
+    CopyLoginUrl,
+    Account,  // the sidebar's account row
     TerminalToggle,
     TermClose,
     TermScreen,
@@ -220,6 +239,8 @@ struct Geometry {
     D2D1_RECT_F newItem{};  // the sidebar's "new chat" row
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
     D2D1_RECT_F folder{};   // under the input, at the left: the folder the chat works in
+    D2D1_RECT_F signIn{};   // the sign-in screen's buttons (in the middle of an empty chat)
+    D2D1_RECT_F signAlt{};
     float listBottom = 0;
     D2D1_RECT_F feed{};
     D2D1_RECT_F box{};
@@ -403,6 +424,20 @@ private:
     void PaintEffort(const Geometry& g);
     void PaintUsage(const Geometry& g);
 
+    // The account: `claude auth status / login / logout`, each on its own thread.
+    bool SignedOut() const { return auth_.known && !auth_.loggedIn; }
+    void RefreshAuth();
+    void SignIn();
+    void CancelSignIn();
+    void SignOut();
+    void OnAuthStatus(const AuthStatus& status);
+    void OnLoginDone(const LoginDone& done);
+    void OnLogoutDone();
+    void ShowAccountMenu();
+    void PaintSignIn(const Geometry& g);
+    std::wstring AccountName() const;
+    std::wstring AccountPlan() const;
+
     // The terminal at the right: PowerShell in a pseudo console, drawn from the emulator's screen.
     struct TermPoint {
         size_t line = 0;  // an index into the emulator's lines (the scrollback first)
@@ -510,6 +545,14 @@ private:
     HWND input_ = nullptr;
     wil::unique_hmodule richEdit_;
     wil::unique_hfont uiFont_;
+    AuthStatus auth_;                // as last asked; auth_.known is false until the first answer
+    bool authWorking_ = false;       // a CLI call (status, login, logout) is running
+    bool loginWaiting_ = false;      // `claude auth login` runs: the user is in the browser
+    bool restartAfterAuth_ = false;  // signed in: the CLI starts over to pick the account up
+    std::string loginUrl_;
+    std::wstring authNote_;          // why the last attempt failed
+    std::thread authThread_;
+    std::atomic<bool> authCancel_ = false;
     bool terminalOpen_ = false;
     bool termFocus_ = false;         // typing goes to the shell
     bool termExited_ = false;
@@ -672,6 +715,7 @@ int ChatWindow::Run(int show) {
         Add(Kind::Error, L"Встроенные шрифты не загрузились — показываю системным.");
     }
     RefreshSessions();
+    RefreshAuth();
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
 
     MSG message{};
@@ -777,6 +821,27 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return reinterpret_cast<LRESULT>(fieldBrush_.get());
         }
         break;
+    case kAuthStatus: {
+        const std::unique_ptr<AuthStatus> payload(reinterpret_cast<AuthStatus*>(lParam));
+        OnAuthStatus(*payload);
+        return 0;
+    }
+    case kAuthUrl: {
+        const std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lParam));
+        if (loginWaiting_) {
+            loginUrl_ = *payload;
+            Refresh();
+        }
+        return 0;
+    }
+    case kAuthLogin: {
+        const std::unique_ptr<LoginDone> payload(reinterpret_cast<LoginDone*>(lParam));
+        OnLoginDone(*payload);
+        return 0;
+    }
+    case kAuthLogout:
+        OnLogoutDone();
+        return 0;
     case kTermData: {
         const std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lParam));
         if (wParam == termGeneration_) {
@@ -1046,6 +1111,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_DESTROY:
+        authCancel_ = true;  // a sign-in in progress ends at once
+        if (authThread_.joinable()) {
+            authThread_.join();
+        }
         ++generation_;
         ++termGeneration_;
         pty_.Stop();
@@ -1101,6 +1170,24 @@ void ChatWindow::OnClick(float x, float y) {
     switch (hit.target) {
     case Target::SidebarToggle:
         SetSidebarOpen(!sidebarOpen_);
+        break;
+    case Target::SignIn:
+        SignIn();
+        break;
+    case Target::CancelLogin:
+        CancelSignIn();
+        break;
+    case Target::CopyLoginUrl:
+        if (SetClipboardText(hwnd_, ToWide(loginUrl_))) {
+            Flash(L"Ссылка скопирована");
+        }
+        break;
+    case Target::Account:
+        if (SignedOut()) {
+            SignIn();
+        } else {
+            ShowAccountMenu();
+        }
         break;
     case Target::TerminalToggle:
         SetTerminalOpen(!terminalOpen_);
@@ -1344,6 +1431,12 @@ Geometry ChatWindow::Layout() const {
     const float folderWidth = std::min(TextWidth(folderName_, ui_.get()) + 34.f, std::max(0.f, g.model.left - left - 16.f));
     g.folder = D2D1::RectF(left + 4, chipTop, left + 4 + folderWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
+    {
+        const float centerX = left + g.column / 2;
+        const float middle = (g.feed.top + g.feed.bottom) / 2;
+        g.signIn = D2D1::RectF(centerX - 90, middle + 28, centerX + 90, middle + 28 + 38);
+        g.signAlt = D2D1::RectF(centerX - 90, g.signIn.bottom + 10, centerX + 90, g.signIn.bottom + 10 + 34);
+    }
 
     if (sidebarWidth > 0) {
         g.sidebar = D2D1::RectF(0, kHeader, sidebarWidth, g.height);
@@ -1476,6 +1569,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.newItem, x, y)) {
             return {Target::NewChat};
         }
+        if (Inside(g.account, x, y)) {
+            return {Target::Account};
+        }
         if (Inside(g.secrets, x, y)) {
             return {Target::Secrets};
         }
@@ -1498,6 +1594,14 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.terminalBtn, x, y)) {
         return {Target::TerminalToggle};
+    }
+    if (SignedOut() && !HasConversation()) {
+        if (Inside(g.signIn, x, y)) {
+            return {loginWaiting_ ? Target::CancelLogin : Target::SignIn};
+        }
+        if (loginWaiting_ && !loginUrl_.empty() && Inside(g.signAlt, x, y)) {
+            return {Target::CopyLoginUrl};
+        }
     }
     if (Inside(g.feed, x, y)) {
         for (size_t i = 0; i < feed_.size(); ++i) {
@@ -1719,7 +1823,9 @@ void ChatWindow::Paint() {
 
 void ChatWindow::PaintFeed(const Geometry& g) {
     const float left = g.left;
-    if (!HasConversation()) {
+    if (SignedOut() && !HasConversation()) {
+        PaintSignIn(g);
+    } else if (!HasConversation()) {
         const std::wstring hello = userName_.empty() ? L"Что дальше?" : L"Что дальше, " + ToWide(userName_) + L"?";
         const float middle = (g.feed.top + g.feed.bottom) / 2;
         Text(hello, greeting_.get(), D2D1::RectF(left, middle - 40, left + g.column, middle), kPrimary);
@@ -2785,6 +2891,207 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
     target_->PopAxisAlignedClip();
 }
 
+// ---- The account --------------------------------------------------------------------------------
+
+std::wstring ChatWindow::AccountName() const {
+    std::string email = auth_.email;
+    if (email.empty()) {
+        return userName_.empty() ? std::wstring(L"Аккаунт") : ToWide(userName_);
+    }
+    return ToWide(email.substr(0, email.find('@')));
+}
+
+std::wstring ChatWindow::AccountPlan() const {
+    if (auth_.plan.empty()) {
+        return {};
+    }
+    std::wstring plan = ToWide(auth_.plan);
+    plan[0] = static_cast<wchar_t>(std::towupper(plan[0]));
+    return plan;
+}
+
+void ChatWindow::RefreshAuth() {
+    if (authWorking_) {
+        return;
+    }
+    if (authThread_.joinable()) {
+        authThread_.join();
+    }
+    authWorking_ = true;
+    const HWND hwnd = hwnd_;
+    authThread_ = std::thread([hwnd] {
+        auto status = std::make_unique<AuthStatus>(QueryAuthStatus(FindClaudeExe(), PickProxy()));
+        if (PostMessageW(hwnd, kAuthStatus, 0, reinterpret_cast<LPARAM>(status.get()))) {
+            status.release();
+        }
+    });
+}
+
+void ChatWindow::OnAuthStatus(const AuthStatus& status) {
+    authWorking_ = false;
+    auth_ = status;
+    if (status.known && status.loggedIn && !status.email.empty()) {
+        userName_ = status.email.substr(0, status.email.find('@'));
+    }
+    if (restartAfterAuth_) {
+        restartAfterAuth_ = false;
+        if (status.loggedIn) {
+            Restart();  // the CLI starts over and finds the account
+        }
+    }
+    Refresh();
+}
+
+// `claude auth login` opens the browser itself and ends when the page has handed the code back.
+void ChatWindow::SignIn() {
+    if (authWorking_) {
+        return;
+    }
+    const std::wstring exe = FindClaudeExe();
+    if (exe.empty()) {
+        authNote_ = L"Не найден claude.exe";
+        Refresh();
+        return;
+    }
+    if (authThread_.joinable()) {
+        authThread_.join();
+    }
+    authWorking_ = true;
+    loginWaiting_ = true;
+    loginUrl_.clear();
+    authNote_.clear();
+    authCancel_ = false;
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &authCancel_;
+    authThread_ = std::thread([hwnd, exe, cancel] {
+        std::string seen;
+        bool urlSent = false;
+        const CliResult run = RunCli(
+            L"\"" + exe + L"\" auth login --claudeai", PickProxy(), 600, cancel, [&](const std::string& text) {
+                seen += text;
+                if (urlSent) {
+                    return;
+                }
+                if (std::string url = FindLoginUrl(seen); !url.empty()) {
+                    urlSent = true;
+                    auto payload = std::make_unique<std::string>(std::move(url));
+                    if (PostMessageW(hwnd, kAuthUrl, 0, reinterpret_cast<LPARAM>(payload.get()))) {
+                        payload.release();
+                    }
+                }
+            });
+        auto done = std::make_unique<LoginDone>();
+        done->cancelled = run.cancelled;
+        done->timedOut = run.timedOut;
+        done->started = run.started;
+        done->exitCode = run.exitCode;
+        done->tail = seen.size() > 400 ? seen.substr(seen.size() - 400) : seen;
+        if (PostMessageW(hwnd, kAuthLogin, 0, reinterpret_cast<LPARAM>(done.get()))) {
+            done.release();
+        }
+    });
+    Refresh();
+}
+
+void ChatWindow::CancelSignIn() {
+    authCancel_ = true;  // the thread ends the CLI and reports back
+}
+
+void ChatWindow::OnLoginDone(const LoginDone& done) {
+    loginWaiting_ = false;
+    authWorking_ = false;
+    loginUrl_.clear();
+    if (done.cancelled) {
+        authNote_ = L"Вход отменён.";
+    } else if (done.timedOut) {
+        authNote_ = L"Время ожидания входа вышло.";
+    } else if (!done.started) {
+        authNote_ = L"Не удалось запустить claude.exe.";
+    } else if (done.exitCode != 0) {
+        const std::wstring tail = LastLines(done.tail, 2);
+        authNote_ = L"Вход не удался" + (tail.empty() ? std::wstring(L".") : L": " + tail);
+    } else {
+        authNote_.clear();
+        restartAfterAuth_ = true;
+    }
+    RefreshAuth();
+}
+
+void ChatWindow::SignOut() {
+    if (authWorking_) {
+        return;
+    }
+    const std::wstring exe = FindClaudeExe();
+    if (exe.empty()) {
+        return;
+    }
+    if (MessageBoxW(hwnd_, L"Выйти из аккаунта?\nЧтобы снова пользоваться Claude, придётся войти заново.", L"AIControls",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    if (authThread_.joinable()) {
+        authThread_.join();
+    }
+    authWorking_ = true;
+    const HWND hwnd = hwnd_;
+    authThread_ = std::thread([hwnd, exe] {
+        RunCli(L"\"" + exe + L"\" auth logout", PickProxy(), 30);
+        PostMessageW(hwnd, kAuthLogout, 0, 0);
+    });
+}
+
+void ChatWindow::OnLogoutDone() {
+    authWorking_ = false;
+    ++generation_;  // the running CLI still holds the old account: it goes
+    claude_.Stop();
+    running_ = false;
+    busy_ = false;
+    RefreshAuth();
+}
+
+void ChatWindow::ShowAccountMenu() {
+    const Geometry g = Layout();
+    POINT screen{ToPx(g.account.left + 8.f), ToPx(g.account.top)};
+    ClientToScreen(hwnd_, &screen);
+    wil::unique_hmenu menu(CreatePopupMenu());
+    const std::wstring who = auth_.email.empty() ? AccountName() : ToWide(auth_.email);
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, who.c_str());
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из аккаунта");
+    if (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, screen.x, screen.y, 0, hwnd_,
+                       nullptr) == 2) {
+        SignOut();
+    }
+}
+
+// In place of the greeting while nobody is signed in: what to do, and the sign-in button.
+void ChatWindow::PaintSignIn(const Geometry& g) {
+    const float middle = (g.feed.top + g.feed.bottom) / 2;
+    Text(L"Войдите в аккаунт Claude", greeting_.get(), D2D1::RectF(g.left, middle - 40, g.left + g.column, middle),
+         kPrimary);
+    const std::wstring hint = loginWaiting_ ? L"Откройте страницу входа в браузере и подтвердите вход."
+                                            : L"Нужна подписка Claude (Pro или Max): без входа чат не отвечает.";
+    Text(hint, notice_.get(), D2D1::RectF(g.left, middle + 2, g.left + g.column, middle + 24), kSecondary);
+
+    const bool onMain = hover_.target == Target::SignIn || hover_.target == Target::CancelLogin;
+    if (loginWaiting_) {
+        Fill(g.signIn, 9.f, onMain ? kLine : kRaised);
+        Text(L"Отмена", button_.get(), g.signIn, kPrimary);
+        if (!loginUrl_.empty()) {
+            const bool onAlt = hover_.target == Target::CopyLoginUrl;
+            Fill(g.signAlt, 9.f, onAlt ? kLine : kRaised);
+            Text(L"Копировать ссылку", button_.get(), g.signAlt, kPrimary);
+        }
+    } else {
+        Fill(g.signIn, 9.f, kAccent, onMain ? 0.85f : 1.f);
+        Text(authWorking_ ? L"Проверяю…" : L"Войти", button_.get(), g.signIn, kPrimary);
+    }
+    if (!authNote_.empty()) {
+        const float top = (loginWaiting_ && !loginUrl_.empty() ? g.signAlt.bottom : g.signIn.bottom) + 12;
+        Text(authNote_, notice_.get(), D2D1::RectF(g.left, top, g.left + g.column, top + 40), kDanger);
+    }
+}
+
 void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {
     Fill(D2D1::RectF(rect.left + 2, rect.top + 4, rect.right + 2, rect.bottom + 6), 10.f, 0x000000, 0.35f);
     Fill(rect, 10.f, kCard);
@@ -2840,16 +3147,38 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
              D2D1::RectF(g.newItem.left + 42, g.newItem.top, g.newItem.right - 8, g.newItem.bottom), color);
     }
 
-    {  // the account, at the bottom
+    {  // the account, at the bottom: who is signed in and the plan, or the way to sign in
         Line({g.sidebar.left, g.account.top - 4.f}, {g.sidebar.right, g.account.top - 4.f}, kLine, 1.f);
+        const bool hovered = hover_.target == Target::Account;
+        if (hovered) {
+            Fill(g.account, 8.f, kRaised);
+        }
         const D2D1_POINT_2F c{g.account.left + 22.f, (g.account.top + g.account.bottom) / 2};
-        brush_->SetColor(Color(0x7a5af8));
-        target_->FillEllipse(D2D1::Ellipse(c, 12.f, 12.f), brush_.get());
-        const std::wstring name = userName_.empty() ? std::wstring(L"Аккаунт") : ToWide(userName_);
-        Text(std::wstring(1, static_cast<wchar_t>(std::towupper(name[0]))), badge_.get(),
-             D2D1::RectF(c.x - 12, c.y - 12, c.x + 12, c.y + 12), kPrimary);
-        Text(name, ui_.get(), D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, g.account.bottom),
-             kPrimary);
+        if (SignedOut()) {
+            brush_->SetColor(Color(kAccent));
+            target_->FillEllipse(D2D1::Ellipse(c, 12.f, 12.f), brush_.get());
+            Line({c.x - 4.f, c.y}, {c.x + 4.f, c.y}, kPrimary, 1.6f);  // an arrow into the door
+            Line({c.x + 1.f, c.y - 3.f}, {c.x + 4.f, c.y}, kPrimary, 1.6f);
+            Line({c.x + 1.f, c.y + 3.f}, {c.x + 4.f, c.y}, kPrimary, 1.6f);
+            Text(L"Войти в аккаунт", ui_.get(),
+                 D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, g.account.bottom), kAccent);
+        } else {
+            const std::wstring name = AccountName();
+            brush_->SetColor(Color(0x7a5af8));
+            target_->FillEllipse(D2D1::Ellipse(c, 12.f, 12.f), brush_.get());
+            Text(std::wstring(1, static_cast<wchar_t>(std::towupper(name[0]))), badge_.get(),
+                 D2D1::RectF(c.x - 12, c.y - 12, c.x + 12, c.y + 12), kPrimary);
+            const std::wstring plan = AccountPlan();
+            const float nameBottom = plan.empty() ? g.account.bottom : g.account.top + 26;
+            Text(name, ui_.get(), D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, nameBottom),
+                 kPrimary);
+            if (!plan.empty()) {
+                Text(plan, badge_.get(),
+                     D2D1::RectF(g.account.left + 44, g.account.top + 22, g.account.left + 44 + TextWidth(plan, badge_.get()) + 4,
+                                 g.account.bottom - 2),
+                     kSecondary);
+            }
+        }
     }
 
     {  // the way to the secrets
@@ -3584,6 +3913,10 @@ void ChatWindow::Submit() {
     const size_t first = text.find_first_not_of(L" \t\n");
     text = first == std::wstring::npos ? L"" : text.substr(first, text.find_last_not_of(L" \t\n") - first + 1);
     if (text.empty() && attachments_.empty()) {
+        return;
+    }
+    if (SignedOut()) {
+        Flash(L"Сначала войдите в аккаунт", 3000);
         return;
     }
     if (!running_ && !StartClaude()) {

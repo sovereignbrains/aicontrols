@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(aicontrols LANGUAGES CXX)
+project(aicontrols LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,5 +30,7 @@ target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_
 add_executable(aicontrols WIN32
   src/app/main.cpp
   src/app/chat_window.cpp
-  src/app/aicontrols.manifest)
+  src/app/fonts.cpp
+  src/app/aicontrols.manifest
+  src/app/aicontrols.rc)
 target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32)

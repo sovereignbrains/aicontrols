@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "app/fonts.h"
 #include "core/attachment.h"
 #include "core/claude_process.h"
 #include "core/store.h"
@@ -287,8 +288,8 @@ private:
     Hit HitTest(float x, float y) const;
     void MoveChild(HWND child, const D2D1_RECT_F& rect) const;
 
-    wil::com_ptr<IDWriteTextFormat> MakeFormat(float size, DWRITE_FONT_WEIGHT weight, DWRITE_TEXT_ALIGNMENT align,
-                                               bool singleLine) const;
+    wil::com_ptr<IDWriteTextFormat> MakeFormat(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight,
+                                               DWRITE_TEXT_ALIGNMENT align, bool singleLine) const;
     float TextWidth(const std::wstring& text, IDWriteTextFormat* format) const;
     void CreateFonts();
     void CreateInput();
@@ -356,6 +357,7 @@ private:
     wil::com_ptr<ID2D1Factory> d2d_;
     wil::com_ptr<IDWriteFactory> dwrite_;
     wil::com_ptr<IWICImagingFactory> wic_;
+    wil::com_ptr<IDWriteFontCollection> fonts_;
     wil::com_ptr<ID2D1HwndRenderTarget> target_;
     wil::com_ptr<ID2D1SolidColorBrush> brush_;
     wil::com_ptr<ID2D1StrokeStyle> round_;
@@ -420,20 +422,22 @@ int ChatWindow::Run(int show) {
     THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d_.put()));
     THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                         reinterpret_cast<IUnknown**>(dwrite_.put())));
+    fonts_ = LoadFontCollection(dwrite_.get());
+    RegisterGdiFonts(instance_);
     THROW_IF_FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                      IID_PPV_ARGS(wic_.put())));
     D2D1_STROKE_STYLE_PROPERTIES stroke = D2D1::StrokeStyleProperties();
     stroke.startCap = stroke.endCap = D2D1_CAP_STYLE_ROUND;
     stroke.lineJoin = D2D1_LINE_JOIN_ROUND;
     THROW_IF_FAILED(d2d_->CreateStrokeStyle(stroke, nullptr, 0, round_.put()));
-    body_ = MakeFormat(15.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
-    notice_ = MakeFormat(12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
-    header_ = MakeFormat(13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    ui_ = MakeFormat(13.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    uiBold_ = MakeFormat(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    uiRight_ = MakeFormat(12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
-    badge_ = MakeFormat(11.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, true);
-    greeting_ = MakeFormat(24.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+    body_ = MakeFormat(kTextFont, 15.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+    notice_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+    header_ = MakeFormat(kDisplayFont, 12.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    ui_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    uiBold_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    uiRight_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
+    badge_ = MakeFormat(kTextFont, 11.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+    greeting_ = MakeFormat(kDisplayFont, 22.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -450,6 +454,9 @@ int ChatWindow::Run(int show) {
     SetWindowPos(hwnd_, nullptr, 0, 0, ToPx(1000.f), ToPx(840.f), SWP_NOMOVE | SWP_NOZORDER);
     ShowWindow(hwnd_, show);
     UpdateWindow(hwnd_);
+    if (!fonts_) {
+        Add(Kind::Error, L"Встроенные шрифты не загрузились — показываю системным.");
+    }
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
 
     MSG message{};
@@ -460,10 +467,10 @@ int ChatWindow::Run(int show) {
     return static_cast<int>(message.wParam);
 }
 
-wil::com_ptr<IDWriteTextFormat> ChatWindow::MakeFormat(float size, DWRITE_FONT_WEIGHT weight,
+wil::com_ptr<IDWriteTextFormat> ChatWindow::MakeFormat(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight,
                                                        DWRITE_TEXT_ALIGNMENT align, bool singleLine) const {
     wil::com_ptr<IDWriteTextFormat> format;
-    THROW_IF_FAILED(dwrite_->CreateTextFormat(L"Segoe UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+    THROW_IF_FAILED(dwrite_->CreateTextFormat(family, fonts_.get(), weight, DWRITE_FONT_STYLE_NORMAL,
                                               DWRITE_FONT_STRETCH_NORMAL, size, L"ru-ru", format.put()));
     format->SetTextAlignment(align);
     if (singleLine) {
@@ -1078,7 +1085,7 @@ void ChatWindow::CreateFonts() {
     LOGFONTW font{};
     font.lfHeight = -MulDiv(11, static_cast<int>(GetDpiForWindow(hwnd_)), 72);
     font.lfQuality = CLEARTYPE_QUALITY;
-    wcscpy_s(font.lfFaceName, L"Segoe UI");
+    wcscpy_s(font.lfFaceName, kTextFont);
     uiFont_.reset(CreateFontIndirectW(&font));
 }
 
@@ -1103,7 +1110,7 @@ void ChatWindow::StyleInput() {
     format.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
     format.crTextColor = ToColorRef(kPrimary);
     format.yHeight = 11 * 20;  // twips
-    wcscpy_s(format.szFaceName, L"Segoe UI");
+    wcscpy_s(format.szFaceName, kTextFont);
     SendMessageW(input_, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&format));
     SendMessageW(input_, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&format));
 }

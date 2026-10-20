@@ -196,6 +196,8 @@ constexpr float kCardPad = 12.f;
 constexpr float kCardTitle = 22.f;
 constexpr float kCardButton = 30.f;
 constexpr float kCardButtonWidth = 112.f;
+constexpr float kTipPadX = 10.f;  // a hint's text inside its box
+constexpr float kTipPadY = 5.f;
 constexpr float kImageWidth = 360.f;   // a picture in the feed fits this box
 constexpr float kImageHeight = 280.f;
 constexpr float kImageGap = 6.f;
@@ -717,7 +719,9 @@ private:
     std::wstring TooltipText();
     void UpdateTip();
     void HideTip();
-    void PaintTooltip(const Geometry& g);
+    static LRESULT CALLBACK TipProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    void ShowTip();
+    void PaintTip();
 
     // Renaming in place (a terminal tab, a chat in the sidebar): the keys go to the field until Enter or Esc,
     // a click elsewhere keeps what is typed.
@@ -1060,6 +1064,9 @@ private:
     size_t secretsFirst_ = 0;  // the first secret shown when they do not all fit
     float wheelRemainder_ = 0;  // wheel movement not yet worth a whole row
     std::wstring tipText_;      // the hint for what is under the pointer ("" for nothing)
+    HWND tip_ = nullptr;        // ... shown in a window of its own, made when first needed
+    wil::com_ptr<ID2D1HwndRenderTarget> tipTarget_;
+    wil::com_ptr<IDWriteTextLayout> tipLayout_;
     bool tipShown_ = false;
     D2D1_POINT_2F tipAt_{};     // where the pointer was when it appeared
     Rename renaming_ = Rename::None;
@@ -1761,9 +1768,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd_, kTipTimer);
             if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
                 !selecting_) {
-                tipShown_ = true;
                 tipAt_ = mouse_;
-                Refresh();
+                ShowTip();
             }
         }
         return 0;
@@ -2250,7 +2256,7 @@ Geometry ChatWindow::Layout() const {
         g.search = D2D1::RectF(10, kHeader + 10, sidebarWidth - 10, kHeader + 10 + kFieldHeight);
         g.newItem = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
         g.secrets = D2D1::RectF(6, g.newItem.bottom + 2, sidebarWidth - 6, g.newItem.bottom + 2 + kNavRow);
-        g.account = D2D1::RectF(6, g.height - 8 - 44, sidebarWidth - 6, g.height - 8);
+        g.account = D2D1::RectF(6, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
         g.listTop = g.secrets.bottom + 8 + 26;  // under the "chats" label
         g.listBottom = g.account.top - 6;
     }
@@ -2766,7 +2772,6 @@ void ChatWindow::Paint() {
     case Popup::None:
         break;
     }
-    PaintTooltip(g);
     if (target_->EndDraw() == D2DERR_RECREATE_TARGET) {
         target_.reset();
         brush_.reset();
@@ -5010,19 +5015,22 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             Text(L"Войти в аккаунт", ui_.get(),
                  D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, g.account.bottom), kAccent);
         } else {
+            // One line, as in Claude's app: "name · plan", the plan quieter.
             const std::wstring name = AccountName();
             brush_->SetColor(Color(0x7a5af8));
-            target_->FillEllipse(D2D1::Ellipse(c, 12.f, 12.f), brush_.get());
+            target_->FillEllipse(D2D1::Ellipse(c, 10.f, 10.f), brush_.get());
             Text(std::wstring(1, static_cast<wchar_t>(std::towupper(name[0]))), badge_.get(),
-                 D2D1::RectF(c.x - 12, c.y - 12, c.x + 12, c.y + 12), kPrimary);
+                 D2D1::RectF(c.x - 10, c.y - 10, c.x + 10, c.y + 10), kPrimary);
             const std::wstring plan = AccountPlan();
-            const float nameBottom = plan.empty() ? g.account.bottom : g.account.top + 26;
-            Text(name, ui_.get(), D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, nameBottom),
-                 kPrimary);
-            if (!plan.empty()) {
-                Text(plan, badge_.get(),
-                     D2D1::RectF(g.account.left + 44, g.account.top + 22, g.account.left + 44 + TextWidth(plan, badge_.get()) + 4,
-                                 g.account.bottom - 2),
+            const float nameLeft = g.account.left + 40;
+            const float room = g.account.right - 8 - nameLeft;
+            const std::wstring tail = plan.empty() ? std::wstring() : L" · " + plan;
+            const float tailWidth = tail.empty() ? 0.f : TextWidth(tail, ui_.get());
+            const float nameWidth = std::min(TextWidth(name, ui_.get()), std::max(0.f, room - tailWidth));
+            Text(name, ui_.get(), D2D1::RectF(nameLeft, g.account.top, nameLeft + nameWidth, g.account.bottom), kPrimary);
+            if (!tail.empty()) {
+                Text(tail, ui_.get(),
+                     D2D1::RectF(nameLeft + nameWidth, g.account.top, nameLeft + nameWidth + tailWidth, g.account.bottom),
                      kSecondary);
             }
         }
@@ -6145,7 +6153,7 @@ void ChatWindow::UpdateTip() {
     KillTimer(hwnd_, kTipTimer);
     if (tipShown_) {
         tipShown_ = false;
-        Refresh();
+        ShowWindow(tip_, SW_HIDE);
     }
     if (!tipText_.empty()) {
         SetTimer(hwnd_, kTipTimer, 600, nullptr);
@@ -6157,40 +6165,108 @@ void ChatWindow::HideTip() {
     KillTimer(hwnd_, kTipTimer);
     if (tipShown_) {
         tipShown_ = false;
-        Refresh();
+        ShowWindow(tip_, SW_HIDE);
     }
 }
 
-void ChatWindow::PaintTooltip(const Geometry& g) {
-    if (!tipShown_ || tipText_.empty() || popup_ != Popup::None) {
+// A window of its own, over everything: drawn into the main one, the hint went under the input box and the
+// preview (child windows of their own).
+LRESULT CALLBACK ChatWindow::TipProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* self = reinterpret_cast<ChatWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (message) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;  // the pointer is the main window's: the hint is only shown
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        BeginPaint(hwnd, &paint);
+        if (self != nullptr) {
+            self->PaintTip();
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    default:
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+}
+
+void ChatWindow::ShowTip() {
+    if (tipText_.empty() || popup_ != Popup::None) {
         return;
     }
-    // The text is laid out once and drawn as laid out: measured one way and drawn into a box of exactly that
-    // width another, the last letter used to wrap. A long hint wraps at most this wide, and stays in the window.
-    constexpr float kPadX = 10.f;
-    constexpr float kPadY = 5.f;
-    const float most = std::max(80.f, std::min(420.f, g.width - 16.f - 2 * kPadX));
-    wil::com_ptr<IDWriteTextLayout> layout;
+    if (tip_ == nullptr) {
+        WNDCLASSEXW tipClass{};
+        tipClass.cbSize = sizeof(tipClass);
+        tipClass.lpfnWndProc = &ChatWindow::TipProc;
+        tipClass.hInstance = instance_;
+        tipClass.lpszClassName = L"AIControlsTip";
+        RegisterClassExW(&tipClass);
+        tip_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"AIControlsTip", L"", WS_POPUP,
+                               0, 0, 1, 1, hwnd_, nullptr, instance_, nullptr);
+        if (tip_ == nullptr) {
+            return;
+        }
+        SetWindowLongPtrW(tip_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
+        DwmSetWindowAttribute(tip_, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+        const COLORREF border = ToColorRef(kLine);
+        DwmSetWindowAttribute(tip_, DWMWA_BORDER_COLOR, &border, sizeof(border));
+    }
+    // Laid out once and drawn as laid out; a long hint wraps at most this wide.
+    const Geometry g = Layout();
+    const float most = std::max(80.f, std::min(420.f, g.width - 16.f - 2 * kTipPadX));
+    tipLayout_.reset();
     if (FAILED(dwrite_->CreateTextLayout(tipText_.c_str(), static_cast<UINT32>(tipText_.size()), small_.get(), most,
-                                         1000.f, layout.put()))) {
+                                         1000.f, tipLayout_.put()))) {
         return;
     }
     DWRITE_TEXT_METRICS metrics{};
-    layout->GetMetrics(&metrics);
-    layout->SetMaxWidth(std::ceil(metrics.widthIncludingTrailingWhitespace) + 1.f);  // the box hugs the text
-    const float width = std::ceil(metrics.widthIncludingTrailingWhitespace) + 1.f + 2 * kPadX;
-    const float height = std::ceil(metrics.height) + 2 * kPadY;
+    tipLayout_->GetMetrics(&metrics);
+    const float textWidth = std::ceil(metrics.widthIncludingTrailingWhitespace) + 1.f;
+    tipLayout_->SetMaxWidth(textWidth);  // the box hugs the text
+    const float width = textWidth + 2 * kTipPadX;
+    const float height = std::ceil(metrics.height) + 2 * kTipPadY;
     const float left = std::clamp(tipAt_.x - width / 2, 8.f, std::max(8.f, g.width - width - 8.f));
     float top = tipAt_.y + 22.f;  // under the pointer, or above it at the window's bottom
     if (top + height > g.height - 6.f) {
         top = tipAt_.y - height - 10.f;
     }
-    const D2D1_RECT_F r = D2D1::RectF(left, top, left + width, top + height);
-    Fill(r, 6.f, kRaised);
-    brush_->SetColor(Color(kLine));
-    target_->DrawRoundedRectangle(D2D1::RoundedRect(r, 6.f, 6.f), brush_.get(), 1.f);
-    brush_->SetColor(Color(kPrimary));
-    target_->DrawTextLayout({r.left + kPadX, r.top + kPadY}, layout.get(), brush_.get());
+    POINT at{ToPx(left), ToPx(top)};
+    ClientToScreen(hwnd_, &at);
+    const int widthPx = ToPx(width);
+    const int heightPx = ToPx(height);
+    SetWindowPos(tip_, HWND_TOP, at.x, at.y, widthPx, heightPx, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (tipTarget_) {
+        tipTarget_->Resize(D2D1::SizeU(static_cast<UINT32>(widthPx), static_cast<UINT32>(heightPx)));
+    } else {
+        D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties();
+        properties.dpiX = properties.dpiY = Dpi();
+        d2d_->CreateHwndRenderTarget(
+            properties,
+            D2D1::HwndRenderTargetProperties(tip_, D2D1::SizeU(static_cast<UINT32>(widthPx), static_cast<UINT32>(heightPx))),
+            tipTarget_.put());
+    }
+    tipShown_ = true;
+    InvalidateRect(tip_, nullptr, FALSE);
+}
+
+void ChatWindow::PaintTip() {
+    if (!tipTarget_ || !tipLayout_) {
+        return;
+    }
+    tipTarget_->SetDpi(Dpi(), Dpi());
+    tipTarget_->BeginDraw();
+    tipTarget_->Clear(Color(kRaised));
+    wil::com_ptr<ID2D1SolidColorBrush> brush;
+    tipTarget_->CreateSolidColorBrush(Color(kPrimary), brush.put());
+    if (brush) {
+        tipTarget_->DrawTextLayout({kTipPadX, kTipPadY}, tipLayout_.get(), brush.get());
+    }
+    if (tipTarget_->EndDraw() == D2DERR_RECREATE_TARGET) {
+        tipTarget_.reset();
+    }
 }
 
 // ---- Renaming in place --------------------------------------------------------------------------------

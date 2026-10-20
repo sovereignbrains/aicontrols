@@ -285,6 +285,14 @@ struct Limit {
     long long resetsAt = 0;  // Unix seconds
 };
 
+// A window as it stands now: past its reset it is empty, until the CLI reports again after a turn.
+Limit Current(const Limit& limit) {
+    if (limit.resetsAt > 0 && limit.resetsAt <= static_cast<long long>(std::time(nullptr))) {
+        return Limit{limit.percent >= 0 ? 0 : -1, 0};
+    }
+    return limit;
+}
+
 enum class Target {
     None,
     SidebarToggle,
@@ -2961,8 +2969,8 @@ void ChatWindow::PaintInput(const Geometry& g) {
         const D2D1_POINT_2F center{(g.usage.left + g.usage.right) / 2, (g.usage.top + g.usage.bottom) / 2};
         brush_->SetColor(Color(kLine));
         target_->DrawEllipse(D2D1::Ellipse(center, 7.5f, 7.5f), brush_.get(), 2.f);
-        if (session_.percent >= 0) {
-            Ring(center, 7.5f, static_cast<float>(session_.percent) / 100.f, session_.percent >= 90 ? kDanger : kAccent);
+        if (const Limit session = Current(session_); session.percent >= 0) {
+            Ring(center, 7.5f, static_cast<float>(session.percent) / 100.f, session.percent >= 90 ? kDanger : kAccent);
         }
     }
 
@@ -3046,10 +3054,11 @@ void ChatWindow::PaintUsage(const Geometry& g) {
     constexpr float kPercentWidth = 40.f;
     float top = g.popup.top + 14 + 24;
     for (const Row& row : rows) {
-        const int percent = row.limit->percent;
+        const Limit limit = Current(*row.limit);
+        const int percent = limit.percent;
         const float labelWidth = TextWidth(row.label, uiBold_.get()) + 12.f;
         Text(row.label, uiBold_.get(), D2D1::RectF(left, top, left + labelWidth, top + 20), kPrimary);
-        Text(ResetText(*row.limit, row.weekday), uiRight_.get(),
+        Text(ResetText(limit, row.weekday), uiRight_.get(),
              D2D1::RectF(left + labelWidth, top, right - kPercentWidth - 8, top + 20), kSecondary);
         Text(percent >= 0 ? std::format(L"{}%", percent) : std::wstring(L"—"), uiRight_.get(),
              D2D1::RectF(right - kPercentWidth, top, right, top + 20), kSecondary);
@@ -6326,15 +6335,25 @@ void ChatWindow::OnClaude(const Json& message) {
             RefreshSessions();  // a new chat appears in the list, a title may have changed
         }
     } else if (type == "rate_limit_event") {
-        const Json& windows = JsonAt(JsonAt(message, "rate_limit_info"), "unifiedWindows");
-        const auto limit = [](const Json& window) {
+        const Json& info = JsonAt(message, "rate_limit_info");
+        const Json& windows = JsonAt(info, "unifiedWindows");
+        const auto update = [](Limit& limit, const Json& window) {
             const Json& used = JsonAt(window, "utilization");
+            if (!used.is_number()) {
+                return;  // not in this event: what was known stays
+            }
             const Json& resets = JsonAt(window, "resetsAt");
-            return Limit{used.is_number() ? static_cast<int>(std::lround(used.get<double>() * 100)) : -1,
-                         resets.is_number() ? resets.get<long long>() : 0};
+            limit = Limit{static_cast<int>(std::lround(used.get<double>() * 100)),
+                          resets.is_number() ? resets.get<long long>() : 0};
         };
-        session_ = limit(JsonAt(windows, "five_hour"));
-        week_ = limit(JsonAt(windows, "seven_day"));
+        if (windows.is_object()) {
+            update(session_, JsonAt(windows, "five_hour"));
+            update(week_, JsonAt(windows, "seven_day"));
+        } else if (const std::string window = JsonStr(info, "rateLimitType"); window == "five_hour") {
+            update(session_, info);  // a CLI without unifiedWindows: only the window the event is about
+        } else if (window == "seven_day") {
+            update(week_, info);
+        }
         if (settings_.sessionPercent != session_.percent || settings_.sessionResets != session_.resetsAt ||
             settings_.weekPercent != week_.percent || settings_.weekResets != week_.resetsAt) {
             settings_.sessionPercent = session_.percent;

@@ -13,11 +13,13 @@
 namespace aic {
 
 CliResult RunCli(const std::wstring& commandLine, const std::wstring& proxy, int timeoutSeconds,
-                 const std::atomic<bool>* cancel, const std::function<void(const std::string&)>& onOutput) {
+                 const std::atomic<bool>* cancel, const std::function<void(const std::string&)>& onOutput,
+                 const std::vector<std::pair<std::wstring, std::wstring>>& extraEnvironment, const std::wstring& cwd) {
     CliResult result;
-    std::vector<std::pair<std::wstring, std::wstring>> overrides;
+    std::vector<std::pair<std::wstring, std::wstring>> overrides = extraEnvironment;
     if (!proxy.empty()) {
-        overrides = {{L"HTTPS_PROXY", proxy}, {L"HTTP_PROXY", proxy}, {L"NO_PROXY", L"127.0.0.1,localhost,::1"}};
+        overrides.insert(overrides.end(), {{L"HTTPS_PROXY", proxy}, {L"HTTP_PROXY", proxy},
+                                           {L"NO_PROXY", L"127.0.0.1,localhost,::1"}});
     }
     std::vector<wchar_t> environment = MakeEnvironmentBlock(overrides);
 
@@ -58,7 +60,7 @@ CliResult RunCli(const std::wstring& commandLine, const std::wstring& proxy, int
     PROCESS_INFORMATION info{};
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-                        environment.data(), nullptr, &startup.StartupInfo, &info)) {
+                        environment.data(), cwd.empty() ? nullptr : cwd.c_str(), &startup.StartupInfo, &info)) {
         return result;
     }
     const wil::unique_handle process(info.hProcess);

@@ -24,6 +24,7 @@ add_library(aic_core STATIC
   src/core/attachment.cpp
   src/core/auth.cpp
   src/core/claude_process.cpp
+  src/core/github.cpp
   src/core/markdown.cpp
   src/core/pty.cpp
   src/core/secrets.cpp
@@ -31,7 +32,7 @@ add_library(aic_core STATIC
   src/core/tools.cpp
   src/core/vt_screen.cpp)
 target_include_directories(aic_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs)
+target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs winhttp)
 
 add_executable(aicontrols WIN32
   src/app/main.cpp
@@ -56,6 +57,10 @@ target_link_libraries(aic_pty_test PRIVATE aic_core)
 
 add_executable(aic_auth_test tests/auth_test.cpp)
 target_link_libraries(aic_auth_test PRIVATE aic_core)
+
+# By hand: the GitHub repositories the GITHUB secret reaches (and a clone).
+add_executable(aic_github_probe tests/github_probe.cpp)
+target_link_libraries(aic_github_probe PRIVATE aic_core)
 
 # By hand: the titles of the real chats.
 add_executable(aic_store_probe tests/store_probe.cpp)

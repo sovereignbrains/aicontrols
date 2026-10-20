@@ -333,6 +333,20 @@ Settings LoadSettings() {
     settings.sessionResets = number("sessionResets", 0);
     settings.weekPercent = static_cast<int>(number("weekPercent", -1));
     settings.weekResets = number("weekResets", 0);
+    const auto real = [&](const char* key) {
+        const Json& value = JsonAt(data, key);
+        return value.is_number() ? value.get<float>() : 0.f;
+    };
+    settings.sidebarWidth = real("sidebarWidth");
+    settings.terminalWidth = real("terminalWidth");
+    settings.workspace = ToWide(JsonStr(data, "workspace"));
+    if (const Json& recent = JsonAt(data, "recentFolders"); recent.is_array()) {
+        for (const Json& folder : recent) {
+            if (folder.is_string()) {
+                settings.recentFolders.push_back(ToWide(folder.get<std::string>()));
+            }
+        }
+    }
     return settings;
 }
 
@@ -341,12 +355,20 @@ void SaveSettings(const Settings& settings) {
     std::error_code error;
     fs::create_directories(file.parent_path(), error);
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    Json recent = Json::array();
+    for (const std::wstring& folder : settings.recentFolders) {
+        recent.push_back(ToUtf8(folder));
+    }
     out << Json{{"model", settings.model},
                 {"effort", settings.effort},
                 {"sessionPercent", settings.sessionPercent},
                 {"sessionResets", settings.sessionResets},
                 {"weekPercent", settings.weekPercent},
-                {"weekResets", settings.weekResets}}
+                {"weekResets", settings.weekResets},
+                {"sidebarWidth", settings.sidebarWidth},
+                {"terminalWidth", settings.terminalWidth},
+                {"workspace", ToUtf8(settings.workspace)},
+                {"recentFolders", recent}}
                .dump(2)
         << "\n";
 }

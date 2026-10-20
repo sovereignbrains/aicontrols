@@ -36,6 +36,7 @@
 #include "core/attachment.h"
 #include "core/auth.h"
 #include "core/claude_process.h"
+#include "core/github.h"
 #include "core/markdown.h"
 #include "core/pty.h"
 #include "core/secrets.h"
@@ -64,6 +65,21 @@ struct LoginDone {
     DWORD exitCode = 0;
     std::string tail;  // the end of the CLI's output, for the failure note
 };
+
+constexpr UINT kRepos = WM_APP + 10;      // ReposResult*: the GitHub repositories
+constexpr UINT kCloneDone = WM_APP + 11;  // CloneDone*: `git clone` ended
+
+struct ReposResult {
+    std::vector<GithubRepo> repos;
+    std::string error;
+};
+
+struct CloneDone {
+    bool ok = false;
+    std::wstring folder;
+    std::wstring name;
+    std::string output;
+};
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
@@ -89,7 +105,10 @@ constexpr float kUsageRow = 58.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 32.f;
-constexpr float kTerminal = 480.f;  // the right column: PowerShell
+constexpr float kTerminal = 480.f;  // the right column: PowerShell (as wide by default)
+constexpr float kMinTerminal = 300.f;
+constexpr float kMinSidebar = 180.f;
+constexpr float kMaxSidebar = 480.f;
 constexpr uint32_t kTermFg = 0xd4d4d8;
 constexpr float kSidebar = 252.f;  // the left column: search, secrets, the chats
 constexpr float kHistoryRow = 34.f;
@@ -190,6 +209,9 @@ enum class Target {
     None,
     SidebarToggle,
     SidebarSearch,
+    FolderChip,     // the chat's folder, under the input: a menu to change it
+    SplitSidebar,   // the edge between the sidebar and the chat: drag to resize
+    SplitTerminal,  // ... and between the chat and the terminal
     WinMin,    // the window's own buttons, drawn in the header (the system caption is gone)
     WinMax,
     WinClose,
@@ -244,6 +266,8 @@ struct Geometry {
     float area = 0;      // ... and its right edge
     float left = 0;      // where the chat column starts
     D2D1_RECT_F sidebar{};
+    D2D1_RECT_F splitSidebar{};   // a few DIPs either side of the sidebar's edge
+    D2D1_RECT_F splitTerminal{};  // ... and of the terminal's
     D2D1_RECT_F term{};  // the terminal column (empty when closed)
     D2D1_RECT_F termClose{};
     D2D1_RECT_F termScreen{};
@@ -503,6 +527,17 @@ private:
     bool CopyFeedSelection();
     void ClearFeedSelection();
 
+    // The chat's folder: the default, recent ones, any folder, or a GitHub repository (cloned first).
+    void LoadRepos();
+    void SwitchWorkspace(const std::wstring& folder);
+    void PickWorkspace();
+    void OpenRepo(size_t index);
+    void OnCloneDone(const CloneDone& done);
+    void ShowFolderMenu();
+    std::wstring FolderLabel() const {
+        return cloning_ ? L"Клонирую " + cloningName_ + L"…" : folderName_;
+    }
+
     // The account: `claude auth status / login / logout`, each on its own thread.
     bool SignedOut() const { return auth_.known && !auth_.loggedIn; }
     void RefreshAuth();
@@ -649,6 +684,14 @@ private:
     std::optional<FeedPoint> feedAnchor_;  // where a selection in the feed began
     std::optional<FeedPoint> feedFocus_;   // ... and where it ends now
     bool feedSelecting_ = false;           // the mouse is dragging one
+    std::vector<GithubRepo> repos_;  // as GitHub listed them for the GITHUB secret
+    std::wstring reposError_;
+    bool reposLoading_ = false;
+    std::thread reposThread_;
+    bool cloning_ = false;
+    std::wstring cloningName_;
+    std::thread cloneThread_;
+    std::atomic<bool> cloneCancel_ = false;
     AuthStatus auth_;                // as last asked; auth_.known is false until the first answer
     bool authWorking_ = false;       // a CLI call (status, login, logout) is running
     bool loginWaiting_ = false;      // `claude auth login` runs: the user is in the browser
@@ -671,6 +714,9 @@ private:
     WPARAM nextTabId_ = 0;
     wil::com_ptr<IDWriteTextFormat> termFont_;
     wil::com_ptr<IDWriteTextFormat> termBold_;
+    float sidebarWidth_ = kSidebar;   // as dragged; kept in the settings
+    float terminalWidth_ = kTerminal;
+    Target dragging_ = Target::None;  // a splitter being dragged
     bool sidebarOpen_ = true;
     bool searchFocus_ = false;  // typing goes to the sidebar's search (drawn here, no caret)
     bool secretsOpen_ = false;  // the sidebar shows the secrets instead of the chats
@@ -761,6 +807,17 @@ int ChatWindow::Run(int show) {
     tools_.SetCwd(workspace_);
     secrets_.Load();
     settings_ = LoadSettings();
+    if (std::error_code error; !settings_.workspace.empty() && std::filesystem::is_directory(settings_.workspace, error)) {
+        workspace_ = settings_.workspace;  // the folder chosen last time
+        folderName_ = std::filesystem::path(workspace_).filename().wstring();
+        tools_.SetCwd(workspace_);
+    }
+    if (settings_.sidebarWidth > 0) {
+        sidebarWidth_ = std::clamp(settings_.sidebarWidth, kMinSidebar, kMaxSidebar);
+    }
+    if (settings_.terminalWidth > 0) {
+        terminalWidth_ = std::max(settings_.terminalWidth, kMinTerminal);
+    }
     {  // the limits as last seen; a window that has reset since is empty again
         const long long now = static_cast<long long>(std::time(nullptr));
         const auto restore = [now](int percent, long long resetsAt) {
@@ -820,6 +877,7 @@ int ChatWindow::Run(int show) {
     }
     RefreshSessions();
     RefreshAuth();
+    LoadRepos();
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
 
     MSG message{};
@@ -966,6 +1024,18 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case kAuthLogout:
         OnLogoutDone();
         return 0;
+    case kRepos: {
+        const std::unique_ptr<ReposResult> payload(reinterpret_cast<ReposResult*>(lParam));
+        reposLoading_ = false;
+        repos_ = std::move(payload->repos);
+        reposError_ = ToWide(payload->error);
+        return 0;
+    }
+    case kCloneDone: {
+        const std::unique_ptr<CloneDone> payload(reinterpret_cast<CloneDone*>(lParam));
+        OnCloneDone(*payload);
+        return 0;
+    }
     case kTermData: {
         const std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lParam));
         OnTermData(wParam, *payload);
@@ -1043,6 +1113,19 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             SetEffortAt(at.x);
             return 0;
         }
+        if (dragging_ != Target::None) {  // a splitter: the panel follows the mouse, within limits
+            const Geometry g = Layout();
+            if (dragging_ == Target::SplitSidebar) {
+                const float most = std::max(kMinSidebar, g.width - (g.width - g.area) - kMinChat);
+                sidebarWidth_ = std::clamp(at.x, kMinSidebar, std::min(kMaxSidebar, most));
+            } else {
+                const float most = std::max(kMinTerminal, g.width - g.areaLeft - kMinChat);
+                terminalWidth_ = std::clamp(g.width - at.x, kMinTerminal, most);
+            }
+            PlaceChildren();
+            Refresh();
+            return 0;
+        }
         if (feedSelecting_) {  // dragging a selection in the feed; past its edge the feed scrolls
             const Geometry g = Layout();
             if (at.y < g.feed.top) {
@@ -1096,12 +1179,19 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 ScreenToClient(hwnd_, &cursor);
                 text = Inside(Layout().feed, ToDip(cursor.x), ToDip(cursor.y));
             }
-            SetCursor(LoadCursorW(nullptr, text ? IDC_IBEAM : (clickable ? IDC_HAND : IDC_ARROW)));
+            const bool split = hover_.target == Target::SplitSidebar || hover_.target == Target::SplitTerminal;
+            SetCursor(LoadCursorW(nullptr, split ? IDC_SIZEWE : (text ? IDC_IBEAM : (clickable ? IDC_HAND : IDC_ARROW))));
             return TRUE;
         }
         break;
     case WM_LBUTTONDOWN: {
         const D2D1_POINT_2F at = CursorDip(lParam);
+        if (const Target target = HitTest(at.x, at.y).target;
+            popup_ == Popup::None && (target == Target::SplitSidebar || target == Target::SplitTerminal)) {
+            dragging_ = target;
+            SetCapture(hwnd_);
+            return 0;
+        }
         if (popup_ == Popup::None && Screen() && HitTest(at.x, at.y).target == Target::TermScreen) {
             termFocus_ = true;  // a click into the terminal: keys go to the shell, a drag selects
             searchFocus_ = false;
@@ -1135,6 +1225,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_LBUTTONUP: {
+        if (dragging_ != Target::None) {
+            dragging_ = Target::None;
+            ReleaseCapture();
+            settings_.sidebarWidth = sidebarWidth_;
+            settings_.terminalWidth = terminalWidth_;
+            SaveSettings(settings_);
+            return 0;
+        }
         if (feedSelecting_) {
             feedSelecting_ = false;
             ReleaseCapture();
@@ -1289,6 +1387,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (authThread_.joinable()) {
             authThread_.join();
         }
+        cloneCancel_ = true;
+        if (cloneThread_.joinable()) {
+            cloneThread_.join();
+        }
+        if (reposThread_.joinable()) {
+            reposThread_.join();
+        }
         ++generation_;
         tabs_.clear();  // every shell ends
         host_.CancelAll();
@@ -1412,6 +1517,10 @@ void ChatWindow::OnClick(float x, float y) {
         break;
     case Target::UsageChip:
         OpenPopup(Popup::Usage);
+        break;
+    case Target::FolderChip:
+        ShowFolderMenu();
+        keepFocus = true;
         break;
     case Target::Secrets:
         SetSecretsOpen(true);
@@ -1598,9 +1707,16 @@ Geometry ChatWindow::Layout() const {
     g.width = ToDip(client.right);
     g.height = ToDip(client.bottom);
     // The sidebar docks at the left and the chat takes what is left, as in Claude's app.
-    const float sidebarWidth = sidebarOpen_ ? std::min(kSidebar, std::max(0.f, g.width - kMinChat)) : 0.f;
+    const float sidebarWidth = sidebarOpen_ ? std::min(sidebarWidth_, std::max(0.f, g.width - kMinChat)) : 0.f;
     g.areaLeft = sidebarWidth;
-    const float termWidth = terminalOpen_ ? std::min(kTerminal, std::max(0.f, g.width - sidebarWidth - kMinChat)) : 0.f;
+    const float termWidth =
+        terminalOpen_ ? std::min(terminalWidth_, std::max(0.f, g.width - sidebarWidth - kMinChat)) : 0.f;
+    if (sidebarWidth > 0) {
+        g.splitSidebar = D2D1::RectF(sidebarWidth - 3, kHeader, sidebarWidth + 4, g.height);
+    }
+    if (termWidth > 0) {
+        g.splitTerminal = D2D1::RectF(g.width - termWidth - 4, kHeader, g.width - termWidth + 3, g.height);
+    }
     g.area = g.width - termWidth;
     g.column = std::max(0.f, std::min(g.area - g.areaLeft - 2 * kSide, kColumnMax));
     const float left = g.areaLeft + (g.area - g.areaLeft - g.column) / 2;
@@ -1643,7 +1759,7 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
-    const float folderWidth = std::min(TextWidth(folderName_, ui_.get()) + 34.f, std::max(0.f, g.model.left - left - 16.f));
+    const float folderWidth = std::min(TextWidth(FolderLabel(), ui_.get()) + 34.f, std::max(0.f, g.model.left - left - 16.f));
     g.folder = D2D1::RectF(left + 4, chipTop, left + 4 + folderWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
@@ -1771,6 +1887,12 @@ Hit ChatWindow::HitTest(float x, float y) const {
     case Popup::None:
         break;
     }
+    if (Inside(g.splitSidebar, x, y)) {
+        return {Target::SplitSidebar};
+    }
+    if (Inside(g.splitTerminal, x, y)) {
+        return {Target::SplitTerminal};
+    }
     if (secretsOpen_ && Inside(g.panel, x, y)) {  // the sidebar in its secrets view
         if (Inside(g.panelClose, x, y)) {
             return {Target::SecretsClose};
@@ -1887,6 +2009,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.model, x, y)) {
         return {Target::ModelChip};
+    }
+    if (Inside(g.folder, x, y)) {
+        return {Target::FolderChip};
     }
     if (Inside(g.effort, x, y)) {
         return {Target::EffortChip};
@@ -2063,6 +2188,12 @@ void ChatWindow::Paint() {
     PaintInput(g);
     PaintSidebar(g);
     PaintTerminal(g);
+    for (const Target split : {Target::SplitSidebar, Target::SplitTerminal}) {  // the edge lights up to be dragged
+        if (hover_.target == split || dragging_ == split) {
+            const float x = split == Target::SplitSidebar ? g.areaLeft : g.area;
+            Fill(D2D1::RectF(x - 1.f, kHeader, x + 1.f, g.height), 0.f, kAccent);
+        }
+    }
     switch (popup_) {
     case Popup::Models:
         PaintModels(g);
@@ -2388,15 +2519,20 @@ void ChatWindow::PaintInput(const Geometry& g) {
     }
 
     // The model, then its effort in a box of its own, as in Claude's app.
-    if (g.folder.right > g.folder.left) {  // the folder the chat works in (shown, not a button)
+    if (g.folder.right > g.folder.left) {  // the folder the chat works in: a menu to change it
+        const bool active = hover_.target == Target::FolderChip;
+        if (active) {
+            Fill(g.folder, 6.f, kRaised);
+        }
+        const uint32_t color = active ? kPrimary : kSecondary;
         const D2D1_POINT_2F c{g.folder.left + 12.f, (g.folder.top + g.folder.bottom) / 2};
-        brush_->SetColor(Color(kSecondary));
+        brush_->SetColor(Color(color));
         target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 5.5f, c.y - 3.5f, c.x + 5.5f, c.y + 4.5f), 1.5f, 1.5f),
                                       brush_.get(), 1.2f);
-        Line({c.x - 5.5f, c.y - 3.5f}, {c.x - 3.5f, c.y - 5.5f}, kSecondary, 1.2f);
-        Line({c.x - 3.5f, c.y - 5.5f}, {c.x - 1.f, c.y - 5.5f}, kSecondary, 1.2f);
-        Text(folderName_, ui_.get(), D2D1::RectF(g.folder.left + 26, g.folder.top, g.folder.right, g.folder.bottom),
-             kSecondary);
+        Line({c.x - 5.5f, c.y - 3.5f}, {c.x - 3.5f, c.y - 5.5f}, color, 1.2f);
+        Line({c.x - 3.5f, c.y - 5.5f}, {c.x - 1.f, c.y - 5.5f}, color, 1.2f);
+        Text(FolderLabel(), ui_.get(), D2D1::RectF(g.folder.left + 26, g.folder.top, g.folder.right - 6, g.folder.bottom),
+             color);
     }
     const bool modelActive = hover_.target == Target::ModelChip || popup_ == Popup::Models;
     if (modelActive) {
@@ -3728,6 +3864,201 @@ void ChatWindow::ClearFeedSelection() {
     feedAnchor_.reset();
     feedFocus_.reset();
     feedSelecting_ = false;
+}
+
+// ---- The chat's folder: the default one, others picked before, any folder, a GitHub repository -------
+
+void ChatWindow::LoadRepos() {
+    if (reposLoading_) {
+        return;
+    }
+    const std::string token = secrets_.Get("GITHUB").value_or("");
+    if (token.empty()) {
+        reposError_ = L"нет секрета GITHUB";
+        return;
+    }
+    if (reposThread_.joinable()) {
+        reposThread_.join();
+    }
+    reposLoading_ = true;
+    const HWND hwnd = hwnd_;
+    reposThread_ = std::thread([hwnd, token] {
+        auto result = std::make_unique<ReposResult>();
+        result->repos = ListGithubRepos(token, result->error);
+        if (PostMessageW(hwnd, kRepos, 0, reinterpret_cast<LPARAM>(result.get()))) {
+            result.release();
+        }
+    });
+}
+
+// The chats now work in `folder`: a new chat starts there, with that folder's history in the sidebar.
+void ChatWindow::SwitchWorkspace(const std::wstring& folder) {
+    if (folder.empty() || folder == workspace_) {
+        return;
+    }
+    if (busy_ && MessageBoxW(hwnd_, L"Claude сейчас отвечает. Сменить папку и начать новый чат?", L"AIControls",
+                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    workspace_ = folder;
+    folderName_ = std::filesystem::path(folder).filename().wstring();
+    if (folderName_.empty()) {
+        folderName_ = folder;
+    }
+    tools_.SetCwd(folder);
+    settings_.workspace = folder == DefaultWorkspace() ? std::wstring() : folder;
+    std::erase(settings_.recentFolders, folder);
+    settings_.recentFolders.insert(settings_.recentFolders.begin(), folder);
+    if (settings_.recentFolders.size() > 8) {
+        settings_.recentFolders.resize(8);
+    }
+    SaveSettings(settings_);
+    ResetChat();
+    StartClaude();
+    firstRow_ = 0;
+    selected_ = 0;
+    RefreshSessions();
+    PlaceChildren();
+    Flash(L"Папка чата: " + folderName_, 2500);
+    Refresh();
+}
+
+void ChatWindow::PickWorkspace() {
+    wil::com_ptr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(dialog.put())))) {
+        return;
+    }
+    FILEOPENDIALOGOPTIONS options{};
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dialog->SetTitle(L"Папка, в которой работает чат");
+    wil::com_ptr<IShellItem> current;
+    if (SUCCEEDED(SHCreateItemFromParsingName(workspace_.c_str(), nullptr, IID_PPV_ARGS(current.put())))) {
+        dialog->SetFolder(current.get());
+    }
+    if (FAILED(dialog->Show(hwnd_))) {
+        return;  // cancelled
+    }
+    wil::com_ptr<IShellItem> item;
+    wil::unique_cotaskmem_string path;
+    if (SUCCEEDED(dialog->GetResult(item.put())) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, path.put()))) {
+        SwitchWorkspace(path.get());
+    }
+}
+
+void ChatWindow::OpenRepo(size_t index) {
+    if (index >= repos_.size() || cloning_) {
+        return;
+    }
+    const GithubRepo repo = repos_[index];
+    const std::wstring folder = RepoFolder(repo);
+    std::error_code error;
+    if (std::filesystem::exists(std::filesystem::path(folder) / L".git", error)) {
+        SwitchWorkspace(folder);  // cloned before: just work there
+        return;
+    }
+    if (std::filesystem::exists(folder, error) && !std::filesystem::is_empty(folder, error)) {
+        MessageBoxW(hwnd_, (L"Папка " + folder + L" уже есть, но это не клон репозитория.\nПереименуйте её или выберите её через «Выбрать папку…».").c_str(),
+                    L"AIControls", MB_ICONWARNING);
+        return;
+    }
+    const std::string token = secrets_.Get("GITHUB").value_or("");
+    if (cloneThread_.joinable()) {
+        cloneThread_.join();
+    }
+    cloning_ = true;
+    cloningName_ = ToWide(repo.name);
+    cloneCancel_ = false;
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &cloneCancel_;
+    cloneThread_ = std::thread([hwnd, repo, folder, token, cancel] {
+        auto done = std::make_unique<CloneDone>();
+        done->folder = folder;
+        done->name = ToWide(repo.name);
+        done->ok = CloneGithubRepo(repo, folder, token, cancel, done->output);
+        if (PostMessageW(hwnd, kCloneDone, 0, reinterpret_cast<LPARAM>(done.get()))) {
+            done.release();
+        }
+    });
+    Refresh();
+}
+
+void ChatWindow::OnCloneDone(const CloneDone& done) {
+    cloning_ = false;
+    cloningName_.clear();
+    if (done.ok) {
+        SwitchWorkspace(done.folder);
+    } else {
+        const std::wstring tail = LastLines(done.output, 3);
+        Add(Kind::Error, L"Не удалось клонировать " + done.name + (tail.empty() ? L"." : L":\n" + tail));
+    }
+    Refresh();
+}
+
+void ChatWindow::ShowFolderMenu() {
+    constexpr UINT kDefault = 2;
+    constexpr UINT kPick = 3;
+    constexpr UINT kReload = 4;
+    constexpr UINT kRecent = 100;
+    constexpr UINT kRepo = 1000;
+    const std::wstring standard = DefaultWorkspace();
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, (L"Сейчас: " + workspace_).c_str());
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING | (workspace_ == standard ? MF_CHECKED : 0), kDefault,
+                (std::filesystem::path(standard).filename().wstring() + L"  (по умолчанию)").c_str());
+    std::vector<std::wstring> recent;
+    for (const std::wstring& folder : settings_.recentFolders) {
+        std::error_code error;
+        if (folder != standard && recent.size() < 8 && std::filesystem::is_directory(folder, error)) {
+            recent.push_back(folder);
+            AppendMenuW(menu.get(), MF_STRING | (folder == workspace_ ? MF_CHECKED : 0),
+                        kRecent + static_cast<UINT>(recent.size() - 1), folder.c_str());
+        }
+    }
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kPick, L"Выбрать папку…");
+
+    wil::unique_hmenu repoMenu(CreatePopupMenu());
+    if (repos_.empty()) {
+        const std::wstring note = reposLoading_ ? L"Загружаю…" : (reposError_.empty() ? L"Репозиториев нет" : reposError_);
+        AppendMenuW(repoMenu.get(), MF_STRING | MF_GRAYED, 0, note.c_str());
+    }
+    for (size_t i = 0; i < repos_.size(); ++i) {
+        std::error_code error;
+        const bool local = std::filesystem::exists(std::filesystem::path(RepoFolder(repos_[i])) / L".git", error);
+        std::wstring label = ToWide(repos_[i].fullName);
+        if (repos_[i].isPrivate) {
+            label += L"  · приватный";
+        }
+        label += local ? L"  · склонирован" : L"";
+        AppendMenuW(repoMenu.get(), MF_STRING | (RepoFolder(repos_[i]) == workspace_ ? MF_CHECKED : 0),
+                    kRepo + static_cast<UINT>(i), label.c_str());
+    }
+    AppendMenuW(repoMenu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(repoMenu.get(), MF_STRING | (reposLoading_ ? MF_GRAYED : 0), kReload, L"Обновить список");
+    AppendMenuW(menu.get(), MF_POPUP | (cloning_ ? MF_GRAYED : 0), reinterpret_cast<UINT_PTR>(repoMenu.release()),
+                cloning_ ? (L"Клонирую " + cloningName_ + L"…").c_str() : L"Репозитории GitHub");
+
+    const Geometry g = Layout();
+    POINT screen{ToPx(g.folder.left), ToPx(g.folder.top)};
+    ClientToScreen(hwnd_, &screen);
+    const auto chosen = static_cast<UINT>(TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                                                         screen.x, screen.y, 0, hwnd_, nullptr));
+    if (chosen == kDefault) {
+        SwitchWorkspace(standard);
+    } else if (chosen == kPick) {
+        PickWorkspace();
+    } else if (chosen == kReload) {
+        repos_.clear();
+        LoadRepos();
+        Flash(L"Обновляю список репозиториев…");
+    } else if (chosen >= kRepo && chosen - kRepo < repos_.size()) {
+        OpenRepo(chosen - kRepo);
+    } else if (chosen >= kRecent && chosen - kRecent < recent.size()) {
+        SwitchWorkspace(recent[chosen - kRecent]);
+    }
+    SetFocus(input_);
 }
 
 void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {

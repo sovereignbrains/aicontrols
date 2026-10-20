@@ -5,6 +5,8 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace aic {
 
@@ -31,7 +33,9 @@ struct CliResult {
 // Only the process itself is killed on timeout or cancel: a browser it opened is not ours to close.
 CliResult RunCli(const std::wstring& commandLine, const std::wstring& proxy, int timeoutSeconds,
                  const std::atomic<bool>* cancel = nullptr,
-                 const std::function<void(const std::string&)>& onOutput = {});
+                 const std::function<void(const std::string&)>& onOutput = {},
+                 const std::vector<std::pair<std::wstring, std::wstring>>& extraEnvironment = {},
+                 const std::wstring& cwd = {});
 
 AuthStatus ParseAuthStatus(const std::string& output);
 // `claude auth status`

@@ -30,6 +30,12 @@ struct Settings {
     long long sessionResets = 0;
     int weekPercent = -1;
     long long weekResets = 0;
+    // The side panels' widths as the user dragged them, in DIPs; 0: the default.
+    float sidebarWidth = 0;
+    float terminalWidth = 0;
+    // The folder the chats work in (empty: DefaultWorkspace) and the ones used before, newest first.
+    std::wstring workspace;
+    std::vector<std::wstring> recentFolders;
 };
 
 // The old SSH Client's workspace while both clients live side by side: Claude's memory and the

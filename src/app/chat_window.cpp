@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cwctype>
 #include <exception>
+#include <filesystem>
 #include <format>
 #include <ctime>
 #include <memory>
@@ -216,7 +217,10 @@ struct Geometry {
     D2D1_RECT_F valueField{};
     D2D1_RECT_F saveButton{};
     float secretsTop = 0;  // the first secret's row
-    D2D1_RECT_F newChat{};
+    D2D1_RECT_F newItem{};  // the sidebar's "new chat" row
+    D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
+    D2D1_RECT_F folder{};   // under the input, at the left: the folder the chat works in
+    float listBottom = 0;
     D2D1_RECT_F feed{};
     D2D1_RECT_F box{};
     D2D1_RECT_F attachments{};  // the row of attached files above the text
@@ -577,6 +581,7 @@ private:
     bool draggingEffort_ = false;
 
     std::wstring workspace_;
+    std::wstring folderName_;  // its last component, for the chip under the input
     Settings settings_;
     Json models_ = Json::array();
     std::string userName_;
@@ -602,6 +607,10 @@ private:
 
 int ChatWindow::Run(int show) {
     workspace_ = DefaultWorkspace();
+    folderName_ = std::filesystem::path(workspace_).filename().wstring();
+    if (folderName_.empty()) {
+        folderName_ = workspace_;
+    }
     tools_.SetCwd(workspace_);
     secrets_.Load();
     settings_ = LoadSettings();
@@ -1301,7 +1310,6 @@ Geometry ChatWindow::Layout() const {
 
     const float buttonTop = (kHeader - kButton) / 2;
     g.terminalBtn = D2D1::RectF(g.width - 10 - kButton, buttonTop, g.width - 10, buttonTop + kButton);
-    g.newChat = D2D1::RectF(g.terminalBtn.left - 4 - kButton, buttonTop, g.terminalBtn.left - 4, buttonTop + kButton);
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
@@ -1333,13 +1341,18 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
+    const float folderWidth = std::min(TextWidth(folderName_, ui_.get()) + 34.f, std::max(0.f, g.model.left - left - 16.f));
+    g.folder = D2D1::RectF(left + 4, chipTop, left + 4 + folderWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
 
     if (sidebarWidth > 0) {
         g.sidebar = D2D1::RectF(0, kHeader, sidebarWidth, g.height);
         g.search = D2D1::RectF(10, kHeader + 10, sidebarWidth - 10, kHeader + 10 + kFieldHeight);
-        g.secrets = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
+        g.newItem = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
+        g.secrets = D2D1::RectF(6, g.newItem.bottom + 2, sidebarWidth - 6, g.newItem.bottom + 2 + kNavRow);
+        g.account = D2D1::RectF(6, g.height - 8 - 44, sidebarWidth - 6, g.height - 8);
         g.listTop = g.secrets.bottom + 8 + 26;  // under the "chats" label
+        g.listBottom = g.account.top - 6;
     }
     if (termWidth > 0) {
         g.term = D2D1::RectF(g.area, kHeader, g.width, g.height);
@@ -1460,10 +1473,13 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.search, x, y)) {
             return {Target::SidebarSearch};
         }
+        if (Inside(g.newItem, x, y)) {
+            return {Target::NewChat};
+        }
         if (Inside(g.secrets, x, y)) {
             return {Target::Secrets};
         }
-        if (y >= g.listTop) {
+        if (y >= g.listTop && y < g.listBottom) {
             const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
             if (row < filtered_.size() && row < firstRow_ + SidebarRows(g)) {
                 return {Target::HistoryRow, row};
@@ -1498,9 +1514,6 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 return {Target::ApprovalDeny, i};
             }
         }
-    }
-    if (Inside(g.newChat, x, y)) {
-        return {Target::NewChat};
     }
     if (Inside(g.attach, x, y)) {
         return {Target::Attach};
@@ -1885,7 +1898,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     // The title starts where the chat does (as in Claude's app), or after the toggle when the sidebar is hidden.
     const float titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
-    const float titleRight = g.newChat.left - 12;
+    const float titleRight = g.terminalBtn.left - 12;
     Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kPrimary);
     std::wstring state = busy_ ? L"отвечает…" : L"";
     if (!status_.empty()) {
@@ -1896,10 +1909,8 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Text(state, ui_.get(), D2D1::RectF(titleLeft + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
     }
 
-    for (const Target button : {Target::SidebarToggle, Target::NewChat, Target::TerminalToggle}) {
-        const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle
-                               : button == Target::NewChat    ? g.newChat
-                                                              : g.terminalBtn;
+    for (const Target button : {Target::SidebarToggle, Target::TerminalToggle}) {
+        const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle : g.terminalBtn;
         const bool active = hover_.target == button || (button == Target::SidebarToggle && sidebarOpen_) ||
                             (button == Target::TerminalToggle && terminalOpen_);
         if (active) {
@@ -1912,13 +1923,10 @@ void ChatWindow::PaintHeader(const Geometry& g) {
             target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 8.f, c.y - 6.5f, c.x + 8.f, c.y + 6.5f), 2.5f, 2.5f),
                                           brush_.get(), 1.4f);
             Line({c.x - 3.f, c.y - 6.5f}, {c.x - 3.f, c.y + 6.5f}, color, 1.4f);
-        } else if (button == Target::TerminalToggle) {  // a prompt: > and a cursor
+        } else {  // the terminal: a prompt, > and a cursor
             Line({c.x - 6.f, c.y - 4.f}, {c.x - 1.5f, c.y}, color, 1.5f);
             Line({c.x - 1.5f, c.y}, {c.x - 6.f, c.y + 4.f}, color, 1.5f);
             Line({c.x + 1.f, c.y + 5.f}, {c.x + 7.f, c.y + 5.f}, color, 1.5f);
-        } else {  // a plus
-            Line({c.x - 6.5f, c.y}, {c.x + 6.5f, c.y}, color, 1.6f);
-            Line({c.x, c.y - 6.5f}, {c.x, c.y + 6.5f}, color, 1.6f);
         }
     }
 }
@@ -1941,6 +1949,16 @@ void ChatWindow::PaintInput(const Geometry& g) {
     }
 
     // The model, then its effort in a box of its own, as in Claude's app.
+    if (g.folder.right > g.folder.left) {  // the folder the chat works in (shown, not a button)
+        const D2D1_POINT_2F c{g.folder.left + 12.f, (g.folder.top + g.folder.bottom) / 2};
+        brush_->SetColor(Color(kSecondary));
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 5.5f, c.y - 3.5f, c.x + 5.5f, c.y + 4.5f), 1.5f, 1.5f),
+                                      brush_.get(), 1.2f);
+        Line({c.x - 5.5f, c.y - 3.5f}, {c.x - 3.5f, c.y - 5.5f}, kSecondary, 1.2f);
+        Line({c.x - 3.5f, c.y - 5.5f}, {c.x - 1.f, c.y - 5.5f}, kSecondary, 1.2f);
+        Text(folderName_, ui_.get(), D2D1::RectF(g.folder.left + 26, g.folder.top, g.folder.right, g.folder.bottom),
+             kSecondary);
+    }
     const bool modelActive = hover_.target == Target::ModelChip || popup_ == Popup::Models;
     if (modelActive) {
         Fill(g.model, 6.f, kRaised);
@@ -2775,7 +2793,7 @@ void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {
 }
 
 size_t ChatWindow::SidebarRows(const Geometry& g) {
-    const float room = g.sidebar.bottom - g.listTop - 8;
+    const float room = g.listBottom - g.listTop;
     return room < kHistoryRow ? 0 : static_cast<size_t>(room / kHistoryRow);
 }
 
@@ -2796,11 +2814,42 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         brush_->SetColor(Color(kAccent, 0.75f));
         target_->DrawRoundedRectangle(D2D1::RoundedRect(g.search, 8.f, 8.f), brush_.get(), 1.f);
     }
-    const D2D1_RECT_F field = D2D1::RectF(g.search.left + 12, g.search.top, g.search.right - 10, g.search.bottom);
+    {  // a magnifier
+        const D2D1_POINT_2F c{g.search.left + 18.f, (g.search.top + g.search.bottom) / 2};
+        brush_->SetColor(Color(kSecondary));
+        target_->DrawEllipse(D2D1::Ellipse({c.x - 1.f, c.y - 1.f}, 4.5f, 4.5f), brush_.get(), 1.4f);
+        Line({c.x + 2.5f, c.y + 2.5f}, {c.x + 5.5f, c.y + 5.5f}, kSecondary, 1.4f);
+    }
+    const D2D1_RECT_F field = D2D1::RectF(g.search.left + 34, g.search.top, g.search.right - 10, g.search.bottom);
     if (searchText_.empty()) {
         Text(L"Поиск", ui_.get(), field, kSecondary);
     } else {
         Text(searchText_, ui_.get(), field, kPrimary);
+    }
+
+    {  // a new chat: lit while the open chat is empty, as "New" is in Claude's app
+        const bool active = hover_.target == Target::NewChat || !HasConversation();
+        if (active) {
+            Fill(g.newItem, 8.f, kRaised);
+        }
+        const uint32_t color = active ? kPrimary : kSecondary;
+        const D2D1_POINT_2F c{g.newItem.left + 22.f, (g.newItem.top + g.newItem.bottom) / 2};
+        Line({c.x - 5.5f, c.y}, {c.x + 5.5f, c.y}, color, 1.5f);
+        Line({c.x, c.y - 5.5f}, {c.x, c.y + 5.5f}, color, 1.5f);
+        Text(L"Новый чат", ui_.get(),
+             D2D1::RectF(g.newItem.left + 42, g.newItem.top, g.newItem.right - 8, g.newItem.bottom), color);
+    }
+
+    {  // the account, at the bottom
+        Line({g.sidebar.left, g.account.top - 4.f}, {g.sidebar.right, g.account.top - 4.f}, kLine, 1.f);
+        const D2D1_POINT_2F c{g.account.left + 22.f, (g.account.top + g.account.bottom) / 2};
+        brush_->SetColor(Color(0x7a5af8));
+        target_->FillEllipse(D2D1::Ellipse(c, 12.f, 12.f), brush_.get());
+        const std::wstring name = userName_.empty() ? std::wstring(L"Аккаунт") : ToWide(userName_);
+        Text(std::wstring(1, static_cast<wchar_t>(std::towupper(name[0]))), badge_.get(),
+             D2D1::RectF(c.x - 12, c.y - 12, c.x + 12, c.y + 12), kPrimary);
+        Text(name, ui_.get(), D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, g.account.bottom),
+             kPrimary);
     }
 
     {  // the way to the secrets

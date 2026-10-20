@@ -4,6 +4,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/highlight.h"
+
 namespace aic {
 
 // What a run of text looks like. Spans may overlap (bold inside a link); each flag is its own property.
@@ -14,6 +16,8 @@ enum MdFlag : unsigned {
     kMdLink = 8,
     kMdQuote = 16,   // quotes and rules: toned down
     kMdHeading = 32,
+    kMdToken = 64,   // a colored part of a fenced block (see MdSpan::token)
+    kMdTable = 128,  // with kMdCode and block: a table, aligned in the code font
 };
 
 struct MdSpan {
@@ -22,6 +26,8 @@ struct MdSpan {
     unsigned flags = 0;
     float scale = 1.f;   // headings: the size relative to the body
     bool block = false;  // kMdCode only: a fenced block (the lines get a panel), not inline code
+    TokenKind token = TokenKind::None;  // kMdToken only
+    std::wstring url;                   // kMdLink only: where it goes (also for bare http(s):// addresses)
 };
 
 // The text to show, without the markup, and how its runs are styled.
@@ -30,8 +36,8 @@ struct MdText {
     std::vector<MdSpan> spans;
 };
 
-// A forgiving subset: # headings, **bold**, *italic*, `code`, ``` fences, - lists, > quotes, [links](url),
-// --- rules. Markup that is not closed (a message still streaming) stays as typed.
+// A forgiving subset: # headings, **bold**, *italic*, `code`, ``` fences (colored by their language), - lists,
+// > quotes, [links](url) and bare http(s):// addresses, | tables |, --- rules. Markup that is not closed (a message still streaming) stays as typed.
 MdText ParseMarkdown(std::wstring_view source);
 
 }  // namespace aic

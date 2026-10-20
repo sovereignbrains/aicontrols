@@ -25,6 +25,7 @@ add_library(aic_core STATIC
   src/core/auth.cpp
   src/core/claude_process.cpp
   src/core/github.cpp
+  src/core/highlight.cpp
   src/core/markdown.cpp
   src/core/pty.cpp
   src/core/secrets.cpp
@@ -44,7 +45,7 @@ target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32)
 
 # Tests of the core without the UI: `ctest --test-dir build/dev`.
 enable_testing()
-foreach(name tools markdown vt_screen pty auth)
+foreach(name tools markdown highlight vt_screen pty auth)
   add_executable(aic_${name}_test tests/${name}_test.cpp)
   target_link_libraries(aic_${name}_test PRIVATE aic_core)
   add_test(NAME ${name} COMMAND aic_${name}_test)

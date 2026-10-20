@@ -1,6 +1,8 @@
 #include "core/markdown.h"
 
+#include <algorithm>
 #include <cwctype>
+#include <optional>
 
 namespace aic {
 namespace {
@@ -19,7 +21,7 @@ bool EndsWith(const std::wstring& text, std::wstring_view tail) {
 
 // Appends `s` to out.text without markup; spans are recorded after their content (inner ones first).
 void Inline(std::wstring_view s, MdText& out) {
-    const auto styled = [&](std::wstring_view inner, unsigned flag, bool nested) {
+    const auto styled = [&](std::wstring_view inner, unsigned flag, bool nested, std::wstring_view url = {}) {
         const size_t start = out.text.size();
         if (nested) {
             Inline(inner, out);
@@ -27,7 +29,9 @@ void Inline(std::wstring_view s, MdText& out) {
             out.text.append(inner);
         }
         if (out.text.size() > start) {
-            out.spans.push_back(MdSpan{start, out.text.size() - start, flag, 1.f, false});
+            MdSpan span{start, out.text.size() - start, flag, 1.f, false};
+            span.url = url;
+            out.spans.push_back(std::move(span));
         }
     };
 
@@ -95,8 +99,32 @@ void Inline(std::wstring_view s, MdText& out) {
             const size_t middle = s.find(L"](", i + 1);
             const size_t end = middle == std::wstring_view::npos ? middle : s.find(L')', middle + 2);
             if (end != std::wstring_view::npos && middle > i + 1) {
-                styled(s.substr(i + 1, middle - i - 1), kMdLink, true);
+                std::wstring_view url = s.substr(middle + 2, end - middle - 2);
+                url = url.substr(0, url.find(L' '));  // [text](url "title"): the title is dropped
+                styled(s.substr(i + 1, middle - i - 1), kMdLink, true, url);
                 i = end + 1;
+                continue;
+            }
+        }
+        if (c == L'h' && (i == 0 || !IsWordChar(s[i - 1])) &&
+            (s.substr(i).starts_with(L"http://") || s.substr(i).starts_with(L"https://"))) {
+            size_t end = i;
+            while (end < s.size() && !IsSpace(s[end]) && s[end] != L'<' && s[end] != L'>' && s[end] != L'`') {
+                ++end;
+            }
+            while (end > i) {  // sentence punctuation after an address is not part of it
+                const wchar_t last = s[end - 1];
+                const std::wstring_view address = s.substr(i, end - i);
+                const bool unbalanced = last == L')' && std::count(address.begin(), address.end(), L'(') <
+                                                            std::count(address.begin(), address.end(), L')');
+                if (std::wstring_view(L".,;:!?'\"*]").find(last) == std::wstring_view::npos && !unbalanced) {
+                    break;
+                }
+                --end;
+            }
+            if (end > i + 8) {
+                styled(s.substr(i, end - i), kMdLink, false, s.substr(i, end - i));
+                i = end;
                 continue;
             }
         }
@@ -117,12 +145,100 @@ void Separate(MdText& out) {
     }
 }
 
+std::wstring_view Trim(std::wstring_view s) {
+    while (!s.empty() && IsSpace(s.front())) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && IsSpace(s.back())) {
+        s.remove_suffix(1);
+    }
+    return s;
+}
+
+// The cells of a table row; the pipes at its ends are optional, \| stays inside a cell.
+std::vector<std::wstring_view> SplitRow(std::wstring_view row) {
+    row = Trim(row);
+    if (row.starts_with(L'|')) {
+        row.remove_prefix(1);
+    }
+    if (row.ends_with(L'|') && !(row.size() >= 2 && row[row.size() - 2] == L'\\')) {
+        row.remove_suffix(1);
+    }
+    std::vector<std::wstring_view> cells;
+    size_t from = 0;
+    for (size_t i = 0; i <= row.size(); ++i) {
+        if (i == row.size() || (row[i] == L'|' && (i == 0 || row[i - 1] != L'\\'))) {
+            cells.push_back(Trim(row.substr(from, i - from)));
+            from = i + 1;
+        }
+    }
+    return cells;
+}
+
+enum class Align { Left, Right, Center };
+
+// `|---|:-:|--:|`: the alignments, or nothing when the line is not a delimiter row.
+std::optional<std::vector<Align>> DelimiterRow(std::wstring_view line) {
+    if (line.find(L'|') == std::wstring_view::npos) {
+        return std::nullopt;
+    }
+    std::vector<Align> aligns;
+    for (std::wstring_view cell : SplitRow(line)) {
+        const bool left = cell.starts_with(L':');
+        const bool right = cell.ends_with(L':');
+        if (left) {
+            cell.remove_prefix(1);
+        }
+        if (right && !cell.empty()) {
+            cell.remove_suffix(1);
+        }
+        if (cell.empty() || cell.find_first_not_of(L'-') != std::wstring_view::npos) {
+            return std::nullopt;
+        }
+        aligns.push_back(right ? (left ? Align::Center : Align::Right) : Align::Left);
+    }
+    return aligns;
+}
+
+std::wstring Plain(std::wstring_view markdown) {
+    MdText cell;
+    Inline(markdown, cell);
+    return cell.text;
+}
+
+void AppendPadded(std::wstring& out, const std::wstring& cell, size_t width, Align align, bool last) {
+    const size_t gap = width > cell.size() ? width - cell.size() : 0;
+    const size_t before = align == Align::Right ? gap : (align == Align::Center ? gap / 2 : 0);
+    out.append(before, L' ');
+    out += cell;
+    if (!last || align != Align::Left) {
+        out.append(gap - before, L' ');
+    }
+}
+
+// The line at `pos` of `source` (no line end), if there is one.
+std::optional<std::wstring_view> LineAt(std::wstring_view source, size_t pos) {
+    if (pos >= source.size()) {
+        return std::nullopt;
+    }
+    size_t end = source.find(L'\n', pos);
+    if (end == std::wstring_view::npos) {
+        end = source.size();
+    }
+    std::wstring_view line = source.substr(pos, end - pos);
+    if (line.ends_with(L'\r')) {
+        line.remove_suffix(1);
+    }
+    return line;
+}
+
 }  // namespace
 
 MdText ParseMarkdown(std::wstring_view source) {
     MdText out;
     bool inCode = false;
     size_t codeStart = 0;
+    std::wstring_view language;
 
     const auto closeCode = [&] {
         inCode = false;
@@ -132,6 +248,11 @@ MdText ParseMarkdown(std::wstring_view source) {
         }
         if (end > codeStart) {
             out.spans.push_back(MdSpan{codeStart, end - codeStart, kMdCode, 1.f, true});
+            for (const Token& token : Highlight(std::wstring_view(out.text).substr(codeStart, end - codeStart), language)) {
+                MdSpan span{codeStart + token.start, token.length, kMdToken, 1.f, false};
+                span.token = token.kind;
+                out.spans.push_back(std::move(span));
+            }
         }
         out.text.resize(end);
         out.text += L"\n\n";
@@ -159,6 +280,7 @@ MdText ParseMarkdown(std::wstring_view source) {
                 closeCode();
             } else {
                 inCode = true;
+                language = Trim(rest.substr(3));
                 Separate(out);
                 codeStart = out.text.size();
             }
@@ -175,6 +297,68 @@ MdText ParseMarkdown(std::wstring_view source) {
                 EndLine(out);
             }
             continue;
+        }
+
+        if (rest.find(L'|') != std::wstring_view::npos) {
+            const auto next = LineAt(source, pos);
+            const auto aligns = next ? DelimiterRow(*next) : std::nullopt;
+            if (aligns) {  // a table: the header, the delimiter row, then rows while they have a pipe
+                std::vector<std::vector<std::wstring>> rows;
+                rows.emplace_back();
+                for (const std::wstring_view cell : SplitRow(rest)) {
+                    rows.back().push_back(Plain(cell));
+                }
+                pos += next->size() + 1;
+                if (pos > 0 && pos <= source.size() && source[pos - 1] == L'\r') {
+                    ++pos;  // the delimiter row's "\r\n"
+                }
+                while (const auto row = LineAt(source, pos)) {
+                    const std::wstring_view body = Trim(*row);
+                    if (body.empty() || body.find(L'|') == std::wstring_view::npos || body.starts_with(L"```")) {
+                        break;
+                    }
+                    rows.emplace_back();
+                    for (const std::wstring_view cell : SplitRow(body)) {
+                        rows.back().push_back(Plain(cell));
+                    }
+                    pos += row->size() + 1;
+                    if (pos <= source.size() && source[pos - 1] == L'\r') {
+                        ++pos;
+                    }
+                }
+                const size_t columns = aligns->size();
+                std::vector<size_t> widths(columns, 1);
+                for (std::vector<std::wstring>& row : rows) {
+                    row.resize(columns);
+                    for (size_t c = 0; c < columns; ++c) {
+                        widths[c] = std::max(widths[c], row[c].size());
+                    }
+                }
+                Separate(out);
+                const size_t start = out.text.size();
+                size_t headerEnd = start;
+                for (size_t r = 0; r < rows.size(); ++r) {
+                    if (r > 0) {
+                        out.text += L'\n';
+                    }
+                    for (size_t c = 0; c < columns; ++c) {
+                        out.text += c == 0 ? L"" : L" │ ";
+                        AppendPadded(out.text, rows[r][c], widths[c], (*aligns)[c], c + 1 == columns);
+                    }
+                    if (r == 0) {
+                        headerEnd = out.text.size();
+                        out.text += L'\n';
+                        for (size_t c = 0; c < columns; ++c) {
+                            out.text += c == 0 ? L"" : L"─┼─";
+                            out.text.append(widths[c], L'─');
+                        }
+                    }
+                }
+                out.spans.push_back(MdSpan{start, out.text.size() - start, kMdCode | kMdTable, 1.f, true});
+                out.spans.push_back(MdSpan{start, headerEnd - start, kMdBold, 1.f, false});
+                out.text += L"\n\n";
+                continue;
+            }
         }
 
         size_t hashes = 0;

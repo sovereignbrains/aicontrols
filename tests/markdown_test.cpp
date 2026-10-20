@@ -108,6 +108,45 @@ int main() {
         Expect(md.text == L"win\nlines", "CRLF", Narrow(md.text));
         Expect(ParseMarkdown(L"").text.empty(), "empty");
     }
+    {
+        const auto md = ParseMarkdown(L"```cpp\nint x;\n```");
+        const auto* code = Find(md, aic::kMdCode);
+        const auto* token = Find(md, aic::kMdToken);
+        Expect(code && Cover(md, *code) == L"int x;", "fenced code, the language line is not shown", Narrow(md.text));
+        Expect(token && token->token == aic::TokenKind::Keyword && Cover(md, *token) == L"int", "fence colored by language");
+    }
+    {
+        const auto md = ParseMarkdown(L"```\nint x;\n```");
+        Expect(Find(md, aic::kMdToken) == nullptr, "no language, no colors");
+    }
+    {
+        const auto md = ParseMarkdown(L"see [docs](https://a.b/c \"t\") and https://x.y/z. Then (https://p.q/r_(s)).");
+        std::vector<std::wstring> urls;
+        for (const aic::MdSpan& span : md.spans) {
+            if ((span.flags & aic::kMdLink) != 0) {
+                urls.push_back(span.url);
+            }
+        }
+        Expect(urls.size() == 3 && urls[0] == L"https://a.b/c" && urls[1] == L"https://x.y/z" &&
+                   urls[2] == L"https://p.q/r_(s)",
+               "link addresses, bare ones without the closing punctuation", std::to_string(urls.size()));
+        Expect(md.text.starts_with(L"see docs and https://x.y/z."), "link text shown, address dropped", Narrow(md.text));
+    }
+    {
+        const auto md = ParseMarkdown(L"| Name | N |\n|:--|--:|\n| a | 10 |\n| **bb** | 2 |\n\nafter");
+        Expect(md.text == L"Name │  N\n─────┼───\na    │ 10\nbb   │  2\n\nafter", "table aligned", Narrow(md.text));
+        const auto* table = Find(md, aic::kMdTable);
+        Expect(table && table->block && (table->flags & aic::kMdCode) != 0 && table->start == 0, "table is a code panel");
+        Expect(Find(md, aic::kMdBold) != nullptr, "table header is bold");
+    }
+    {
+        const auto md = ParseMarkdown(L"a | b\nno table here");
+        Expect(md.text == L"a | b\nno table here" && Find(md, aic::kMdTable) == nullptr, "pipes alone are no table");
+    }
+    {
+        const auto md = ParseMarkdown(L"| h |\r\n|---|\r\n| v |\r\nend");
+        Expect(md.text == L"h\n─\nv\n\nend", "table with CRLF", Narrow(md.text));
+    }
     std::cout << (failures == 0 ? "all passed\n" : "FAILED\n");
     return failures == 0 ? 0 : 1;
 }

@@ -520,6 +520,7 @@ private:
     };
     D2D1_POINT_2F ItemOrigin(const Geometry& g, const FeedItem& item) const;
     std::optional<FeedPoint> FeedPointAt(const Geometry& g, float x, float y) const;
+    std::wstring LinkAt(const Geometry& g, float x, float y) const;
     bool HasFeedSelection() const;
     bool FeedSelectionIn(size_t index, UINT32& from, UINT32& to) const;
     void PaintFeedSelection(size_t index, D2D1_POINT_2F origin);
@@ -1173,14 +1174,20 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup &&
                                    hover_.target != Target::AttachmentChip && hover_.target != Target::TermScreen;
             bool text = hover_.target == Target::TermScreen;
+            bool link = false;
             if (hover_.target == Target::None && popup_ == Popup::None && HasConversation()) {  // over the feed: text
                 POINT cursor{};
                 GetCursorPos(&cursor);
                 ScreenToClient(hwnd_, &cursor);
                 text = Inside(Layout().feed, ToDip(cursor.x), ToDip(cursor.y));
+                if (text && !LinkAt(Layout(), ToDip(cursor.x), ToDip(cursor.y)).empty()) {
+                    text = false;
+                    link = true;
+                }
             }
             const bool split = hover_.target == Target::SplitSidebar || hover_.target == Target::SplitTerminal;
-            SetCursor(LoadCursorW(nullptr, split ? IDC_SIZEWE : (text ? IDC_IBEAM : (clickable ? IDC_HAND : IDC_ARROW))));
+            SetCursor(LoadCursorW(nullptr, split ? IDC_SIZEWE
+                                                 : (link ? IDC_HAND : (text ? IDC_IBEAM : (clickable ? IDC_HAND : IDC_ARROW)))));
             return TRUE;
         }
         break;
@@ -1236,8 +1243,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (feedSelecting_) {
             feedSelecting_ = false;
             ReleaseCapture();
-            if (!HasFeedSelection()) {  // a plain click: nothing selected
+            if (!HasFeedSelection()) {  // a plain click: nothing selected, a link opens
                 ClearFeedSelection();
+                const D2D1_POINT_2F at = CursorDip(lParam);
+                const std::wstring url = LinkAt(Layout(), at.x, at.y);
+                if (url.starts_with(L"http://") || url.starts_with(L"https://") || url.starts_with(L"mailto:")) {
+                    ShellExecuteW(hwnd_, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
             }
             searchFocus_ = false;
             termFocus_ = false;
@@ -2303,8 +2315,22 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
     target_->CreateSolidColorBrush(Color(kAccent), link.put());
     target_->CreateSolidColorBrush(Color(kSecondary), quote.put());
     target_->CreateSolidColorBrush(Color(kCodeText), code.put());
+    std::array<wil::com_ptr<ID2D1SolidColorBrush>, 8> tokens;  // by TokenKind, made when first needed
+    const auto tokenBrush = [&](TokenKind kind) {
+        constexpr std::array<uint32_t, 8> colors = {kCodeText, 0x7f8794, 0x9ccc8a, 0xe5b567,
+                                                    0xc792ea,  0x7fbfe6, 0x7fd48a, 0xf07178};
+        wil::com_ptr<ID2D1SolidColorBrush>& brush = tokens[static_cast<size_t>(kind)];
+        if (!brush) {
+            target_->CreateSolidColorBrush(Color(colors[static_cast<size_t>(kind)]), brush.put());
+        }
+        return brush.get();
+    };
     for (const MdSpan& span : item.spans) {
         const DWRITE_TEXT_RANGE range{static_cast<UINT32>(span.start), static_cast<UINT32>(span.length)};
+        if ((span.flags & kMdToken) != 0) {  // after its block's span: the color of one part of the code
+            item.layout->SetDrawingEffect(tokenBrush(span.token), range);
+            continue;
+        }
         if ((span.flags & kMdLink) != 0) {
             item.layout->SetDrawingEffect(link.get(), range);
         }
@@ -3793,6 +3819,35 @@ std::optional<ChatWindow::FeedPoint> ChatWindow::FeedPointAt(const Geometry& g, 
         found = FeedPoint{i, static_cast<UINT32>(item.shown.size())};  // past this one: its end, unless another follows
     }
     return found;
+}
+
+// The address of the link right under a point (the innermost one), or empty.
+std::wstring ChatWindow::LinkAt(const Geometry& g, float x, float y) const {
+    if (!Inside(g.feed, x, y)) {
+        return {};
+    }
+    for (const FeedItem& item : feed_) {
+        if (item.kind != Kind::Assistant || !item.layout || y < item.top || y >= item.top + item.height) {
+            continue;
+        }
+        const D2D1_POINT_2F origin = ItemOrigin(g, item);
+        BOOL trailing = FALSE;
+        BOOL inside = FALSE;
+        DWRITE_HIT_TEST_METRICS metrics{};
+        item.layout->HitTestPoint(x - origin.x, y - origin.y, &trailing, &inside, &metrics);
+        if (!inside) {
+            return {};
+        }
+        const MdSpan* best = nullptr;
+        for (const MdSpan& span : item.spans) {
+            if ((span.flags & kMdLink) != 0 && !span.url.empty() && metrics.textPosition >= span.start &&
+                metrics.textPosition < span.start + span.length && (!best || span.length < best->length)) {
+                best = &span;
+            }
+        }
+        return best ? best->url : std::wstring();
+    }
+    return {};
 }
 
 bool ChatWindow::HasFeedSelection() const {

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -166,6 +167,43 @@ int main() {
     Expect(!aic::ToolNeedsApproval("read_file") && aic::ToolNeedsApproval("run_command") &&
                aic::ToolNeedsApproval("write_file"),
            "approval policy");
+    Expect(aic::ToolNeedsApproval("read_file", {{"path", "/etc/hostname"}, {"on", "root@example.com"}}) &&
+               !aic::ToolNeedsApproval("read_file", {{"path", "x"}}),
+           "anything on a server waits for approval");
+    Expect(aic::SummarizeTool("run_command", {{"command", "ls"}, {"on", "root@h"}}).detail.starts_with(L"→ root@h\n"),
+           "the card names the server");
+
+    // `on` is checked before ssh is started: nothing that looks like an option or a shell word gets through.
+    for (const char* bad : {"-oProxyCommand=calc", "root@-oProxyCommand=x", "a b@host", "host;ls", "@host", "user@",
+                            "root@host:", "root@host:12x", "u@h@x", "root@h$(id)"}) {
+        r = run("run_command", {{"command", "id"}, {"on", bad}});
+        Expect(r.isError && Has(r.text, "Bad `on`"), "bad target refused", bad);
+    }
+
+    // A real server, only when asked for: AIC_TEST_SSH=user@host (key login). Reads and a scratch file in /tmp.
+    char serverBuffer[256] = {};
+    const bool haveServer = GetEnvironmentVariableA("AIC_TEST_SSH", serverBuffer, sizeof(serverBuffer)) > 0;
+    if (const char* server = serverBuffer; haveServer) {
+        r = run("run_command", {{"command", "echo \"a b\"; echo 'it''s' $((1+2)) >&2; exit 3"}, {"on", server}});
+        Expect(r.isError && Has(r.text, "[exit code 3") && Has(r.text, "a b") && Has(r.text, "its 3"), "remote command", r.text);
+        r = run("run_command", {{"command", "echo \"$TOKEN_A\""}, {"on", server}, {"env_secrets", {"TOKEN_A"}}});
+        Expect(!r.isError && Has(r.text, "***") && !Has(r.text, "hunter2value"), "remote secret is cut out", r.text);
+        const std::string file = "/tmp/aic-ssh-test/sub dir/it's.txt";
+        r = run("write_file", {{"on", server}, {"path", file}, {"content", "one\ntwo\n\xD0\xB4\n"}});
+        Expect(!r.isError, "remote write_file", r.text);
+        r = run("read_file", {{"on", server}, {"path", file}});
+        Expect(!r.isError && r.text == "one\ntwo\n\xD0\xB4\n", "remote read_file", r.text);
+        r = run("edit_file", {{"on", server}, {"path", file}, {"old_string", "two"}, {"new_string", "2"}});
+        Expect(!r.isError, "remote edit_file", r.text);
+        r = run("read_file", {{"on", server}, {"path", file}});
+        Expect(r.text == "one\n2\n\xD0\xB4\n", "remote edit result", r.text);
+        r = run("list_directory", {{"on", server}, {"path", "/tmp/aic-ssh-test/sub dir"}});
+        Expect(!r.isError && Has(r.text, "it's.txt"), "remote list_directory", r.text);
+        r = run("read_file", {{"on", server}, {"path", "/tmp/aic-ssh-test"}});
+        Expect(r.isError && Has(r.text, "list_directory"), "remote read of a folder", r.text);
+        r = run("run_command", {{"on", server}, {"command", "rm -rf /tmp/aic-ssh-test; pwd"}, {"cwd", "~"}});
+        Expect(!r.isError, "remote cleanup, cwd ~", r.text);
+    }
 
     fs::remove_all(dir);
     std::cout << (failures == 0 ? "all passed\n" : "FAILED\n");

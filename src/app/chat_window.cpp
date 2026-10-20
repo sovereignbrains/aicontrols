@@ -5143,7 +5143,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
         return;
     }
     ToolSummary summary = SummarizeTool(name, input);
-    if (!ToolNeedsApproval(name)) {
+    if (!ToolNeedsApproval(name, input)) {
         Add(Kind::Notice, summary.title + L": " + summary.detail);
         claude_.Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
         return;

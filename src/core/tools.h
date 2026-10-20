@@ -28,7 +28,8 @@ struct ToolSummary {
 // A tool's name as the model sees it (mcp__aic__run_command) → ours (run_command); empty if it is not ours.
 std::string OwnToolName(const std::string& fullName);
 // Reading and listing run without asking; commands and writes wait for the user.
-bool ToolNeedsApproval(const std::string& name);
+// Anything aimed at a server (`on`) waits too.
+bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object());
 ToolSummary SummarizeTool(const std::string& name, const Json& input);
 
 // The five tools: run_command, read_file, write_file, edit_file, list_directory.
@@ -44,6 +45,9 @@ public:
 
 private:
     ToolResult RunCommand(const Json& input, const std::atomic<bool>& cancel) const;
+    // Any of the five on a server, through the system ssh.exe (key login, no prompts).
+    ToolResult ExecuteOn(const std::string& on, const std::string& name, const Json& input,
+                         const std::atomic<bool>& cancel) const;
     ToolResult ReadFile(const Json& input) const;
     ToolResult WriteFile(const Json& input) const;
     ToolResult EditFile(const Json& input) const;

@@ -42,30 +42,19 @@ add_executable(aicontrols WIN32
   src/app/aicontrols.rc)
 target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32)
 
-# Tools, secrets and the MCP host without the UI: build\<preset>\aic_tools_test.exe
-add_executable(aic_tools_test tests/tools_test.cpp)
-target_link_libraries(aic_tools_test PRIVATE aic_core)
+# Tests of the core without the UI: `ctest --test-dir build/dev`.
+enable_testing()
+foreach(name tools markdown vt_screen pty auth)
+  add_executable(aic_${name}_test tests/${name}_test.cpp)
+  target_link_libraries(aic_${name}_test PRIVATE aic_core)
+  add_test(NAME ${name} COMMAND aic_${name}_test)
+endforeach()
 
-add_executable(aic_markdown_test tests/markdown_test.cpp)
-target_link_libraries(aic_markdown_test PRIVATE aic_core)
-
-add_executable(aic_vt_test tests/vt_screen_test.cpp)
-target_link_libraries(aic_vt_test PRIVATE aic_core)
-
-add_executable(aic_pty_test tests/pty_test.cpp)
-target_link_libraries(aic_pty_test PRIVATE aic_core)
-
-add_executable(aic_auth_test tests/auth_test.cpp)
-target_link_libraries(aic_auth_test PRIVATE aic_core)
-
-# By hand: the GitHub repositories the GITHUB secret reaches (and a clone).
-add_executable(aic_github_probe tests/github_probe.cpp)
-target_link_libraries(aic_github_probe PRIVATE aic_core)
-
-# By hand: the titles of the real chats.
-add_executable(aic_store_probe tests/store_probe.cpp)
-target_link_libraries(aic_store_probe PRIVATE aic_core)
-
-# By hand, spends a request: the real claude.exe calling our tools (see the file's header).
-add_executable(aic_e2e_probe tests/e2e_probe.cpp)
-target_link_libraries(aic_e2e_probe PRIVATE aic_core)
+# Probes, run by hand against the real world (see each file's header):
+#   aic_e2e_probe     claude.exe calling our tools (spends a request)
+#   aic_github_probe  the repositories the GITHUB secret reaches, and a clone
+#   aic_store_probe   the titles of the real chats; --delete <id>
+foreach(name e2e github store)
+  add_executable(aic_${name}_probe tests/probes/${name}_probe.cpp)
+  target_link_libraries(aic_${name}_probe PRIVATE aic_core)
+endforeach()

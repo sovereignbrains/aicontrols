@@ -1231,7 +1231,9 @@ float ChatWindow::TextWidth(const std::wstring& text, IDWriteTextFormat* format)
     }
     DWRITE_TEXT_METRICS metrics{};
     layout->GetMetrics(&metrics);
-    return metrics.widthIncludingTrailingWhitespace;
+    // Rounded up and a DIP more: a box made exactly this wide draws the text a hair wider (pixel snapping),
+    // and its last letter wrapped or turned into an ellipsis.
+    return std::ceil(metrics.widthIncludingTrailingWhitespace) + 1.f;
 }
 
 LRESULT CALLBACK ChatWindow::Proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -6163,18 +6165,32 @@ void ChatWindow::PaintTooltip(const Geometry& g) {
     if (!tipShown_ || tipText_.empty() || popup_ != Popup::None) {
         return;
     }
-    constexpr float kTipHeight = 26.f;
-    const float width = std::min(TextWidth(tipText_, small_.get()) + 20.f, std::max(120.f, g.width - 16.f));
+    // The text is laid out once and drawn as laid out: measured one way and drawn into a box of exactly that
+    // width another, the last letter used to wrap. A long hint wraps at most this wide, and stays in the window.
+    constexpr float kPadX = 10.f;
+    constexpr float kPadY = 5.f;
+    const float most = std::max(80.f, std::min(420.f, g.width - 16.f - 2 * kPadX));
+    wil::com_ptr<IDWriteTextLayout> layout;
+    if (FAILED(dwrite_->CreateTextLayout(tipText_.c_str(), static_cast<UINT32>(tipText_.size()), small_.get(), most,
+                                         1000.f, layout.put()))) {
+        return;
+    }
+    DWRITE_TEXT_METRICS metrics{};
+    layout->GetMetrics(&metrics);
+    layout->SetMaxWidth(std::ceil(metrics.widthIncludingTrailingWhitespace) + 1.f);  // the box hugs the text
+    const float width = std::ceil(metrics.widthIncludingTrailingWhitespace) + 1.f + 2 * kPadX;
+    const float height = std::ceil(metrics.height) + 2 * kPadY;
     const float left = std::clamp(tipAt_.x - width / 2, 8.f, std::max(8.f, g.width - width - 8.f));
     float top = tipAt_.y + 22.f;  // under the pointer, or above it at the window's bottom
-    if (top + kTipHeight > g.height - 6.f) {
-        top = tipAt_.y - kTipHeight - 10.f;
+    if (top + height > g.height - 6.f) {
+        top = tipAt_.y - height - 10.f;
     }
-    const D2D1_RECT_F r = D2D1::RectF(left, top, left + width, top + kTipHeight);
+    const D2D1_RECT_F r = D2D1::RectF(left, top, left + width, top + height);
     Fill(r, 6.f, kRaised);
     brush_->SetColor(Color(kLine));
     target_->DrawRoundedRectangle(D2D1::RoundedRect(r, 6.f, 6.f), brush_.get(), 1.f);
-    Text(tipText_, small_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 10, r.bottom), kPrimary);
+    brush_->SetColor(Color(kPrimary));
+    target_->DrawTextLayout({r.left + kPadX, r.top + kPadY}, layout.get(), brush_.get());
 }
 
 // ---- Renaming in place --------------------------------------------------------------------------------

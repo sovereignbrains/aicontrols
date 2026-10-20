@@ -61,7 +61,7 @@ constexpr float kChipRow = 30.f;      // under the box: model, effort, usage rin
 constexpr float kChipsBottom = 10.f;
 constexpr float kInputButton = 30.f;  // "+" and send
 constexpr float kRing = 22.f;
-constexpr float kUsageWidth = 330.f;
+constexpr float kUsageWidth = 380.f;
 constexpr float kUsageRow = 58.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
@@ -1798,9 +1798,10 @@ void ChatWindow::PaintUsage(const Geometry& g) {
     float top = g.popup.top + 14 + 24;
     for (const Row& row : rows) {
         const int percent = row.limit->percent;
-        Text(row.label, uiBold_.get(), D2D1::RectF(left, top, left + 140, top + 20), kPrimary);
+        const float labelWidth = TextWidth(row.label, uiBold_.get()) + 12.f;
+        Text(row.label, uiBold_.get(), D2D1::RectF(left, top, left + labelWidth, top + 20), kPrimary);
         Text(ResetText(*row.limit, row.weekday), uiRight_.get(),
-             D2D1::RectF(left + 140, top, right - kPercentWidth - 8, top + 20), kSecondary);
+             D2D1::RectF(left + labelWidth, top, right - kPercentWidth - 8, top + 20), kSecondary);
         Text(percent >= 0 ? std::format(L"{}%", percent) : std::wstring(L"—"), uiRight_.get(),
              D2D1::RectF(right - kPercentWidth, top, right, top + 20), kSecondary);
         const D2D1_RECT_F bar = D2D1::RectF(left, top + 28, right, top + 34);

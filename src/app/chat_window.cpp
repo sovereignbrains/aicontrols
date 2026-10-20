@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "app/fonts.h"
+#include "app/resource.h"
 #include "core/attachment.h"
 #include "core/claude_process.h"
 #include "core/store.h"
@@ -45,6 +46,7 @@ constexpr size_t kTranscriptLimit = 200;
 
 // Layout, in DIPs.
 constexpr float kHeader = 44.f;
+constexpr float kLogo = 28.f;
 constexpr float kColumnMax = 720.f;
 constexpr float kSide = 24.f;
 constexpr float kGap = 14.f;
@@ -301,6 +303,7 @@ private:
     void StyleInput();
     void PlaceChildren();
     void EnsureTarget();
+    void LoadLogo();
 
     void Paint();
     void PaintFeed(const Geometry& g);
@@ -365,6 +368,8 @@ private:
     wil::com_ptr<IDWriteFontCollection> fonts_;
     wil::com_ptr<ID2D1HwndRenderTarget> target_;
     wil::com_ptr<ID2D1SolidColorBrush> brush_;
+    wil::com_ptr<IWICBitmap> logoSource_;
+    wil::com_ptr<ID2D1Bitmap> logo_;  // per render target
     wil::com_ptr<ID2D1StrokeStyle> round_;
     wil::com_ptr<IDWriteTextFormat> body_;
     wil::com_ptr<IDWriteTextFormat> notice_;
@@ -449,9 +454,13 @@ int ChatWindow::Run(int show) {
     windowClass.lpfnWndProc = &ChatWindow::Proc;
     windowClass.hInstance = instance_;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP));
+    windowClass.hIconSm = static_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                                        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                                                        LR_DEFAULTCOLOR));
     windowClass.lpszClassName = L"AIControlsWindow";
     RegisterClassExW(&windowClass);
+    LoadLogo();
 
     CreateWindowExW(0, windowClass.lpszClassName, L"AIControls", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                     CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, instance_, this);
@@ -568,6 +577,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         const auto* suggested = reinterpret_cast<const RECT*>(lParam);
         target_.reset();
         brush_.reset();
+        logo_.reset();
         CreateFonts();
         StyleInput();
         SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
@@ -1145,6 +1155,33 @@ void ChatWindow::EnsureTarget() {
         return;
     }
     target_->CreateSolidColorBrush(Color(kPrimary), brush_.put());
+    if (logoSource_) {
+        target_->CreateBitmapFromWicBitmap(logoSource_.get(), nullptr, logo_.put());
+    }
+}
+
+// The logo from the exe's resources, decoded once; the Direct2D bitmap is made per render target.
+void ChatWindow::LoadLogo() {
+    HRSRC found = FindResourceW(instance_, MAKEINTRESOURCEW(IDR_LOGO), RT_RCDATA);
+    HGLOBAL loaded = found != nullptr ? LoadResource(instance_, found) : nullptr;
+    const void* data = loaded != nullptr ? LockResource(loaded) : nullptr;
+    if (data == nullptr) {
+        return;
+    }
+    wil::com_ptr<IWICStream> stream;
+    wil::com_ptr<IWICBitmapDecoder> decoder;
+    wil::com_ptr<IWICBitmapFrameDecode> frame;
+    wil::com_ptr<IWICFormatConverter> converter;
+    if (FAILED(wic_->CreateStream(stream.put())) ||
+        FAILED(stream->InitializeFromMemory(static_cast<BYTE*>(const_cast<void*>(data)),
+                                            SizeofResource(instance_, found))) ||
+        FAILED(wic_->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.put())) ||
+        FAILED(decoder->GetFrame(0, frame.put())) || FAILED(wic_->CreateFormatConverter(converter.put())) ||
+        FAILED(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr,
+                                     0.0, WICBitmapPaletteTypeCustom))) {
+        return;
+    }
+    wic_->CreateBitmapFromSource(converter.get(), WICBitmapCacheOnLoad, logoSource_.put());
 }
 
 void ChatWindow::Text(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect, uint32_t color) {
@@ -1228,6 +1265,7 @@ void ChatWindow::Paint() {
     if (target_->EndDraw() == D2DERR_RECREATE_TARGET) {
         target_.reset();
         brush_.reset();
+        logo_.reset();
     }
 }
 
@@ -1285,16 +1323,23 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     brush_->SetColor(Color(kLine));
     target_->FillRectangle(D2D1::RectF(0, kHeader - 1, g.width, kHeader), brush_.get());
 
+    float titleLeft = 16;
+    if (logo_) {
+        const float top = (kHeader - kLogo) / 2;
+        target_->DrawBitmap(logo_.get(), D2D1::RectF(14, top, 14 + kLogo, top + kLogo), 1.f,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        titleLeft = 14 + kLogo + 10;
+    }
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
     const float titleRight = g.history.left - 12;
-    Text(title, header_.get(), D2D1::RectF(16, 0, titleRight, kHeader), kPrimary);
+    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kPrimary);
     std::wstring state = busy_ ? L"отвечает…" : L"";
     if (!status_.empty()) {
         state = status_;
     }
     if (!state.empty()) {
-        const float titleWidth = std::min(TextWidth(title, header_.get()), titleRight - 16);
-        Text(state, ui_.get(), D2D1::RectF(16 + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
+        const float titleWidth = std::min(TextWidth(title, header_.get()), titleRight - titleLeft);
+        Text(state, ui_.get(), D2D1::RectF(titleLeft + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
     }
 
     for (const Target button : {Target::History, Target::NewChat}) {

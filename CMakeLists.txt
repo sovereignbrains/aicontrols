@@ -23,6 +23,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 add_library(aic_core STATIC
   src/core/attachment.cpp
   src/core/auth.cpp
+  src/core/claude_install.cpp
   src/core/claude_process.cpp
   src/core/github.cpp
   src/core/highlight.cpp
@@ -33,7 +34,7 @@ add_library(aic_core STATIC
   src/core/tools.cpp
   src/core/vt_screen.cpp)
 target_include_directories(aic_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs winhttp)
+target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs winhttp bcrypt)
 
 add_executable(aicontrols WIN32
   src/app/main.cpp
@@ -45,7 +46,7 @@ target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32)
 
 # Tests of the core without the UI: `ctest --test-dir build/dev`.
 enable_testing()
-foreach(name tools markdown highlight vt_screen pty auth)
+foreach(name tools markdown highlight vt_screen pty auth claude_install)
   add_executable(aic_${name}_test tests/${name}_test.cpp)
   target_link_libraries(aic_${name}_test PRIVATE aic_core)
   add_test(NAME ${name} COMMAND aic_${name}_test)

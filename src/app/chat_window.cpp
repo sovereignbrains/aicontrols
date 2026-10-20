@@ -35,6 +35,7 @@
 #include "app/resource.h"
 #include "core/attachment.h"
 #include "core/auth.h"
+#include "core/claude_install.h"
 #include "core/claude_process.h"
 #include "core/github.h"
 #include "core/markdown.h"
@@ -64,6 +65,23 @@ struct LoginDone {
     bool started = true;
     DWORD exitCode = 0;
     std::string tail;  // the end of the CLI's output, for the failure note
+};
+
+constexpr UINT kSetupEvent = WM_APP + 12;      // SetupEvent*: the CLI's installer or updater
+constexpr UINT kClaudeVersions = WM_APP + 13;  // ClaudeVersions*: what is installed and what is out
+
+struct SetupEvent {
+    unsigned percent = 0;
+    bool installing = false;  // the download is over, `claude.exe install` runs
+    bool finished = false;
+    bool ok = false;
+    bool update = false;  // an update, not a first install
+    std::string error;
+};
+
+struct ClaudeVersions {
+    std::string installed;
+    std::string latest;
 };
 
 constexpr UINT kRepos = WM_APP + 10;      // ReposResult*: the GitHub repositories
@@ -216,6 +234,8 @@ enum class Target {
     WinMax,
     WinClose,
     SignIn,
+    InstallClaude,  // the install screen's button, and the same button while it works
+    CancelInstall,
     CancelLogin,
     CopyLoginUrl,
     Account,  // the sidebar's account row
@@ -550,6 +570,16 @@ private:
     void OnLogoutDone();
     void ShowAccountMenu();
     void PaintSignIn(const Geometry& g);
+
+    // The CLI itself: fetched when it is missing, updated from the account menu.
+    bool ClaudeUpdateAvailable() const { return ClaudeVersionLess(claudeVersion_, claudeLatest_); }
+    void InstallClaudeCli();
+    void UpdateClaudeCli();
+    void CancelSetup() { setupCancel_ = true; }
+    void OnSetupEvent(const SetupEvent& event);
+    void CheckClaudeVersions();
+    void OnClaudeVersions(const ClaudeVersions& versions);
+    void PaintInstall(const Geometry& g);
     std::wstring AccountName() const;
     std::wstring AccountPlan() const;
 
@@ -701,6 +731,17 @@ private:
     std::wstring authNote_;          // why the last attempt failed
     std::thread authThread_;
     std::atomic<bool> authCancel_ = false;
+    bool claudeMissing_ = false;     // no claude.exe was found: the install screen takes the empty chat
+    bool setupBusy_ = false;         // the installer or the updater runs
+    bool setupInstalling_ = false;   // ... and has the build already
+    unsigned setupPercent_ = 0;
+    std::wstring setupNote_;         // why the last attempt failed
+    std::thread setupThread_;
+    std::atomic<bool> setupCancel_ = false;
+    std::string claudeVersion_;      // as last asked; empty until the first answer
+    std::string claudeLatest_;
+    std::string announcedVersion_;   // the newest version already mentioned in a flash
+    std::thread versionThread_;
     bool terminalOpen_ = false;
     bool termFocus_ = false;         // typing goes to the shell
     bool termSwallowChar_ = false;   // the key that was just handled would also make a character
@@ -879,6 +920,7 @@ int ChatWindow::Run(int show) {
     RefreshSessions();
     RefreshAuth();
     LoadRepos();
+    CheckClaudeVersions();
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
 
     MSG message{};
@@ -1025,6 +1067,16 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case kAuthLogout:
         OnLogoutDone();
         return 0;
+    case kSetupEvent: {
+        const std::unique_ptr<SetupEvent> payload(reinterpret_cast<SetupEvent*>(lParam));
+        OnSetupEvent(*payload);
+        return 0;
+    }
+    case kClaudeVersions: {
+        const std::unique_ptr<ClaudeVersions> payload(reinterpret_cast<ClaudeVersions*>(lParam));
+        OnClaudeVersions(*payload);
+        return 0;
+    }
     case kRepos: {
         const std::unique_ptr<ReposResult> payload(reinterpret_cast<ReposResult*>(lParam));
         reposLoading_ = false;
@@ -1399,6 +1451,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (authThread_.joinable()) {
             authThread_.join();
         }
+        setupCancel_ = true;  // so does an install or an update
+        if (setupThread_.joinable()) {
+            setupThread_.join();
+        }
+        if (versionThread_.joinable()) {
+            versionThread_.join();
+        }
         cloneCancel_ = true;
         if (cloneThread_.joinable()) {
             cloneThread_.join();
@@ -1472,6 +1531,12 @@ void ChatWindow::OnClick(float x, float y) {
         return;
     case Target::SignIn:
         SignIn();
+        break;
+    case Target::InstallClaude:
+        InstallClaudeCli();
+        break;
+    case Target::CancelInstall:
+        CancelSetup();
         break;
     case Target::CancelLogin:
         CancelSignIn();
@@ -1983,6 +2048,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.terminalBtn, x, y)) {
         return {Target::TerminalToggle};
     }
+    if (claudeMissing_ && !HasConversation() && Inside(g.signIn, x, y)) {
+        return {setupBusy_ ? Target::CancelInstall : Target::InstallClaude};
+    }
     if (SignedOut() && !HasConversation()) {
         if (Inside(g.signIn, x, y)) {
             return {loginWaiting_ ? Target::CancelLogin : Target::SignIn};
@@ -2227,7 +2295,9 @@ void ChatWindow::Paint() {
 
 void ChatWindow::PaintFeed(const Geometry& g) {
     const float left = g.left;
-    if (SignedOut() && !HasConversation()) {
+    if (claudeMissing_ && !HasConversation()) {
+        PaintInstall(g);
+    } else if (SignedOut() && !HasConversation()) {
         PaintSignIn(g);
     } else if (!HasConversation()) {
         const std::wstring hello = userName_.empty() ? L"Что дальше?" : L"Что дальше, " + ToWide(userName_) + L"?";
@@ -3747,10 +3817,190 @@ void ChatWindow::ShowAccountMenu() {
     const std::wstring who = auth_.email.empty() ? AccountName() : ToWide(auth_.email);
     AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, who.c_str());
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    const std::wstring version = claudeVersion_.empty() ? std::wstring(L"Claude: версия неизвестна")
+                                                        : L"Claude " + ToWide(claudeVersion_);
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 3, version.c_str());
+    const std::wstring update = L"Обновить Claude до " + ToWide(claudeLatest_);
+    AppendMenuW(menu.get(), MF_STRING | (setupBusy_ ? MF_GRAYED : 0), ClaudeUpdateAvailable() ? 4 : 5,
+                ClaudeUpdateAvailable() ? update.c_str() : L"Проверить обновления Claude");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из аккаунта");
-    if (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, screen.x, screen.y, 0, hwnd_,
-                       nullptr) == 2) {
+    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, screen.x, screen.y, 0, hwnd_,
+                           nullptr)) {
+    case 2:
         SignOut();
+        break;
+    case 4:
+        UpdateClaudeCli();
+        break;
+    case 5:
+        CheckClaudeVersions();
+        Flash(L"Проверяю, нет ли новой версии Claude…");
+        break;
+    default:
+        break;
+    }
+}
+
+// ---- The CLI itself ------------------------------------------------------------------------------------
+
+namespace {
+
+void PostSetup(HWND hwnd, SetupEvent event) {
+    auto payload = std::make_unique<SetupEvent>(std::move(event));
+    if (PostMessageW(hwnd, kSetupEvent, 0, reinterpret_cast<LPARAM>(payload.get()))) {
+        payload.release();
+    }
+}
+
+}  // namespace
+
+// What the official installer does: the newest build, its checksum checked, `claude.exe install`.
+void ChatWindow::InstallClaudeCli() {
+    if (setupBusy_) {
+        return;
+    }
+    if (setupThread_.joinable()) {
+        setupThread_.join();
+    }
+    setupBusy_ = true;
+    setupInstalling_ = false;
+    setupPercent_ = 0;
+    setupNote_.clear();
+    setupCancel_ = false;
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &setupCancel_;
+    setupThread_ = std::thread([hwnd, cancel] {
+        std::string error;
+        const bool ok = InstallClaude(
+            PickProxy(), cancel,
+            [hwnd](unsigned percent, bool installing) {
+                PostSetup(hwnd, SetupEvent{percent, installing, false, false, false, {}});
+            },
+            error);
+        PostSetup(hwnd, SetupEvent{100, false, true, ok, false, std::move(error)});
+    });
+    Refresh();
+}
+
+// `claude update`, with the running CLI stopped first: it holds its own file.
+void ChatWindow::UpdateClaudeCli() {
+    const std::wstring exe = FindClaudeExe();
+    if (setupBusy_ || exe.empty()) {
+        return;
+    }
+    if (busy_ && MessageBoxW(hwnd_, L"Сейчас Claude отвечает. Обновление прервёт ответ. Продолжить?", L"AIControls",
+                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    if (setupThread_.joinable()) {
+        setupThread_.join();
+    }
+    ++generation_;
+    host_.CancelAll();
+    for (FeedItem& item : feed_) {
+        if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
+            item.verdict = Verdict::Cancelled;
+        }
+    }
+    claude_.Stop();
+    running_ = false;
+    busy_ = false;
+    setupBusy_ = true;
+    setupInstalling_ = true;
+    setupNote_.clear();
+    setupCancel_ = false;
+    Flash(L"Обновляю Claude…", 60000);
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &setupCancel_;
+    setupThread_ = std::thread([hwnd, exe, cancel] {
+        const CliResult run = RunCli(L"\"" + exe + L"\" update", PickProxy(), 300, cancel);
+        std::string error;
+        if (run.cancelled || run.timedOut || !run.started || run.exitCode != 0) {
+            error = run.timedOut ? "Не дождался конца обновления"
+                                 : (run.output.size() > 300 ? run.output.substr(run.output.size() - 300) : run.output);
+            if (error.empty()) {
+                error = "Обновление не удалось (код " + std::to_string(run.exitCode) + ")";
+            }
+        }
+        PostSetup(hwnd, SetupEvent{100, false, true, error.empty(), true, std::move(error)});
+    });
+    Refresh();
+}
+
+void ChatWindow::OnSetupEvent(const SetupEvent& event) {
+    if (!event.finished) {
+        setupPercent_ = event.percent;
+        setupInstalling_ = event.installing;
+        Refresh();
+        return;
+    }
+    setupBusy_ = false;
+    setupInstalling_ = false;
+    if (event.ok) {
+        setupNote_.clear();
+        claudeMissing_ = FindClaudeExe().empty();
+        CheckClaudeVersions();
+        RefreshAuth();
+        StartClaude();
+        Flash(event.update ? L"Claude обновлён" : L"Claude установлен", 5000);
+    } else {
+        setupNote_ = event.error == "Cancelled" ? std::wstring(L"Отменено.") : ToWide(event.error);
+        if (event.update) {  // the old CLI is still there: back to work with it
+            Flash(L"Не удалось обновить Claude: " + setupNote_, 8000);
+            StartClaude();
+        }
+    }
+    Refresh();
+}
+
+void ChatWindow::CheckClaudeVersions() {
+    if (versionThread_.joinable()) {
+        versionThread_.join();
+    }
+    const HWND hwnd = hwnd_;
+    versionThread_ = std::thread([hwnd] {
+        auto versions = std::make_unique<ClaudeVersions>();
+        versions->installed = InstalledClaudeVersion(FindClaudeExe());
+        versions->latest = LatestClaudeRelease(PickProxy()).version;
+        if (PostMessageW(hwnd, kClaudeVersions, 0, reinterpret_cast<LPARAM>(versions.get()))) {
+            versions.release();
+        }
+    });
+}
+
+void ChatWindow::OnClaudeVersions(const ClaudeVersions& versions) {
+    claudeVersion_ = versions.installed;
+    if (!versions.latest.empty()) {
+        claudeLatest_ = versions.latest;
+    }
+    if (ClaudeUpdateAvailable() && announcedVersion_ != claudeLatest_) {
+        announcedVersion_ = claudeLatest_;
+        Flash(L"Вышла новая версия Claude " + ToWide(claudeLatest_) + L": обновить можно в меню аккаунта", 10000);
+    }
+    Refresh();
+}
+
+// In place of the greeting while claude.exe is missing: what it is, and the button that fetches it.
+void ChatWindow::PaintInstall(const Geometry& g) {
+    const float middle = (g.feed.top + g.feed.bottom) / 2;
+    Text(L"Нужен Claude", greeting_.get(), D2D1::RectF(g.left, middle - 40, g.left + g.column, middle), kPrimary);
+    std::wstring hint = L"Клиенту нужна программа claude.exe. Скачаю её с downloads.claude.ai и проверю контрольную сумму.";
+    if (setupBusy_) {
+        hint = setupInstalling_ ? std::wstring(L"Устанавливаю…") : L"Загружаю… " + std::to_wstring(setupPercent_) + L"%";
+    }
+    Text(hint, notice_.get(), D2D1::RectF(g.left, middle + 2, g.left + g.column, middle + 24), kSecondary);
+    const bool onMain = hover_.target == Target::InstallClaude || hover_.target == Target::CancelInstall;
+    if (setupBusy_) {
+        Fill(g.signIn, 9.f, onMain ? kLine : kRaised);
+        Text(L"Отмена", button_.get(), g.signIn, kPrimary);
+    } else {
+        Fill(g.signIn, 9.f, kAccent, onMain ? 0.85f : 1.f);
+        Text(L"Установить", button_.get(), g.signIn, kPrimary);
+    }
+    if (!setupNote_.empty()) {
+        Text(setupNote_, notice_.get(), D2D1::RectF(g.left, g.signIn.bottom + 12, g.left + g.column, g.signIn.bottom + 52),
+             kDanger);
     }
 }
 
@@ -4896,7 +5146,12 @@ void ChatWindow::Apply(const Settings& next) {
 bool ChatWindow::StartClaude() {
     ClaudeOptions options;
     options.exe = FindClaudeExe();
+    claudeMissing_ = options.exe.empty();
     if (options.exe.empty()) {
+        Refresh();  // an empty chat offers to install it; a chat that has words says so in the feed
+        if (!HasConversation()) {
+            return false;
+        }
         Add(Kind::Error, L"Не нашёл claude.exe ни в %USERPROFILE%\\.local\\bin, ни в PATH.");
         return false;
     }

@@ -135,6 +135,11 @@ bool Inside(const D2D1_RECT_F& r, float x, float y) {
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
 }
 
+// The cross at a terminal tab's right end.
+D2D1_RECT_F TabCloseRect(const D2D1_RECT_F& tab) {
+    return D2D1::RectF(tab.right - 22, tab.top + 5, tab.right - 4, tab.bottom - 5);
+}
+
 bool SetClipboardText(HWND owner, const std::wstring& text);  // below, with the terminal
 
 struct ExitInfo {
@@ -158,11 +163,17 @@ struct FeedItem {
     float height = 0;
     float top = 0;  // where it was last painted, for hit tests
     std::vector<MdSpan> spans;  // Kind::Assistant: how the layout's runs are styled (the text is markdown)
+    std::wstring shown;         // the text the layout was made of (markdown without its markup ...): selections index it
     // Kind::Approval: `text` is what the call does, `title` what kind of call it is.
     std::wstring title;
     std::string requestId;  // the CLI's can_use_tool request, answered once
+    std::string toolUseId;  // ... and the call it is about: its result comes back under this id
     Json input;
     Verdict verdict = Verdict::Pending;
+    bool done = false;         // the result has come back
+    bool outputError = false;
+    std::wstring output;       // what the tool returned
+    size_t outputStart = 0;    // where it begins in the card's layout
 };
 
 // The panels that open over the window; one at a time.
@@ -184,6 +195,9 @@ enum class Target {
     Account,  // the sidebar's account row
     TerminalToggle,
     TermClose,
+    TermTab,       // row: the tab
+    TermTabClose,  // row: the same
+    TermAdd,
     TermScreen,
     NewChat,
     Attach,
@@ -227,6 +241,8 @@ struct Geometry {
     D2D1_RECT_F term{};  // the terminal column (empty when closed)
     D2D1_RECT_F termClose{};
     D2D1_RECT_F termScreen{};
+    std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
+    D2D1_RECT_F termAdd{};               // "+": another shell
     D2D1_RECT_F terminalBtn{};  // the header's button that shows or hides the terminal
     D2D1_RECT_F sideToggle{};   // the header's button that shows or hides the sidebar
     D2D1_RECT_F secrets{};     // the sidebar's entry for the secrets
@@ -276,6 +292,42 @@ std::wstring LastLines(const std::string& text, int count) {
         }
     }
     return ToWide(std::string_view(text).substr(start, end - start));
+}
+
+// A tool's output for its card: whole if short, else its first line (the exit code) and its end.
+std::wstring OutputPreview(const std::wstring& output) {
+    constexpr size_t kTail = 12;
+    constexpr size_t kLongestLine = 400;
+    std::vector<std::wstring> lines;
+    for (size_t start = 0; start <= output.size();) {
+        size_t end = output.find(L'\n', start);
+        if (end == std::wstring::npos) {
+            end = output.size();
+        }
+        std::wstring line = output.substr(start, end - start);
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        if (line.size() > kLongestLine) {
+            line = line.substr(0, kLongestLine) + L"…";
+        }
+        lines.push_back(std::move(line));
+        start = end + 1;
+    }
+    std::wstring preview;
+    const auto add = [&](const std::wstring& line) { preview += (preview.empty() ? L"" : L"\n") + line; };
+    if (lines.size() <= kTail + 2) {
+        for (const std::wstring& line : lines) {
+            add(line);
+        }
+        return preview;
+    }
+    add(lines.front());
+    add(std::format(L"… скрыто строк: {} …", lines.size() - 1 - kTail));
+    for (size_t i = lines.size() - kTail; i < lines.size(); ++i) {
+        add(lines[i]);
+    }
+    return preview;
 }
 
 // RichEdit's text: paragraphs end in \r (GetWindowText may give \r\n); we send \n.
@@ -424,6 +476,20 @@ private:
     void PaintEffort(const Geometry& g);
     void PaintUsage(const Geometry& g);
 
+    // Selecting text in the feed with the mouse, across messages.
+    struct FeedPoint {
+        size_t item = 0;  // an index into feed_
+        UINT32 pos = 0;   // in the item's shown text
+    };
+    D2D1_POINT_2F ItemOrigin(const Geometry& g, const FeedItem& item) const;
+    std::optional<FeedPoint> FeedPointAt(const Geometry& g, float x, float y) const;
+    bool HasFeedSelection() const;
+    bool FeedSelectionIn(size_t index, UINT32& from, UINT32& to) const;
+    void PaintFeedSelection(size_t index, D2D1_POINT_2F origin);
+    std::wstring FeedSelectionText() const;
+    bool CopyFeedSelection();
+    void ClearFeedSelection();
+
     // The account: `claude auth status / login / logout`, each on its own thread.
     bool SignedOut() const { return auth_.known && !auth_.loggedIn; }
     void RefreshAuth();
@@ -443,12 +509,29 @@ private:
         size_t line = 0;  // an index into the emulator's lines (the scrollback first)
         int col = 0;
     };
+    // One shell per tab; its posts carry the tab's id, so a closed or restarted shell's late output is dropped.
+    struct TermTab {
+        std::unique_ptr<VtScreen> screen;
+        std::unique_ptr<Pty> pty;  // its threads end (in its destructor) before the screen goes
+        WPARAM id = 0;
+        int number = 1;            // "Терминал 1", "Терминал 2" ...
+        bool exited = false;
+        size_t scroll = 0;         // lines scrolled back from the bottom
+    };
+    TermTab* Tab() const { return activeTab_ < tabs_.size() ? tabs_[activeTab_].get() : nullptr; }
+    VtScreen* Screen() const { return Tab() != nullptr ? Tab()->screen.get() : nullptr; }
+    TermTab* TabById(WPARAM id) const;
+    void TerminalGrid(int& cols, int& rows) const;
+    void AddTerminalTab();
+    void StartShell(TermTab& tab);
+    void CloseTerminalTab(size_t index);
+    void SelectTerminalTab(size_t index);
+    std::wstring TabLabel(const TermTab& tab) const;
     void PaintTerminal(const Geometry& g);
-    void StartTerminal();
     void SetTerminalOpen(bool open);
     void SyncTerminalSize();
-    void OnTermData(const std::string& bytes);
-    void OnTermExit(DWORD code);
+    void OnTermData(WPARAM id, const std::string& bytes);
+    void OnTermExit(WPARAM id, DWORD code);
     void OnTermKey(WPARAM key);
     void OnTermChar(wchar_t c);
     void TermSend(std::string_view bytes);
@@ -494,6 +577,7 @@ private:
     void Flash(std::wstring status, UINT milliseconds = 1500);
 
     void AskApproval(const std::string& requestId, const Json& request);
+    void OnToolResult(const Json& block);
     void Decide(size_t index, bool allow);
     void CancelApprovals();  // pending cards are answered "no" and marked as cancelled
     void StopTurn();
@@ -545,6 +629,9 @@ private:
     HWND input_ = nullptr;
     wil::unique_hmodule richEdit_;
     wil::unique_hfont uiFont_;
+    std::optional<FeedPoint> feedAnchor_;  // where a selection in the feed began
+    std::optional<FeedPoint> feedFocus_;   // ... and where it ends now
+    bool feedSelecting_ = false;           // the mouse is dragging one
     AuthStatus auth_;                // as last asked; auth_.known is false until the first answer
     bool authWorking_ = false;       // a CLI call (status, login, logout) is running
     bool loginWaiting_ = false;      // `claude auth login` runs: the user is in the browser
@@ -555,18 +642,16 @@ private:
     std::atomic<bool> authCancel_ = false;
     bool terminalOpen_ = false;
     bool termFocus_ = false;         // typing goes to the shell
-    bool termExited_ = false;
     bool termSwallowChar_ = false;   // the key that was just handled would also make a character
     bool selecting_ = false;
     wchar_t pendingHigh_ = 0;        // a UTF-16 high surrogate waiting for its pair
-    size_t termScroll_ = 0;          // lines scrolled back from the bottom
     float cellW_ = 8.f;
     float cellH_ = 18.f;
-    std::optional<TermPoint> selAnchor_;
+    std::optional<TermPoint> selAnchor_;  // in the active tab
     std::optional<TermPoint> selEnd_;
-    WPARAM termGeneration_ = 0;      // bumped per shell; stale posts are dropped
-    std::unique_ptr<VtScreen> term_;
-    Pty pty_;                        // after term_: its threads end before the screen goes
+    std::vector<std::unique_ptr<TermTab>> tabs_;
+    size_t activeTab_ = 0;
+    WPARAM nextTabId_ = 0;
     wil::com_ptr<IDWriteTextFormat> termFont_;
     wil::com_ptr<IDWriteTextFormat> termBold_;
     bool sidebarOpen_ = true;
@@ -844,15 +929,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case kTermData: {
         const std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lParam));
-        if (wParam == termGeneration_) {
-            OnTermData(*payload);
-        }
+        OnTermData(wParam, *payload);
         return 0;
     }
     case kTermExit:
-        if (wParam == termGeneration_) {
-            OnTermExit(static_cast<DWORD>(lParam));
-        }
+        OnTermExit(wParam, static_cast<DWORD>(lParam));
         return 0;
     case kSecretKey: {
         const auto from = reinterpret_cast<HWND>(lParam);
@@ -919,6 +1000,19 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             SetEffortAt(at.x);
             return 0;
         }
+        if (feedSelecting_) {  // dragging a selection in the feed; past its edge the feed scrolls
+            const Geometry g = Layout();
+            if (at.y < g.feed.top) {
+                ScrollBy(-24.f);
+            } else if (at.y > g.feed.bottom) {
+                ScrollBy(24.f);
+            }
+            if (const auto point = FeedPointAt(Layout(), at.x, at.y)) {
+                feedFocus_ = point;
+            }
+            Refresh();
+            return 0;
+        }
         if (selecting_) {  // dragging a selection in the terminal; past its edge the view scrolls
             const Geometry g = Layout();
             if (at.y < g.termScreen.top) {
@@ -952,14 +1046,20 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(lParam) == HTCLIENT && reinterpret_cast<HWND>(wParam) == hwnd_) {
             const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup &&
                                    hover_.target != Target::AttachmentChip && hover_.target != Target::TermScreen;
-            SetCursor(LoadCursorW(nullptr, hover_.target == Target::TermScreen ? IDC_IBEAM
-                                                                                : (clickable ? IDC_HAND : IDC_ARROW)));
+            bool text = hover_.target == Target::TermScreen;
+            if (hover_.target == Target::None && popup_ == Popup::None && HasConversation()) {  // over the feed: text
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                ScreenToClient(hwnd_, &cursor);
+                text = Inside(Layout().feed, ToDip(cursor.x), ToDip(cursor.y));
+            }
+            SetCursor(LoadCursorW(nullptr, text ? IDC_IBEAM : (clickable ? IDC_HAND : IDC_ARROW)));
             return TRUE;
         }
         break;
     case WM_LBUTTONDOWN: {
         const D2D1_POINT_2F at = CursorDip(lParam);
-        if (popup_ == Popup::None && term_ && HitTest(at.x, at.y).target == Target::TermScreen) {
+        if (popup_ == Popup::None && Screen() && HitTest(at.x, at.y).target == Target::TermScreen) {
             termFocus_ = true;  // a click into the terminal: keys go to the shell, a drag selects
             searchFocus_ = false;
             SetFocus(hwnd_);
@@ -970,6 +1070,20 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             Refresh();
             return 0;
         }
+        if (popup_ == Popup::None && HitTest(at.x, at.y).target == Target::None) {
+            const Geometry g = Layout();
+            if (Inside(g.feed, at.x, at.y)) {  // a press on the feed's text starts a selection
+                ClearFeedSelection();
+                feedAnchor_ = FeedPointAt(g, at.x, at.y);
+                feedFocus_ = feedAnchor_;
+                feedSelecting_ = feedAnchor_.has_value();
+                if (feedSelecting_) {
+                    SetCapture(hwnd_);
+                }
+                Refresh();
+                return 0;
+            }
+        }
         if (HitTest(at.x, at.y).target == Target::EffortTrack) {
             draggingEffort_ = true;
             SetCapture(hwnd_);
@@ -978,6 +1092,19 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_LBUTTONUP: {
+        if (feedSelecting_) {
+            feedSelecting_ = false;
+            ReleaseCapture();
+            if (!HasFeedSelection()) {  // a plain click: nothing selected
+                ClearFeedSelection();
+            }
+            searchFocus_ = false;
+            termFocus_ = false;
+            ClosePopup();
+            SetFocus(input_);  // Ctrl+C there copies the selection when the input has none of its own
+            Refresh();
+            return 0;
+        }
         if (selecting_) {
             selecting_ = false;
             ReleaseCapture();
@@ -1016,7 +1143,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_RBUTTONUP:
-        if (popup_ == Popup::None && term_ &&
+        if (popup_ == Popup::None && Screen() &&
             HitTest(CursorDip(lParam).x, CursorDip(lParam).y).target == Target::TermScreen) {
             if (HasTermSelection()) {  // as in Windows Terminal: a right click copies a selection, else pastes
                 CopyTermSelection();
@@ -1055,7 +1182,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_SYSCHAR:  // Alt+key in the shell
-        if (termFocus_ && popup_ == Popup::None && !termExited_) {
+        if (termFocus_ && popup_ == Popup::None && Tab() != nullptr && !Tab()->exited) {
             TermSend("\x1b" + ToUtf8(std::wstring(1, static_cast<wchar_t>(wParam))));
             return 0;
         }
@@ -1116,8 +1243,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             authThread_.join();
         }
         ++generation_;
-        ++termGeneration_;
-        pty_.Stop();
+        tabs_.clear();  // every shell ends
         host_.CancelAll();
         claude_.Stop();
         PostQuitMessage(0);
@@ -1195,6 +1321,23 @@ void ChatWindow::OnClick(float x, float y) {
         break;
     case Target::TermClose:
         SetTerminalOpen(false);
+        break;
+    case Target::TermTab:
+        SelectTerminalTab(hit.row);
+        keepFocus = true;
+        break;
+    case Target::TermTabClose:
+        CloseTerminalTab(hit.row);
+        keepFocus = terminalOpen_;
+        if (terminalOpen_) {
+            SelectTerminalTab(activeTab_);
+        }
+        break;
+    case Target::TermAdd:
+        AddTerminalTab();
+        SyncTerminalSize();
+        SelectTerminalTab(activeTab_);
+        keepFocus = true;
         break;
     case Target::SidebarSearch:
         searchFocus_ = true;
@@ -1361,6 +1504,13 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             FocusSearch();
             return 1;
         }
+        if ((filter.wParam == 'C' || filter.wParam == VK_INSERT) && control) {
+            CHARRANGE own{};  // the input's own selection comes first
+            SendMessageW(input_, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&own));
+            if (own.cpMax == own.cpMin && CopyFeedSelection()) {
+                return 1;
+            }
+        }
         if (filter.wParam == 'U' && control) {
             PickFiles();
             return 1;
@@ -1451,6 +1601,13 @@ Geometry ChatWindow::Layout() const {
         g.term = D2D1::RectF(g.area, kHeader, g.width, g.height);
         g.termClose = D2D1::RectF(g.term.right - 12 - 28, g.term.top + 8, g.term.right - 12, g.term.top + 36);
         g.termScreen = D2D1::RectF(g.term.left + 14, g.term.top + 44, g.term.right - 8, g.term.bottom - 12);
+        float tabLeft = g.term.left + 10;
+        for (const auto& tab : tabs_) {
+            const float width = TextWidth(TabLabel(*tab), ui_.get()) + 16 + 20;
+            g.termTabs.push_back(D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + width, g.term.top + 36));
+            tabLeft += width + 4;
+        }
+        g.termAdd = D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + 28, g.term.top + 36);
     }
     if (secretsOpen_ && sidebarWidth > 0) {
         g.panel = g.sidebar;
@@ -1586,6 +1743,17 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.term, x, y)) {
         if (Inside(g.termClose, x, y)) {
             return {Target::TermClose};
+        }
+        for (size_t i = 0; i < g.termTabs.size(); ++i) {
+            if (Inside(TabCloseRect(g.termTabs[i]), x, y)) {
+                return {Target::TermTabClose, i};
+            }
+            if (Inside(g.termTabs[i], x, y)) {
+                return {Target::TermTab, i};
+            }
+        }
+        if (Inside(g.termAdd, x, y)) {
+            return {Target::TermAdd};
         }
         return Inside(g.termScreen, x, y) ? Hit{Target::TermScreen} : Hit{};
     }
@@ -1759,6 +1927,11 @@ void ChatWindow::MeasureFeed(float column) {
             shown = std::move(md.text);
             item.spans = std::move(md.spans);
             source = &shown;
+        } else if (item.kind == Kind::Approval && !item.output.empty()) {
+            shown = item.text + L"\n\n";
+            item.outputStart = shown.size();
+            shown += OutputPreview(item.output);
+            source = &shown;
         }
         if (FAILED(dwrite_->CreateTextLayout(source->c_str(), static_cast<UINT32>(source->size()), format,
                                              std::max(width, 1.f), 1e6f, item.layout.put()))) {
@@ -1768,6 +1941,7 @@ void ChatWindow::MeasureFeed(float column) {
         if (item.kind == Kind::Assistant) {
             StyleMarkdown(item);
         }
+        item.shown = *source;
         item.layoutWidth = width;
         DWRITE_TEXT_METRICS metrics{};
         item.layout->GetMetrics(&metrics);
@@ -1861,6 +2035,8 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             if (item.kind == Kind::Assistant) {
                 PaintMarkdown(item, x, y, left, g.column);
             }
+            PaintFeedSelection(static_cast<size_t>(&item - feed_.data()),
+                               {x, y + (item.kind == Kind::User ? kBubblePad : 0.f)});
             brush_->SetColor(Color(color));
             target_->DrawTextLayout({x, y + (item.kind == Kind::User ? kBubblePad : 0.f)}, item.layout.get(),
                                     brush_.get());
@@ -1976,11 +2152,23 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
     const float top = item.top + kCardPad;
     Text(item.title, uiBold_.get(), D2D1::RectF(inner, top, card.right - kCardPad - 110.f, top + kCardTitle), kPrimary);
     if (!pending) {
-        const bool allowed = item.verdict == Verdict::Allowed;
-        const wchar_t* label = allowed ? L"Разрешено" : (item.verdict == Verdict::Denied ? L"Отклонено" : L"Отменено");
+        std::wstring label;
+        uint32_t labelColor = kDanger;
+        if (item.verdict == Verdict::Allowed) {
+            label = !item.done ? L"Выполняется…" : (item.outputError ? L"Ошибка" : L"Готово");
+            labelColor = item.done && item.outputError ? kDanger : kSecondary;
+        } else {
+            label = item.verdict == Verdict::Denied ? L"Отклонено" : L"Отменено";
+        }
         Text(label, uiRight_.get(), D2D1::RectF(card.right - kCardPad - 110.f, top, card.right - kCardPad, top + kCardTitle),
-             allowed ? kSecondary : kDanger);
+             labelColor);
     }
+    if (!item.output.empty() && item.layout) {  // the output under the call, in the terminal's colour (red if it failed)
+        wil::com_ptr<ID2D1SolidColorBrush> outputBrush;
+        target_->CreateSolidColorBrush(Color(item.outputError ? kDanger : kTermFg), outputBrush.put());
+        item.layout->SetDrawingEffect(outputBrush.get(), DWRITE_TEXT_RANGE{static_cast<UINT32>(item.outputStart), 0x7fffffff});
+    }
+    PaintFeedSelection(static_cast<size_t>(&item - feed_.data()), {inner, top + kCardTitle + 4.f});
     brush_->SetColor(Color(pending ? kPrimary : kSecondary));
     target_->DrawTextLayout({inner, top + kCardTitle + 4.f}, item.layout.get(), brush_.get());
 
@@ -2417,35 +2605,104 @@ uint32_t Mix(uint32_t from, uint32_t to, float amount) {
     return channel(16) << 16 | channel(8) << 8 | channel(0);
 }
 
-void ChatWindow::StartTerminal() {
+ChatWindow::TermTab* ChatWindow::TabById(WPARAM id) const {
+    for (const auto& tab : tabs_) {
+        if (tab->id == id) {
+            return tab.get();
+        }
+    }
+    return nullptr;
+}
+
+// As many columns and rows as fit the panel's screen area.
+void ChatWindow::TerminalGrid(int& cols, int& rows) const {
     const Geometry g = Layout();
-    const int cols = std::max(10, static_cast<int>((g.termScreen.right - g.termScreen.left) / cellW_));
-    const int rows = std::max(3, static_cast<int>((g.termScreen.bottom - g.termScreen.top) / cellH_));
-    pty_.Stop();
-    term_ = std::make_unique<VtScreen>(cols, rows);
-    term_->SetReply([this](std::string answer) { pty_.Write(answer); });
-    termExited_ = false;
-    termScroll_ = 0;
+    cols = std::max(10, static_cast<int>((g.termScreen.right - g.termScreen.left) / cellW_));
+    rows = std::max(3, static_cast<int>((g.termScreen.bottom - g.termScreen.top) / cellH_));
+}
+
+std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
+    return std::format(L"Терминал {}", tab.number);
+}
+
+void ChatWindow::AddTerminalTab() {
+    auto tab = std::make_unique<TermTab>();
+    int number = 1;  // the lowest number not in use
+    while (std::ranges::any_of(tabs_, [&](const auto& other) { return other->number == number; })) {
+        ++number;
+    }
+    tab->number = number;
+    tabs_.push_back(std::move(tab));
+    activeTab_ = tabs_.size() - 1;
     selAnchor_.reset();
     selEnd_.reset();
-    const WPARAM generation = ++termGeneration_;
+    StartShell(*tabs_.back());
+    Refresh();
+}
+
+// A fresh PowerShell in the tab (also after the old one has exited).
+void ChatWindow::StartShell(TermTab& tab) {
+    int cols = 0;
+    int rows = 0;
+    TerminalGrid(cols, rows);
+    tab.pty.reset();  // stops the old shell and its threads
+    tab.pty = std::make_unique<Pty>();
+    tab.screen = std::make_unique<VtScreen>(cols, rows);
+    Pty* pty = tab.pty.get();
+    tab.screen->SetReply([pty](std::string answer) { pty->Write(answer); });
+    tab.exited = false;
+    tab.scroll = 0;
+    tab.id = ++nextTabId_;
+    const WPARAM id = tab.id;
     const HWND hwnd = hwnd_;
     wchar_t profile[MAX_PATH]{};
     GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
     try {
-        pty_.Start(
+        tab.pty->Start(
             cols, rows, L"powershell.exe -NoLogo", profile,
-            [hwnd, generation](std::string bytes) {
+            [hwnd, id](std::string bytes) {
                 auto payload = std::make_unique<std::string>(std::move(bytes));
-                if (PostMessageW(hwnd, kTermData, generation, reinterpret_cast<LPARAM>(payload.get()))) {
+                if (PostMessageW(hwnd, kTermData, id, reinterpret_cast<LPARAM>(payload.get()))) {
                     payload.release();
                 }
             },
-            [hwnd, generation](DWORD code) { PostMessageW(hwnd, kTermExit, generation, static_cast<LPARAM>(code)); });
+            [hwnd, id](DWORD code) { PostMessageW(hwnd, kTermExit, id, static_cast<LPARAM>(code)); });
     } catch (const std::exception& e) {
-        term_->Feed("\x1b[31m" + ToUtf8(L"Не удалось запустить PowerShell: ") + e.what() + "\x1b[0m");
-        termExited_ = true;
+        tab.screen->Feed("\x1b[31m" + ToUtf8(L"Не удалось запустить PowerShell: ") + e.what() + "\x1b[0m");
+        tab.exited = true;
     }
+}
+
+void ChatWindow::CloseTerminalTab(size_t index) {
+    if (index >= tabs_.size()) {
+        return;
+    }
+    tabs_.erase(tabs_.begin() + static_cast<std::ptrdiff_t>(index));  // the shell ends with it
+    selAnchor_.reset();
+    selEnd_.reset();
+    hover_ = {};
+    if (tabs_.empty()) {
+        activeTab_ = 0;
+        SetTerminalOpen(false);
+        return;
+    }
+    if (activeTab_ >= tabs_.size() || index < activeTab_) {
+        activeTab_ = activeTab_ == 0 ? 0 : activeTab_ - 1;
+    }
+    activeTab_ = std::min(activeTab_, tabs_.size() - 1);
+    Refresh();
+}
+
+void ChatWindow::SelectTerminalTab(size_t index) {
+    if (index < tabs_.size() && index != activeTab_) {
+        activeTab_ = index;
+        selAnchor_.reset();
+        selEnd_.reset();
+    }
+    termFocus_ = true;
+    searchFocus_ = false;
+    SetFocus(hwnd_);
+    Refresh();
 }
 
 void ChatWindow::SetTerminalOpen(bool open) {
@@ -2457,8 +2714,8 @@ void ChatWindow::SetTerminalOpen(bool open) {
     hover_ = {};
     PlaceChildren();  // the chat's column moves
     if (open) {
-        if (!term_) {
-            StartTerminal();
+        if (tabs_.empty()) {
+            AddTerminalTab();
         }
         SyncTerminalSize();
         termFocus_ = true;
@@ -2472,49 +2729,65 @@ void ChatWindow::SetTerminalOpen(bool open) {
     Refresh();
 }
 
-// The grid follows the panel: as many columns and rows as fit.
+// Every tab's grid follows the panel.
 void ChatWindow::SyncTerminalSize() {
-    if (!terminalOpen_ || !term_) {
+    if (!terminalOpen_ || tabs_.empty()) {
         return;
     }
     const Geometry g = Layout();
     if (g.termScreen.right <= g.termScreen.left) {
         return;
     }
-    const int cols = std::max(10, static_cast<int>((g.termScreen.right - g.termScreen.left) / cellW_));
-    const int rows = std::max(3, static_cast<int>((g.termScreen.bottom - g.termScreen.top) / cellH_));
-    if (cols != term_->Cols() || rows != term_->Rows()) {
-        term_->Resize(cols, rows);
-        pty_.Resize(cols, rows);
-        termScroll_ = std::min(termScroll_, term_->ScrollbackSize());
+    int cols = 0;
+    int rows = 0;
+    TerminalGrid(cols, rows);
+    for (const auto& tab : tabs_) {
+        if (tab->screen && (cols != tab->screen->Cols() || rows != tab->screen->Rows())) {
+            tab->screen->Resize(cols, rows);
+            if (tab->pty) {
+                tab->pty->Resize(cols, rows);
+            }
+            tab->scroll = std::min(tab->scroll, tab->screen->ScrollbackSize());
+        }
     }
 }
 
-void ChatWindow::OnTermData(const std::string& bytes) {
-    if (!term_) {
+void ChatWindow::OnTermData(WPARAM id, const std::string& bytes) {
+    TermTab* tab = TabById(id);
+    if (tab == nullptr || !tab->screen) {
         return;
     }
-    const size_t before = term_->ScrollbackSize();
-    term_->Feed(bytes);
-    if (termScroll_ > 0) {  // reading the scrollback: the view stays on its lines while new ones arrive
-        termScroll_ = std::min(termScroll_ + (term_->ScrollbackSize() - std::min(before, term_->ScrollbackSize())),
-                               term_->ScrollbackSize());
+    const size_t before = tab->screen->ScrollbackSize();
+    tab->screen->Feed(bytes);
+    if (tab->scroll > 0) {  // reading the scrollback: the view stays on its lines while new ones arrive
+        const size_t after = tab->screen->ScrollbackSize();
+        tab->scroll = std::min(tab->scroll + (after - std::min(before, after)), after);
     }
-    Refresh();
+    if (tab == Tab()) {
+        Refresh();
+    }
 }
 
-void ChatWindow::OnTermExit(DWORD code) {
-    termExited_ = true;
-    if (term_) {
-        term_->Feed("\r\n\x1b[90m" + ToUtf8(std::format(L"[процесс завершён, код {}; любая клавиша запускает заново]", code)) +
-                    "\x1b[0m");
+void ChatWindow::OnTermExit(WPARAM id, DWORD code) {
+    TermTab* tab = TabById(id);
+    if (tab == nullptr) {
+        return;
+    }
+    tab->exited = true;
+    if (tab->screen) {
+        tab->screen->Feed("\r\n\x1b[90m" +
+                          ToUtf8(std::format(L"[процесс завершён, код {}; любая клавиша запускает заново]", code)) + "\x1b[0m");
     }
     Refresh();
 }
 
 void ChatWindow::TermSend(std::string_view bytes) {
-    pty_.Write(bytes);
-    termScroll_ = 0;
+    TermTab* tab = Tab();
+    if (tab == nullptr || !tab->pty) {
+        return;
+    }
+    tab->pty->Write(bytes);
+    tab->scroll = 0;
     selAnchor_.reset();
     selEnd_.reset();
     Refresh();
@@ -2525,8 +2798,11 @@ void ChatWindow::OnTermChar(wchar_t c) {
         termSwallowChar_ = false;
         return;
     }
-    if (termExited_) {
-        StartTerminal();
+    if (Tab() == nullptr) {
+        return;
+    }
+    if (Tab()->exited) {
+        StartShell(*Tab());
         return;
     }
     if (c >= 0xd800 && c <= 0xdbff) {
@@ -2551,9 +2827,12 @@ void ChatWindow::OnTermChar(wchar_t c) {
 }
 
 void ChatWindow::OnTermKey(WPARAM key) {
-    if (termExited_) {
+    if (Tab() == nullptr) {
+        return;
+    }
+    if (Tab()->exited) {
         if (key != VK_SHIFT && key != VK_CONTROL && key != VK_MENU) {
-            StartTerminal();
+            StartShell(*Tab());
             termSwallowChar_ = true;
         }
         return;
@@ -2576,7 +2855,7 @@ void ChatWindow::OnTermKey(WPARAM key) {
         return;
     }
     if (shift && (key == VK_PRIOR || key == VK_NEXT)) {
-        ScrollTerminal((key == VK_PRIOR ? 1 : -1) * std::max(1, term_ ? term_->Rows() - 1 : 1));
+        ScrollTerminal((key == VK_PRIOR ? 1 : -1) * std::max(1, Screen() ? Screen()->Rows() - 1 : 1));
         return;
     }
     if (key == VK_TAB && shift) {
@@ -2587,7 +2866,7 @@ void ChatWindow::OnTermKey(WPARAM key) {
     const int modifier = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (control ? 4 : 0);
     const auto arrow = [&](char final) {
         if (modifier == 1) {
-            return std::string(term_ && term_->AppCursorKeys() ? "\x1bO" : "\x1b[") + final;
+            return std::string(Screen() && Screen()->AppCursorKeys() ? "\x1bO" : "\x1b[") + final;
         }
         return "\x1b[1;" + std::to_string(modifier) + final;
     };
@@ -2653,7 +2932,7 @@ void ChatWindow::OnTermKey(WPARAM key) {
 }
 
 void ChatWindow::PasteToTerminal() {
-    if (!term_ || termExited_) {
+    if (!Screen() || Tab()->exited) {
         return;
     }
     std::wstring text = ClipboardText(hwnd_);
@@ -2670,7 +2949,7 @@ void ChatWindow::PasteToTerminal() {
         }
     }
     std::string bytes = ToUtf8(flat);
-    if (term_->BracketedPaste()) {
+    if (Screen()->BracketedPaste()) {
         bytes = "\x1b[200~" + bytes + "\x1b[201~";
     }
     TermSend(bytes);
@@ -2695,7 +2974,7 @@ bool ChatWindow::TermSelected(size_t line, int col) const {
 }
 
 void ChatWindow::CopyTermSelection() {
-    if (!term_ || !HasTermSelection()) {
+    if (!Screen() || !HasTermSelection()) {
         return;
     }
     TermPoint a = *selAnchor_;
@@ -2703,7 +2982,7 @@ void ChatWindow::CopyTermSelection() {
     if (a.line > b.line || (a.line == b.line && a.col > b.col)) {
         std::swap(a, b);
     }
-    if (SetClipboardText(hwnd_, term_->TextBetween(a.line, a.col, b.line, b.col + 1))) {
+    if (SetClipboardText(hwnd_, Screen()->TextBetween(a.line, a.col, b.line, b.col + 1))) {
         Flash(L"Скопировано");
     }
     selAnchor_.reset();
@@ -2713,31 +2992,31 @@ void ChatWindow::CopyTermSelection() {
 
 // The index of the line shown at the top of the screen area.
 size_t ChatWindow::TermFirstLine() const {
-    if (!term_) {
+    if (!Screen()) {
         return 0;
     }
-    const size_t rows = static_cast<size_t>(term_->Rows());
-    const size_t scroll = std::min(termScroll_, term_->ScrollbackSize());
-    return term_->LineCount() - rows - scroll;
+    const size_t rows = static_cast<size_t>(Screen()->Rows());
+    const size_t scroll = std::min(Tab()->scroll, Screen()->ScrollbackSize());
+    return Screen()->LineCount() - rows - scroll;
 }
 
 ChatWindow::TermPoint ChatWindow::TermCellAt(const Geometry& g, float x, float y) const {
     TermPoint point;
-    if (!term_) {
+    if (!Screen()) {
         return point;
     }
-    const int row = std::clamp(static_cast<int>(std::floor((y - g.termScreen.top) / cellH_)), 0, term_->Rows() - 1);
-    point.col = std::clamp(static_cast<int>(std::floor((x - g.termScreen.left) / cellW_)), 0, term_->Cols() - 1);
+    const int row = std::clamp(static_cast<int>(std::floor((y - g.termScreen.top) / cellH_)), 0, Screen()->Rows() - 1);
+    point.col = std::clamp(static_cast<int>(std::floor((x - g.termScreen.left) / cellW_)), 0, Screen()->Cols() - 1);
     point.line = TermFirstLine() + static_cast<size_t>(row);
     return point;
 }
 
 void ChatWindow::ScrollTerminal(long long lines) {
-    if (!term_) {
+    if (!Screen()) {
         return;
     }
-    const long long most = static_cast<long long>(term_->ScrollbackSize());
-    termScroll_ = static_cast<size_t>(std::clamp(static_cast<long long>(termScroll_) + lines, 0LL, most));
+    const long long most = static_cast<long long>(Screen()->ScrollbackSize());
+    Tab()->scroll = static_cast<size_t>(std::clamp(static_cast<long long>(Tab()->scroll) + lines, 0LL, most));
     Refresh();
 }
 
@@ -2747,8 +3026,33 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
     }
     Fill(g.term, 0.f, kPanel);
     Line({g.term.left, g.term.top}, {g.term.left, g.term.bottom}, kLine, 1.f);
-    Text(L"Терминал", uiBold_.get(),
-         D2D1::RectF(g.term.left + 14, g.term.top + 8, g.termClose.left - 8, g.term.top + 36), kPrimary);
+    for (size_t i = 0; i < tabs_.size() && i < g.termTabs.size(); ++i) {  // the tabs, as in Claude's app
+        const D2D1_RECT_F& r = g.termTabs[i];
+        const bool active = i == activeTab_;
+        const bool hovered = (hover_.target == Target::TermTab || hover_.target == Target::TermTabClose) && hover_.row == i;
+        if (active || hovered) {
+            Fill(r, 6.f, active ? kRaised : kCard);
+        }
+        Text(TabLabel(*tabs_[i]), ui_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 22, r.bottom),
+             active ? kPrimary : kSecondary);
+        if (active || hovered) {
+            const D2D1_RECT_F x = TabCloseRect(r);
+            const D2D1_POINT_2F c{(x.left + x.right) / 2, (x.top + x.bottom) / 2};
+            const uint32_t color = hover_.target == Target::TermTabClose && hover_.row == i ? kPrimary : kSecondary;
+            Line({c.x - 3.5f, c.y - 3.5f}, {c.x + 3.5f, c.y + 3.5f}, color, 1.3f);
+            Line({c.x - 3.5f, c.y + 3.5f}, {c.x + 3.5f, c.y - 3.5f}, color, 1.3f);
+        }
+    }
+    {  // "+"
+        const bool active = hover_.target == Target::TermAdd;
+        if (active) {
+            Fill(g.termAdd, 6.f, kRaised);
+        }
+        const D2D1_POINT_2F c{(g.termAdd.left + g.termAdd.right) / 2, (g.termAdd.top + g.termAdd.bottom) / 2};
+        const uint32_t color = active ? kPrimary : kSecondary;
+        Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
+        Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
+    }
     {  // a cross
         const bool active = hover_.target == Target::TermClose;
         if (active) {
@@ -2759,18 +3063,18 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.5f);
         Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.5f);
     }
-    if (!term_) {
+    if (!Screen()) {
         return;
     }
 
     target_->PushAxisAlignedClip(D2D1::RectF(g.term.left + 1, g.termScreen.top, g.term.right, g.term.bottom - 4),
                                  D2D1_ANTIALIAS_MODE_ALIASED);
-    const int cols = term_->Cols();
-    const int rows = term_->Rows();
+    const int cols = Screen()->Cols();
+    const int rows = Screen()->Rows();
     const size_t first = TermFirstLine();
     for (int r = 0; r < rows; ++r) {
         const size_t index = first + static_cast<size_t>(r);
-        const VtLine& line = term_->Line(index);
+        const VtLine& line = Screen()->Line(index);
         const float y = g.termScreen.top + static_cast<float>(r) * cellH_;
         const auto colors = [&](const VtCell& cell, size_t col, uint32_t& fg, uint32_t& bg, bool& hasBg) {
             fg = cell.fg == kVtDefault ? kTermFg : cell.fg;
@@ -2868,11 +3172,11 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         flush();
     }
 
-    if (term_->CursorVisible() && termScroll_ == 0 && !termExited_) {  // a block while typing goes here, an outline otherwise
-        const D2D1_RECT_F block = D2D1::RectF(g.termScreen.left + static_cast<float>(term_->CursorCol()) * cellW_,
-                                              g.termScreen.top + static_cast<float>(term_->CursorRow()) * cellH_,
-                                              g.termScreen.left + static_cast<float>(term_->CursorCol() + 1) * cellW_,
-                                              g.termScreen.top + static_cast<float>(term_->CursorRow() + 1) * cellH_);
+    if (Screen()->CursorVisible() && Tab()->scroll == 0 && !Tab()->exited) {  // a block while typing goes here, an outline otherwise
+        const D2D1_RECT_F block = D2D1::RectF(g.termScreen.left + static_cast<float>(Screen()->CursorCol()) * cellW_,
+                                              g.termScreen.top + static_cast<float>(Screen()->CursorRow()) * cellH_,
+                                              g.termScreen.left + static_cast<float>(Screen()->CursorCol() + 1) * cellW_,
+                                              g.termScreen.top + static_cast<float>(Screen()->CursorRow() + 1) * cellH_);
         if (termFocus_) {
             Fill(block, 0.f, kTermFg, 0.55f);
         } else {
@@ -2880,9 +3184,9 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
             target_->DrawRectangle(block, brush_.get(), 1.f);
         }
     }
-    if (term_->ScrollbackSize() > 0) {  // where the view is within the scrollback
+    if (Screen()->ScrollbackSize() > 0) {  // where the view is within the scrollback
         const float track = g.termScreen.bottom - g.termScreen.top;
-        const float total = static_cast<float>(term_->LineCount());
+        const float total = static_cast<float>(Screen()->LineCount());
         const float thumb = std::max(20.f, track * static_cast<float>(rows) / total);
         const float shown = static_cast<float>(first) / std::max(1.f, total - static_cast<float>(rows));
         const float top = g.termScreen.top + (track - thumb) * std::clamp(shown, 0.f, 1.f);
@@ -3090,6 +3394,116 @@ void ChatWindow::PaintSignIn(const Geometry& g) {
         const float top = (loginWaiting_ && !loginUrl_.empty() ? g.signAlt.bottom : g.signIn.bottom) + 12;
         Text(authNote_, notice_.get(), D2D1::RectF(g.left, top, g.left + g.column, top + 40), kDanger);
     }
+}
+
+// ---- Selecting text in the feed ---------------------------------------------------------------------
+
+// Where an item's text layout is drawn (as PaintFeed and PaintApproval place it).
+D2D1_POINT_2F ChatWindow::ItemOrigin(const Geometry& g, const FeedItem& item) const {
+    switch (item.kind) {
+    case Kind::User:
+        return {g.left + g.column - (item.textWidth + 2 * kBubblePad) + kBubblePad, item.top + kBubblePad};
+    case Kind::Approval:
+        return {g.left + kCardPad, item.top + kCardPad + kCardTitle + 4.f};
+    default:
+        return {g.left, item.top};
+    }
+}
+
+// The text position under a point; above an item it is the item's start, below the last one its end.
+std::optional<ChatWindow::FeedPoint> ChatWindow::FeedPointAt(const Geometry& g, float x, float y) const {
+    std::optional<FeedPoint> found;
+    for (size_t i = 0; i < feed_.size(); ++i) {
+        const FeedItem& item = feed_[i];
+        if (!item.layout || (item.kind == Kind::Notice && !HasConversation())) {
+            continue;
+        }
+        if (y < item.top) {
+            return found ? found : FeedPoint{i, 0};
+        }
+        if (y < item.top + item.height) {
+            const D2D1_POINT_2F origin = ItemOrigin(g, item);
+            BOOL trailing = FALSE;
+            BOOL inside = FALSE;
+            DWRITE_HIT_TEST_METRICS metrics{};
+            item.layout->HitTestPoint(x - origin.x, y - origin.y, &trailing, &inside, &metrics);
+            const UINT32 position = metrics.textPosition + (trailing ? metrics.length : 0);
+            return FeedPoint{i, std::min<UINT32>(position, static_cast<UINT32>(item.shown.size()))};
+        }
+        found = FeedPoint{i, static_cast<UINT32>(item.shown.size())};  // past this one: its end, unless another follows
+    }
+    return found;
+}
+
+bool ChatWindow::HasFeedSelection() const {
+    return feedAnchor_ && feedFocus_ && (feedAnchor_->item != feedFocus_->item || feedAnchor_->pos != feedFocus_->pos);
+}
+
+// The selected part of item `index`, as [from, to) in its layout's text; false when none of it is selected.
+bool ChatWindow::FeedSelectionIn(size_t index, UINT32& from, UINT32& to) const {
+    if (!HasFeedSelection() || index >= feed_.size()) {
+        return false;
+    }
+    FeedPoint a = *feedAnchor_;
+    FeedPoint b = *feedFocus_;
+    if (a.item > b.item || (a.item == b.item && a.pos > b.pos)) {
+        std::swap(a, b);
+    }
+    if (index < a.item || index > b.item) {
+        return false;
+    }
+    const auto size = static_cast<UINT32>(feed_[index].shown.size());
+    from = index == a.item ? std::min(a.pos, size) : 0;
+    to = index == b.item ? std::min(b.pos, size) : size;
+    return to > from;
+}
+
+void ChatWindow::PaintFeedSelection(size_t index, D2D1_POINT_2F origin) {
+    UINT32 from = 0;
+    UINT32 to = 0;
+    if (!FeedSelectionIn(index, from, to) || !feed_[index].layout) {
+        return;
+    }
+    IDWriteTextLayout* layout = feed_[index].layout.get();
+    UINT32 count = 0;
+    layout->HitTestTextRange(from, to - from, 0, 0, nullptr, 0, &count);
+    std::vector<DWRITE_HIT_TEST_METRICS> boxes(count);
+    if (count == 0 || FAILED(layout->HitTestTextRange(from, to - from, 0, 0, boxes.data(), count, &count))) {
+        return;
+    }
+    for (const DWRITE_HIT_TEST_METRICS& box : boxes) {
+        Fill(D2D1::RectF(origin.x + box.left, origin.y + box.top, origin.x + box.left + std::max(box.width, 4.f),
+                         origin.y + box.top + box.height),
+             0.f, kAccent, 0.38f);
+    }
+}
+
+std::wstring ChatWindow::FeedSelectionText() const {
+    std::wstring text;
+    for (size_t i = 0; i < feed_.size(); ++i) {
+        UINT32 from = 0;
+        UINT32 to = 0;
+        if (FeedSelectionIn(i, from, to)) {
+            text += (text.empty() ? L"" : L"\n\n") + feed_[i].shown.substr(from, to - from);
+        }
+    }
+    return text;
+}
+
+bool ChatWindow::CopyFeedSelection() {
+    if (!HasFeedSelection()) {
+        return false;
+    }
+    if (SetClipboardText(hwnd_, FeedSelectionText())) {
+        Flash(L"Скопировано");
+    }
+    return true;
+}
+
+void ChatWindow::ClearFeedSelection() {
+    feedAnchor_.reset();
+    feedFocus_.reset();
+    feedSelecting_ = false;
 }
 
 void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {
@@ -3406,22 +3820,10 @@ void ChatWindow::CopyItemAt(float y) {
         if (y < item.top || y >= item.top + item.height || item.text.empty()) {
             continue;
         }
-        if (!OpenClipboard(hwnd_)) {
+        // A tool's card copies with its whole output, not the shortened one it shows.
+        if (!SetClipboardText(hwnd_, item.output.empty() ? item.text : item.text + L"\n\n" + item.output)) {
             return;
         }
-        EmptyClipboard();
-        const size_t bytes = (item.text.size() + 1) * sizeof(wchar_t);
-        if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes); memory != nullptr) {
-            void* data = GlobalLock(memory);
-            if (data != nullptr) {
-                std::memcpy(data, item.text.c_str(), bytes);
-                GlobalUnlock(memory);
-            }
-            if (data == nullptr || SetClipboardData(CF_UNICODETEXT, memory) == nullptr) {
-                GlobalFree(memory);
-            }
-        }
-        CloseClipboard();
         Flash(L"скопировано");
         return;
     }
@@ -3614,6 +4016,14 @@ void ChatWindow::ShowInputMenu(POINT screen) {
 }
 
 void ChatWindow::ShowCopyMenu(POINT screen, float y) {
+    if (HasFeedSelection()) {
+        wil::unique_hmenu menu(CreatePopupMenu());
+        AppendMenuW(menu.get(), MF_STRING, 1, L"Копировать выделенное\tCtrl+C");
+        if (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr) == 1) {
+            CopyFeedSelection();
+        }
+        return;
+    }
     const bool onMessage = std::ranges::any_of(feed_, [y](const FeedItem& item) {
         return y >= item.top && y < item.top + item.height && !item.text.empty();
     });
@@ -3898,6 +4308,7 @@ void ChatWindow::ResetChat() {
     currentMessageId_.clear();
     streamed_.clear();
     feed_.clear();
+    ClearFeedSelection();
     scroll_ = 0;
     stick_ = true;
 }
@@ -3993,7 +4404,21 @@ void ChatWindow::OnClaude(const Json& message) {
                 }
             }
         }
+    } else if (type == "user") {  // the CLI's echo of tool results
+        const Json& content = JsonAt(JsonAt(message, "message"), "content");
+        if (content.is_array()) {
+            for (const Json& block : content) {
+                if (JsonStr(block, "type") == "tool_result") {
+                    OnToolResult(block);
+                }
+            }
+        }
     } else if (type == "result") {
+        for (FeedItem& item : feed_) {  // a turn that ended (or was stopped) leaves no call "running"
+            if (item.kind == Kind::Approval && item.verdict == Verdict::Allowed && !item.done) {
+                item.done = true;
+            }
+        }
         if (!stateEvents_) {
             busy_ = false;
         }
@@ -4077,9 +4502,38 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     item.title = std::move(summary.title);
     item.text = std::move(summary.detail);
     item.requestId = requestId;
+    item.toolUseId = JsonStr(request, "tool_use_id");
     item.input = input;
     feed_.push_back(std::move(item));
     stick_ = true;
+}
+
+// A tool's result, as the CLI echoes it back: the card of that call shows it.
+void ChatWindow::OnToolResult(const Json& block) {
+    const std::string id = JsonStr(block, "tool_use_id");
+    for (FeedItem& item : feed_) {
+        if (item.kind != Kind::Approval || item.toolUseId.empty() || item.toolUseId != id) {
+            continue;
+        }
+        const Json& content = JsonAt(block, "content");
+        std::wstring text;
+        if (content.is_string()) {
+            text = ToWide(content.get<std::string>());
+        } else if (content.is_array()) {
+            for (const Json& part : content) {
+                if (JsonStr(part, "type") == "text") {
+                    text += (text.empty() ? L"" : L"\n") + ToWide(JsonStr(part, "text"));
+                }
+            }
+        }
+        const size_t end = text.find_last_not_of(L" \t\r\n");
+        text.resize(end == std::wstring::npos ? 0 : end + 1);
+        item.output = std::move(text);
+        item.outputError = JsonAt(block, "is_error").is_boolean() && JsonAt(block, "is_error").get<bool>();
+        item.done = true;
+        item.layout.reset();
+        return;
+    }
 }
 
 void ChatWindow::Decide(size_t index, bool allow) {

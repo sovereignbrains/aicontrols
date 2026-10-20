@@ -57,6 +57,10 @@ target_link_libraries(aic_pty_test PRIVATE aic_core)
 add_executable(aic_auth_test tests/auth_test.cpp)
 target_link_libraries(aic_auth_test PRIVATE aic_core)
 
+# By hand: the titles of the real chats.
+add_executable(aic_store_probe tests/store_probe.cpp)
+target_link_libraries(aic_store_probe PRIVATE aic_core)
+
 # By hand, spends a request: the real claude.exe calling our tools (see the file's header).
 add_executable(aic_e2e_probe tests/e2e_probe.cpp)
 target_link_libraries(aic_e2e_probe PRIVATE aic_core)

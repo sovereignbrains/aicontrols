@@ -70,6 +70,35 @@ void ForEachLine(std::string_view text, Fn&& fn) {
     }
 }
 
+std::wstring TextOf(const Json& content);
+
+// A chat the CLI never titled is named after its first message: its first line, shortened.
+std::wstring FirstPrompt(std::string_view text) {
+    std::wstring found;
+    ForEachLine(text, [&](std::string_view line) {
+        if (!found.empty() || line.find("\"type\":\"user\"") == std::string_view::npos) {
+            return;
+        }
+        const Json entry = Json::parse(line, nullptr, false);
+        if (JsonStr(entry, "type") != "user" || (JsonAt(entry, "isMeta").is_boolean() && JsonAt(entry, "isMeta").get<bool>())) {
+            return;
+        }
+        std::wstring prompt = TextOf(JsonAt(JsonAt(entry, "message"), "content"));
+        const size_t first = prompt.find_first_not_of(L" \t\r\n");
+        if (first == std::wstring::npos || prompt[first] == L'<') {  // tool results, command and system insertions
+            return;
+        }
+        prompt = prompt.substr(first);
+        prompt = prompt.substr(0, prompt.find_first_of(L"\r\n"));
+        constexpr size_t kLongest = 70;
+        if (prompt.size() > kLongest) {
+            prompt = prompt.substr(0, kLongest) + L"…";
+        }
+        found = std::move(prompt);
+    });
+    return found;
+}
+
 void ScanTitles(std::string_view text, std::wstring& custom, std::wstring& generated) {
     ForEachLine(text, [&](std::string_view line) {
         if (line.find("\"custom-title\"") == std::string_view::npos &&
@@ -92,13 +121,17 @@ std::wstring ReadTitle(const fs::path& file, uint64_t size) {
     constexpr uint64_t kChunk = 512 * 1024;
     std::wstring custom;
     std::wstring generated;
+    const std::string head = ReadRange(file, 0, std::min(size, 2 * kChunk));
     if (size <= 2 * kChunk) {
-        ScanTitles(ReadRange(file, 0, size), custom, generated);
+        ScanTitles(head, custom, generated);
     } else {
-        ScanTitles(ReadRange(file, 0, kChunk), custom, generated);
+        ScanTitles(std::string_view(head).substr(0, kChunk), custom, generated);
         ScanTitles(ReadRange(file, size - kChunk, kChunk), custom, generated);
     }
-    return !custom.empty() ? custom : generated;
+    if (!custom.empty()) {
+        return custom;
+    }
+    return !generated.empty() ? generated : FirstPrompt(head);
 }
 
 uint64_t ToTicks(const FILETIME& time) {

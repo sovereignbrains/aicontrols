@@ -57,6 +57,7 @@ public:
     bool BracketedPaste() const { return bracketedPaste_; }
     bool AltScreen() const { return alt_; }
     const std::wstring& Title() const { return title_; }
+    void ClearScrollback() { scrollback_.clear(); }  // the lines above the screen; the screen stays
 
     // The text between two points (line index, column), the end exclusive; rows joined by \n, trailing blanks cut.
     std::wstring TextBetween(size_t fromLine, int fromCol, size_t toLine, int toCol) const;

@@ -99,6 +99,7 @@ struct CloneDone {
     std::string output;
 };
 constexpr UINT_PTR kStatusTimer = 1;
+constexpr UINT_PTR kTipTimer = 2;  // the pointer has rested on something long enough for its hint
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
 
@@ -541,6 +542,31 @@ private:
     D2D1_POINT_2F ItemOrigin(const Geometry& g, const FeedItem& item) const;
     std::optional<FeedPoint> FeedPointAt(const Geometry& g, float x, float y) const;
     std::wstring LinkAt(const Geometry& g, float x, float y) const;
+    // The innermost markdown span with `flag` under a point of an answer (and its item), or null.
+    const MdSpan* MarkdownSpanAt(const Geometry& g, float x, float y, unsigned flag, const FeedItem** owner) const;
+
+    // Hints: what a button does, shown after the pointer rests on it (a link shows its address).
+    std::wstring TooltipText();
+    void UpdateTip();
+    void HideTip();
+    void PaintTooltip(const Geometry& g);
+
+    // Renaming in place (a terminal tab, a chat in the sidebar): the keys go to the field until Enter or Esc,
+    // a click elsewhere keeps what is typed.
+    enum class Rename { None, Tab, Chat };
+    void BeginRename(Rename what, size_t index);
+    void CommitRename();
+    void CancelRename();
+    void OnRenameKey(WPARAM key);
+    void OnRenameChar(wchar_t c);
+    void PaintRenameField(const D2D1_RECT_F& r);
+
+    // Right-click menus.
+    void ShowTabMenu(size_t index, POINT screen);
+    void ShowSecretMenu(size_t index, POINT screen);
+    void ShowAttachmentMenu(size_t index, POINT screen);
+    void ShowTitleMenu(POINT screen);
+    void ClearTerminalTab(size_t index);
     bool HasFeedSelection() const;
     bool FeedSelectionIn(size_t index, UINT32& from, UINT32& to) const;
     void PaintFeedSelection(size_t index, D2D1_POINT_2F origin);
@@ -593,6 +619,7 @@ private:
         std::unique_ptr<VtScreen> screen;
         std::unique_ptr<Pty> pty;  // its threads end (in its destructor) before the screen goes
         WPARAM id = 0;
+        std::wstring name;         // given by the user; empty: the numbered default
         int number = 1;            // "Терминал 1", "Терминал 2" ...
         bool exited = false;
         size_t scroll = 0;         // lines scrolled back from the bottom
@@ -681,7 +708,7 @@ private:
     void AttachClipboardImage();
     void PasteClipboard();
     void ShowInputMenu(POINT screen);
-    void ShowCopyMenu(POINT screen, float y);
+    void ShowCopyMenu(POINT screen, D2D1_POINT_2F at);
     void ShowChatMenu(size_t filteredIndex, POINT screen);
     void Attached();
 
@@ -811,6 +838,13 @@ private:
     size_t firstRow_ = 0;
     size_t secretsFirst_ = 0;  // the first secret shown when they do not all fit
     float wheelRemainder_ = 0;  // wheel movement not yet worth a whole row
+    std::wstring tipText_;      // the hint for what is under the pointer ("" for nothing)
+    bool tipShown_ = false;
+    D2D1_POINT_2F tipAt_{};     // where the pointer was when it appeared
+    Rename renaming_ = Rename::None;
+    WPARAM renameTab_ = 0;      // the tab's id
+    std::string renameChat_;    // the chat's session id
+    std::wstring renameText_;
     D2D1_POINT_2F mouse_{-1.f, -1.f};  // the pointer in DIPs; off the window after it leaves
     size_t selected_ = 0;
     // Models: indexes into models_.
@@ -1222,11 +1256,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             Refresh();
         }
+        UpdateTip();
         return 0;
     }
     case WM_MOUSELEAVE:
         trackingMouse_ = false;
         mouse_ = {-1.f, -1.f};
+        HideTip();
+        tipText_.clear();
         hover_ = {};
         Refresh();
         return 0;
@@ -1254,6 +1291,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         break;
     case WM_LBUTTONDOWN: {
         const D2D1_POINT_2F at = CursorDip(lParam);
+        HideTip();
+        if (renaming_ != Rename::None) {  // a click elsewhere keeps what was typed
+            CommitRename();
+        }
         if (const Target target = HitTest(at.x, at.y).target;
             popup_ == Popup::None && (target == Target::SplitSidebar || target == Target::SplitTerminal)) {
             dragging_ = target;
@@ -1339,6 +1380,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_MOUSEWHEEL: {
+        HideTip();
         POINT at{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(hwnd_, &at);
         const float steps = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
@@ -1380,22 +1422,54 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (popup_ == Popup::None) {
+            HideTip();
+            if (renaming_ != Rename::None) {
+                CommitRename();
+            }
             const D2D1_POINT_2F at = CursorDip(lParam);
             POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ClientToScreen(hwnd_, &screen);
-            if (const Hit hit = HitTest(at.x, at.y); hit.target == Target::HistoryRow) {
+            const Geometry g = Layout();
+            switch (const Hit hit = HitTest(at.x, at.y); hit.target) {
+            case Target::HistoryRow:
                 ShowChatMenu(hit.row, screen);
                 return 0;
+            case Target::TermTab:
+            case Target::TermTabClose:
+                ShowTabMenu(hit.row, screen);
+                return 0;
+            case Target::SecretRow:
+            case Target::SecretDelete:
+                ShowSecretMenu(hit.row, screen);
+                return 0;
+            case Target::AttachmentChip:
+            case Target::RemoveAttachment:
+                ShowAttachmentMenu(hit.row, screen);
+                return 0;
+            case Target::Account:
+                ShowAccountMenu();
+                return 0;
+            case Target::None:
+                break;
+            default:
+                return 0;  // a button: its left click is what it does
             }
-            if (Inside(Layout().box, at.x, at.y)) {
+            if (at.y < kHeader && at.x > g.areaLeft && at.x < g.terminalBtn.left) {
+                ShowTitleMenu(screen);  // the chat's title
+            } else if (!secretsOpen_ && Inside(g.sidebar, at.x, at.y)) {
+                ShowTitleMenu(screen);  // the empty part of the chats' list: the same "new chat"
+            } else if (Inside(g.box, at.x, at.y)) {
                 ShowInputMenu(screen);  // the padding of the input card
             } else {
-                ShowCopyMenu(screen, at.y);
+                ShowCopyMenu(screen, at);
             }
         }
         return 0;
     case WM_KEYDOWN:
-        if (popup_ != Popup::None) {
+        HideTip();
+        if (renaming_ != Rename::None) {
+            OnRenameKey(wParam);
+        } else if (popup_ != Popup::None) {
             OnPopupKey(wParam);
         } else if (searchFocus_) {
             OnSearchKey(wParam);
@@ -1404,7 +1478,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_CHAR:
-        if (popup_ != Popup::None) {
+        if (renaming_ != Rename::None) {
+            OnRenameChar(static_cast<wchar_t>(wParam));
+        } else if (popup_ != Popup::None) {
             OnPopupChar(static_cast<wchar_t>(wParam));
         } else if (searchFocus_) {
             OnSearchChar(static_cast<wchar_t>(wParam));
@@ -1419,7 +1495,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_SETFOCUS:
-        if (popup_ == Popup::None && !searchFocus_ && !termFocus_) {  // with a panel open, the search or the shell active the keys stay here
+        if (popup_ == Popup::None && !searchFocus_ && !termFocus_ && renaming_ == Rename::None) {  // with a panel open, the search or the shell active the keys stay here
             SetFocus(input_);
         }
         return 0;
@@ -1428,6 +1504,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd_, kStatusTimer);
             status_.clear();
             Refresh();
+        } else if (wParam == kTipTimer) {
+            KillTimer(hwnd_, kTipTimer);
+            if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
+                !selecting_) {
+                tipShown_ = true;
+                tipAt_ = mouse_;
+                Refresh();
+            }
         }
         return 0;
     case WM_COMMAND:
@@ -2311,6 +2395,7 @@ void ChatWindow::Paint() {
     case Popup::None:
         break;
     }
+    PaintTooltip(g);
     if (target_->EndDraw() == D2DERR_RECREATE_TARGET) {
         target_.reset();
         brush_.reset();
@@ -3107,6 +3192,9 @@ void ChatWindow::TerminalGrid(int& cols, int& rows) const {
 }
 
 std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
+    if (!tab.name.empty()) {
+        return tab.name;
+    }
     return std::format(L"Терминал {}", tab.number);
 }
 
@@ -3515,6 +3603,10 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         const D2D1_RECT_F& r = g.termTabs[i];
         const bool active = i == activeTab_;
         const bool hovered = (hover_.target == Target::TermTab || hover_.target == Target::TermTabClose) && hover_.row == i;
+        if (renaming_ == Rename::Tab && tabs_[i]->id == renameTab_) {
+            PaintRenameField(r);
+            continue;
+        }
         if (active || hovered) {
             Fill(r, 6.f, active ? kRaised : kCard);
         }
@@ -4102,8 +4194,14 @@ std::optional<ChatWindow::FeedPoint> ChatWindow::FeedPointAt(const Geometry& g, 
 
 // The address of the link right under a point (the innermost one), or empty.
 std::wstring ChatWindow::LinkAt(const Geometry& g, float x, float y) const {
+    const MdSpan* link = MarkdownSpanAt(g, x, y, kMdLink, nullptr);
+    return link != nullptr ? link->url : std::wstring();
+}
+
+const MdSpan* ChatWindow::MarkdownSpanAt(const Geometry& g, float x, float y, unsigned flag,
+                                         const FeedItem** owner) const {
     if (!Inside(g.feed, x, y)) {
-        return {};
+        return nullptr;
     }
     for (const FeedItem& item : feed_) {
         if (item.kind != Kind::Assistant || !item.layout || y < item.top || y >= item.top + item.height) {
@@ -4114,19 +4212,24 @@ std::wstring ChatWindow::LinkAt(const Geometry& g, float x, float y) const {
         BOOL inside = FALSE;
         DWRITE_HIT_TEST_METRICS metrics{};
         item.layout->HitTestPoint(x - origin.x, y - origin.y, &trailing, &inside, &metrics);
-        if (!inside) {
-            return {};
+        // A link has to be under the pointer itself; a code block counts anywhere on its lines (its panel).
+        if (!inside && flag != kMdCode) {
+            return nullptr;
         }
         const MdSpan* best = nullptr;
         for (const MdSpan& span : item.spans) {
-            if ((span.flags & kMdLink) != 0 && !span.url.empty() && metrics.textPosition >= span.start &&
-                metrics.textPosition < span.start + span.length && (!best || span.length < best->length)) {
+            if ((span.flags & flag) != 0 && (flag != kMdLink || !span.url.empty()) &&
+                metrics.textPosition >= span.start && metrics.textPosition < span.start + span.length &&
+                (!best || span.length < best->length)) {
                 best = &span;
             }
         }
-        return best ? best->url : std::wstring();
+        if (best != nullptr && owner != nullptr) {
+            *owner = &item;
+        }
+        return best;
     }
-    return {};
+    return nullptr;
 }
 
 bool ChatWindow::HasFeedSelection() const {
@@ -4517,6 +4620,10 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         const SessionInfo& session = sessions_[filtered_[row]];
         const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
         const D2D1_RECT_F r = D2D1::RectF(g.sidebar.left + 6, top, g.sidebar.right - 6, top + kHistoryRow);
+        if (renaming_ == Rename::Chat && session.id == renameChat_) {
+            PaintRenameField(r);
+            continue;
+        }
         const bool hovered = hover_.target == Target::HistoryRow && hover_.row == row;
         if (hovered || (searchFocus_ && row == selected_)) {
             Fill(r, 8.f, kRaised);
@@ -4927,7 +5034,12 @@ void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
     AppendMenuW(menu.get(), MF_STRING, 1, L"Открыть");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 2, L"Удалить чат");
+    InsertMenuW(menu.get(), 1, MF_BYPOSITION | MF_STRING, 3, L"Переименовать");
     const auto chosen = TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr);
+    if (chosen == 3) {
+        BeginRename(Rename::Chat, filteredIndex);
+        return;
+    }
     if (chosen == 1) {
         OpenSession(filteredIndex);
         SetFocus(input_);
@@ -4958,25 +5070,443 @@ void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
     Refresh();
 }
 
-void ChatWindow::ShowCopyMenu(POINT screen, float y) {
-    if (HasFeedSelection()) {
-        wil::unique_hmenu menu(CreatePopupMenu());
-        AppendMenuW(menu.get(), MF_STRING, 1, L"Копировать выделенное\tCtrl+C");
-        if (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr) == 1) {
-            CopyFeedSelection();
-        }
-        return;
-    }
+// The feed's menu: what is under the pointer can be taken: a selection, a link, a code block or table,
+// the whole message.
+void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
+    constexpr UINT kSelection = 1, kOpenLink = 2, kCopyLink = 3, kCopyCode = 4, kCopyMessage = 5;
+    const Geometry g = Layout();
+    const float y = at.y;
+    const FeedItem* codeOwner = nullptr;
+    const MdSpan* link = MarkdownSpanAt(g, at.x, at.y, kMdLink, nullptr);
+    const MdSpan* code = MarkdownSpanAt(g, at.x, at.y, kMdCode, &codeOwner);
     const bool onMessage = std::ranges::any_of(feed_, [y](const FeedItem& item) {
         return y >= item.top && y < item.top + item.height && !item.text.empty();
     });
-    if (!onMessage) {
+    wil::unique_hmenu menu(CreatePopupMenu());
+    const auto separate = [&] {
+        if (GetMenuItemCount(menu.get()) > 0) {
+            AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+        }
+    };
+    if (HasFeedSelection()) {
+        AppendMenuW(menu.get(), MF_STRING, kSelection, L"Копировать выделенное\tCtrl+C");
+    }
+    if (link != nullptr && !link->url.empty()) {
+        separate();
+        AppendMenuW(menu.get(), MF_STRING, kOpenLink, L"Открыть ссылку");
+        AppendMenuW(menu.get(), MF_STRING, kCopyLink, L"Копировать ссылку");
+    }
+    if (code != nullptr && codeOwner != nullptr) {
+        separate();
+        AppendMenuW(menu.get(), MF_STRING, kCopyCode,
+                    (code->flags & kMdTable) != 0 ? L"Копировать таблицу" : L"Копировать код");
+    }
+    if (onMessage) {
+        separate();
+        AppendMenuW(menu.get(), MF_STRING, kCopyMessage, L"Копировать сообщение");
+    }
+    if (GetMenuItemCount(menu.get()) == 0) {
+        return;
+    }
+    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    case kSelection:
+        CopyFeedSelection();
+        break;
+    case kOpenLink:
+        if (link != nullptr && (link->url.starts_with(L"http://") || link->url.starts_with(L"https://") ||
+                                link->url.starts_with(L"mailto:"))) {
+            ShellExecuteW(hwnd_, L"open", link->url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        break;
+    case kCopyLink:
+        if (link != nullptr && SetClipboardText(hwnd_, link->url)) {
+            Flash(L"Ссылка скопирована");
+        }
+        break;
+    case kCopyCode:
+        if (code != nullptr && codeOwner != nullptr && SetClipboardText(hwnd_, codeOwner->shown.substr(code->start, code->length))) {
+            Flash((code->flags & kMdTable) != 0 ? L"Таблица скопирована" : L"Код скопирован");
+        }
+        break;
+    case kCopyMessage:
+        CopyItemAt(y);
+        break;
+    default:
+        break;
+    }
+}
+
+// ---- Hints -----------------------------------------------------------------------------------------
+
+std::wstring ChatWindow::TooltipText() {
+    switch (hover_.target) {
+    case Target::SidebarToggle:
+        return sidebarOpen_ ? L"Скрыть боковую панель" : L"Показать боковую панель";
+    case Target::TerminalToggle:
+        return terminalOpen_ ? L"Скрыть терминал" : L"Показать терминал";
+    case Target::WinMin:
+        return L"Свернуть";
+    case Target::WinMax:
+        return IsZoomed(hwnd_) ? L"Восстановить" : L"Развернуть";
+    case Target::WinClose:
+        return L"Закрыть";
+    case Target::SidebarSearch:
+        return L"Поиск по чатам (Ctrl+H)";
+    case Target::FolderChip:
+        return L"Папка чата: " + workspace_;
+    case Target::Account:
+        return ClaudeUpdateAvailable() ? L"Аккаунт · вышел Claude " + ToWide(claudeLatest_)
+                                       : std::wstring(L"Аккаунт, версия Claude, выход");
+    case Target::TermAdd:
+        return L"Новый терминал";
+    case Target::TermClose:
+        return L"Скрыть терминал";
+    case Target::TermTabClose:
+        return L"Закрыть вкладку";
+    case Target::TermTab:
+        return L"Правый клик: переименовать, очистить";
+    case Target::Attach:
+        return L"Прикрепить файлы или фото (Ctrl+U)";
+    case Target::AttachmentChip:
+        return hover_.row < attachments_.size() ? attachments_[hover_.row].name : std::wstring();
+    case Target::RemoveAttachment:
+        return L"Убрать";
+    case Target::ModelChip:
+        return L"Модель";
+    case Target::EffortChip:
+        return L"Усилие: насколько глубоко Claude думает";
+    case Target::UsageChip:
+        return L"Лимиты использования";
+    case Target::SecretsClose:
+        return L"Назад к чатам";
+    case Target::SecretEye:
+        return showValue_ ? L"Скрыть значение" : L"Показать значение";
+    case Target::SecretDelete:
+        return L"Удалить секрет";
+    case Target::EffortReset:
+        return L"Вернуть как было";
+    case Target::Send:
+        if (busy_ && !hasContent()) {
+            return L"Остановить ответ (Esc)";
+        }
+        return busy_ ? L"Отправить сейчас: Claude учтёт по ходу (Enter)" : L"Отправить (Enter)";
+    case Target::HistoryRow: {  // the whole title, when the row cuts it
+        if (hover_.row >= filtered_.size()) {
+            return {};
+        }
+        const SessionInfo& session = sessions_[filtered_[hover_.row]];
+        const Geometry g = Layout();
+        const float room = (g.sidebar.right - 14.f) - (g.sidebar.left + 16.f);
+        return !session.title.empty() && TextWidth(session.title, ui_.get()) > room ? session.title : std::wstring();
+    }
+    case Target::None: {  // a link: where it goes
+        std::wstring url = LinkAt(Layout(), mouse_.x, mouse_.y);
+        if (url.size() > 140) {
+            url = url.substr(0, 137) + L"…";
+        }
+        return url;
+    }
+    default:
+        return {};
+    }
+}
+
+void ChatWindow::UpdateTip() {
+    std::wstring text;
+    if (popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ && !selecting_ &&
+        renaming_ == Rename::None) {
+        text = TooltipText();
+    }
+    if (text == tipText_) {
+        return;
+    }
+    tipText_ = std::move(text);
+    KillTimer(hwnd_, kTipTimer);
+    if (tipShown_) {
+        tipShown_ = false;
+        Refresh();
+    }
+    if (!tipText_.empty()) {
+        SetTimer(hwnd_, kTipTimer, 600, nullptr);
+    }
+}
+
+// Gone until the pointer moves to something else (a click or a key does not bring it back on the same spot).
+void ChatWindow::HideTip() {
+    KillTimer(hwnd_, kTipTimer);
+    if (tipShown_) {
+        tipShown_ = false;
+        Refresh();
+    }
+}
+
+void ChatWindow::PaintTooltip(const Geometry& g) {
+    if (!tipShown_ || tipText_.empty() || popup_ != Popup::None) {
+        return;
+    }
+    constexpr float kTipHeight = 26.f;
+    const float width = std::min(TextWidth(tipText_, small_.get()) + 20.f, std::max(120.f, g.width - 16.f));
+    const float left = std::clamp(tipAt_.x - width / 2, 8.f, std::max(8.f, g.width - width - 8.f));
+    float top = tipAt_.y + 22.f;  // under the pointer, or above it at the window's bottom
+    if (top + kTipHeight > g.height - 6.f) {
+        top = tipAt_.y - kTipHeight - 10.f;
+    }
+    const D2D1_RECT_F r = D2D1::RectF(left, top, left + width, top + kTipHeight);
+    Fill(r, 6.f, kRaised);
+    brush_->SetColor(Color(kLine));
+    target_->DrawRoundedRectangle(D2D1::RoundedRect(r, 6.f, 6.f), brush_.get(), 1.f);
+    Text(tipText_, small_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 10, r.bottom), kPrimary);
+}
+
+// ---- Renaming in place --------------------------------------------------------------------------------
+
+void ChatWindow::BeginRename(Rename what, size_t index) {
+    if (what == Rename::Tab) {
+        if (index >= tabs_.size()) {
+            return;
+        }
+        renameTab_ = tabs_[index]->id;
+        renameText_ = TabLabel(*tabs_[index]);
+        SetTerminalOpen(true);
+    } else if (what == Rename::Chat) {
+        if (index >= filtered_.size()) {
+            return;
+        }
+        const SessionInfo& session = sessions_[filtered_[index]];
+        renameChat_ = session.id;
+        renameText_ = session.title;
+        if (secretsOpen_) {
+            SetSecretsOpen(false);
+        }
+        SetSidebarOpen(true);
+        const size_t rows = std::max<size_t>(1, SidebarRows(Layout()));  // the row in view
+        if (index < firstRow_) {
+            firstRow_ = index;
+        } else if (index >= firstRow_ + rows) {
+            firstRow_ = index + 1 - rows;
+        }
+    } else {
+        return;
+    }
+    renaming_ = what;
+    searchFocus_ = false;
+    termFocus_ = false;
+    HideTip();
+    SetFocus(hwnd_);
+    Refresh();
+}
+
+void ChatWindow::CommitRename() {
+    const Rename what = renaming_;
+    renaming_ = Rename::None;
+    std::wstring text = renameText_;
+    renameText_.clear();
+    const size_t first = text.find_first_not_of(L" \t");
+    text = first == std::wstring::npos ? L"" : text.substr(first, text.find_last_not_of(L" \t") - first + 1);
+    if (what == Rename::Tab) {
+        if (TermTab* tab = TabById(renameTab_)) {
+            tab->name.clear();  // empty, or the default label typed back: the numbered default
+            if (!text.empty() && text != TabLabel(*tab)) {
+                tab->name = text;
+            }
+        }
+    } else if (what == Rename::Chat && !text.empty()) {
+        if (RenameSession(workspace_, renameChat_, text)) {
+            if (renameChat_ == sessionId_) {
+                title_ = text;
+            }
+            RefreshSessions();
+        } else {
+            Flash(L"Не удалось переименовать чат", 3000);
+        }
+    }
+    SetFocus(input_);
+    Refresh();
+}
+
+void ChatWindow::CancelRename() {
+    renaming_ = Rename::None;
+    renameText_.clear();
+    SetFocus(input_);
+    Refresh();
+}
+
+void ChatWindow::OnRenameKey(WPARAM key) {
+    if (key == VK_RETURN) {
+        CommitRename();
+    } else if (key == VK_ESCAPE) {
+        CancelRename();
+    } else if (key == 'V' && (GetKeyState(VK_CONTROL) & 0x8000) != 0 && OpenClipboard(hwnd_)) {
+        if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+            if (const auto* text = static_cast<const wchar_t*>(GlobalLock(data))) {
+                std::wstring pasted(text);
+                GlobalUnlock(data);
+                pasted = pasted.substr(0, pasted.find_first_of(L"\r\n"));
+                renameText_ += pasted.substr(0, 100 - std::min<size_t>(100, renameText_.size()));
+            }
+        }
+        CloseClipboard();
+        Refresh();
+    }
+}
+
+void ChatWindow::OnRenameChar(wchar_t c) {
+    if (c == L'\b') {
+        if (!renameText_.empty()) {
+            renameText_.pop_back();
+        }
+    } else if (c == 0x7f) {  // Ctrl+Backspace
+        renameText_.clear();
+    } else if (c >= L' ' && renameText_.size() < 100) {
+        renameText_ += c;
+    } else {
+        return;
+    }
+    Refresh();
+}
+
+// The field drawn in place of a tab's or a chat's label: the end of the text stays in view, a still caret.
+void ChatWindow::PaintRenameField(const D2D1_RECT_F& r) {
+    Fill(r, 6.f, kWindow);
+    brush_->SetColor(Color(kAccent));
+    target_->DrawRoundedRectangle(D2D1::RoundedRect(r, 6.f, 6.f), brush_.get(), 1.f);
+    const float room = r.right - r.left - 20.f;
+    std::wstring shown = renameText_;
+    while (!shown.empty() && TextWidth(shown, ui_.get()) > room) {
+        shown.erase(0, 1);
+    }
+    Text(shown, ui_.get(), D2D1::RectF(r.left + 8, r.top, r.right - 8, r.bottom), kPrimary);
+    const float caret = r.left + 9.f + TextWidth(shown, ui_.get());
+    Line({caret, r.top + 7.f}, {caret, r.bottom - 7.f}, kAccent, 1.2f);
+}
+
+// ---- Right-click menus --------------------------------------------------------------------------------
+
+void ChatWindow::ShowTabMenu(size_t index, POINT screen) {
+    if (index >= tabs_.size()) {
+        return;
+    }
+    constexpr UINT kRename = 1, kClear = 2, kNew = 3, kClose = 4;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, kRename, L"Переименовать");
+    AppendMenuW(menu.get(), MF_STRING, kClear, L"Очистить");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый терминал");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kClose, L"Закрыть");
+    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    case kRename:
+        BeginRename(Rename::Tab, index);
+        break;
+    case kClear:
+        ClearTerminalTab(index);
+        break;
+    case kNew:
+        AddTerminalTab();
+        break;
+    case kClose:
+        CloseTerminalTab(index);
+        if (terminalOpen_) {
+            SelectTerminalTab(activeTab_);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+// As Windows Terminal's "clear": the scrollback goes, and the shell redraws its prompt at the top (Ctrl+L).
+void ChatWindow::ClearTerminalTab(size_t index) {
+    if (index >= tabs_.size()) {
+        return;
+    }
+    SelectTerminalTab(index);
+    TermTab& tab = *tabs_[index];
+    tab.scroll = 0;
+    if (tab.screen) {
+        tab.screen->ClearScrollback();
+    }
+    if (!tab.exited && tab.pty) {
+        TermSend("\x0c");
+    } else if (tab.screen) {
+        tab.screen->Feed("\x1b[2J\x1b[H");
+    }
+    Refresh();
+}
+
+void ChatWindow::ShowSecretMenu(size_t index, POINT screen) {
+    const std::vector<std::string> names = secrets_.Names();
+    if (index >= names.size()) {
+        return;
+    }
+    constexpr UINT kEdit = 1, kCopyName = 2, kDelete = 3;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, kEdit, L"Изменить");
+    AppendMenuW(menu.get(), MF_STRING, kCopyName, L"Копировать имя");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kDelete, L"Удалить");
+    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    case kEdit:
+        EditSecret(names[index]);
+        break;
+    case kCopyName:
+        if (SetClipboardText(hwnd_, ToWide(names[index]))) {
+            Flash(L"Имя скопировано");
+        }
+        break;
+    case kDelete:
+        DeleteSecret(names[index]);
+        break;
+    default:
+        break;
+    }
+}
+
+void ChatWindow::ShowAttachmentMenu(size_t index, POINT screen) {
+    if (index >= attachments_.size()) {
         return;
     }
     wil::unique_hmenu menu(CreatePopupMenu());
-    AppendMenuW(menu.get(), MF_STRING, 1, L"Копировать сообщение");
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 2, attachments_[index].name.c_str());
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, 1, L"Убрать");
     if (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr) == 1) {
-        CopyItemAt(y);
+        attachments_.erase(attachments_.begin() + static_cast<std::ptrdiff_t>(index));
+        hover_ = {};
+        Attached();
+    }
+}
+
+// The chat's title in the header (and the empty part of the chats' list): rename it, or start a new one.
+void ChatWindow::ShowTitleMenu(POINT screen) {
+    constexpr UINT kRename = 1, kNew = 2;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING | (sessionId_.empty() ? MF_GRAYED : 0), kRename, L"Переименовать чат");
+    AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат");
+    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    case kRename: {
+        const auto find = [&] {
+            return std::ranges::find_if(filtered_, [&](size_t i) { return sessions_[i].id == sessionId_; });
+        };
+        RefreshSessions();
+        auto at = find();
+        if (at == filtered_.end() && !searchText_.empty()) {  // the search hides it
+            searchText_.clear();
+            FilterSessions();
+            at = find();
+        }
+        if (at != filtered_.end()) {
+            BeginRename(Rename::Chat, static_cast<size_t>(at - filtered_.begin()));
+        } else {
+            Flash(L"Чат ещё не сохранён: сначала напишите что-нибудь", 3000);
+        }
+        break;
+    }
+    case kNew:
+        NewChat();
+        break;
+    default:
+        break;
     }
 }
 

@@ -248,6 +248,23 @@ bool DeleteSession(const std::wstring& workspace, const std::string& id) {
     return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted && !fs::exists(file, error);
 }
 
+bool RenameSession(const std::wstring& workspace, const std::string& id, const std::wstring& title) {
+    if (id.empty() || id.find_first_of("/\\.:") != std::string::npos || title.empty()) {
+        return false;
+    }
+    const fs::path file = SessionFile(workspace, id);
+    std::error_code error;
+    if (!fs::exists(file, error)) {
+        return false;
+    }
+    std::string line = Json{{"type", "custom-title"}, {"customTitle", ToUtf8(title)}, {"sessionId", id}}.dump(
+        -1, ' ', false, Json::error_handler_t::replace);
+    line += '\n';
+    std::ofstream out(file, std::ios::binary | std::ios::app);
+    out.write(line.data(), static_cast<std::streamsize>(line.size()));  // one write: the CLI may append too
+    return out.good();
+}
+
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id) {
     const fs::path file = SessionFile(workspace, id);
     WIN32_FILE_ATTRIBUTE_DATA data{};

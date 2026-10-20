@@ -46,6 +46,9 @@ std::vector<SessionInfo> ListSessions(const std::wstring& workspace);  // newest
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);
 // Moves a chat to the Recycle Bin: its transcript and the folder the CLI keeps beside it. False if it could not.
 bool DeleteSession(const std::wstring& workspace, const std::string& id);
+// Gives a chat its own title the way the CLI's /rename does: a custom-title entry appended to its file
+// (the newest one wins, over the generated title too).
+bool RenameSession(const std::wstring& workspace, const std::string& id, const std::wstring& title);
 // The last `limit` entries of a chat, for showing it again before it is resumed.
 std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
                                             bool& truncated);

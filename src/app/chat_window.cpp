@@ -86,6 +86,11 @@ D2D1_COLOR_F Color(uint32_t rgb, float alpha = 1.f) {
     return D2D1::ColorF(rgb, alpha);
 }
 
+// std::clamp asserts when lo > hi, which a narrow or minimized window makes of the panels' bounds.
+float ClampTo(float value, float lo, float hi) {
+    return std::clamp(value, lo, std::max(lo, hi));
+}
+
 bool Inside(const D2D1_RECT_F& r, float x, float y) {
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
 }
@@ -827,6 +832,9 @@ void ChatWindow::OnPopupKey(WPARAM key) {
             ClosePopup();
         } else if (key == VK_LEFT || key == VK_RIGHT) {
             const std::vector<std::string> levels = EffortLevels();
+            if (levels.empty()) {
+                break;
+            }
             const auto at = std::ranges::find(levels, pendingEffort_);
             long long index = at == levels.end() ? -1 : at - levels.begin();
             index = std::clamp<long long>(index + (key == VK_RIGHT ? 1 : -1), 0,
@@ -972,7 +980,7 @@ Geometry ChatWindow::Layout() const {
     case Popup::Models: {
         const float rows = static_cast<float>(mainModels_.size());
         const float height = 12 + rows * kMenuRow + (moreModels_.empty() ? 0 : 9 + kMenuRow);
-        const float popupLeft = std::clamp(g.model.left, 10.f, g.width - 10 - kModelsWidth);
+        const float popupLeft = ClampTo(g.model.left, 10.f, g.width - 10 - kModelsWidth);
         g.popup = D2D1::RectF(popupLeft, g.box.top - 6 - height, popupLeft + kModelsWidth, g.box.top - 6);
         g.modelsTop = g.popup.top + 6;
         if (!moreModels_.empty()) {
@@ -988,7 +996,7 @@ Geometry ChatWindow::Layout() const {
         break;
     }
     case Popup::Effort: {
-        const float popupRight = std::clamp(g.effort.right, 10.f + kEffortWidth, g.width - 10);
+        const float popupRight = ClampTo(g.effort.right, 10.f + kEffortWidth, g.width - 10);
         g.popup = D2D1::RectF(popupRight - kEffortWidth, g.box.top - 6 - kEffortHeight, popupRight, g.box.top - 6);
         g.track = D2D1::RectF(g.popup.left + 14, g.popup.top + 62, g.popup.right - 14, g.popup.top + 86);
         const float resetWidth = TextWidth(L"по умолчанию", uiRight_.get());

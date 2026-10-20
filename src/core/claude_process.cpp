@@ -126,7 +126,8 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     }
     std::wstring cmd = QuoteArg(exe) +
                        L" --output-format stream-json --verbose --input-format stream-json"
-                       L" --permission-prompt-tool stdio --tools \"\"";
+                       L" --permission-prompt-tool stdio --tools \"\""
+                       L" --mcp-config {\\\"mcpServers\\\":{\\\"aic\\\":{\\\"type\\\":\\\"sdk\\\",\\\"name\\\":\\\"aic\\\"}}}";
     if (options.includePartial) {
         cmd += L" --include-partial-messages";
     }
@@ -382,6 +383,10 @@ void ClaudeProcess::HandleLine(std::string_view line) {
     if (!stopping_ && onMessage_) {
         onMessage_(std::move(message));
     }
+}
+
+std::vector<wchar_t> MakeEnvironmentBlock(const std::vector<std::pair<std::wstring, std::wstring>>& overrides) {
+    return BuildEnvironment(overrides);
 }
 
 std::wstring FindClaudeExe() {

@@ -81,6 +81,9 @@ private:
     unsigned requestCounter_ = 0;
 };
 
+// Our environment plus the overrides, as a CREATE_UNICODE_ENVIRONMENT block for CreateProcessW.
+std::vector<wchar_t> MakeEnvironmentBlock(const std::vector<std::pair<std::wstring, std::wstring>>& overrides);
+
 // %USERPROFILE%\.local\bin\claude.exe (the native installer's place), else PATH; empty if none.
 std::wstring FindClaudeExe();
 // The way out for the CLI's HTTPS: the old client's bridge (2092), else sing-box's mixed port

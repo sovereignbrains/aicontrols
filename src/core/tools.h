@@ -1,0 +1,87 @@
+#pragma once
+
+#include <atomic>
+#include <functional>
+#include <list>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include "core/claude_process.h"
+#include "core/secrets.h"
+
+namespace aic {
+
+inline constexpr const char* kToolServer = "aic";  // the MCP server name: tools reach the model as mcp__aic__<name>
+
+struct ToolResult {
+    std::string text;
+    bool isError = false;
+};
+
+// What the approval card shows for a call.
+struct ToolSummary {
+    std::wstring title;   // "Выполнить команду", "Записать файл" …
+    std::wstring detail;  // the command, the path and the text — what the user is agreeing to
+};
+
+// A tool's name as the model sees it (mcp__aic__run_command) → ours (run_command); empty if it is not ours.
+std::string OwnToolName(const std::string& fullName);
+// Reading and listing run without asking; commands and writes wait for the user.
+bool ToolNeedsApproval(const std::string& name);
+ToolSummary SummarizeTool(const std::string& name, const Json& input);
+
+// The five tools: run_command, read_file, write_file, edit_file, list_directory.
+class Tools {
+public:
+    Tools(SecretStore& secrets, std::wstring cwd);
+
+    static Json Definitions();  // the MCP tools/list payload
+    // Blocks until done; `cancel` stops a running command. Output is scrubbed of secret values.
+    ToolResult Execute(const std::string& name, const Json& input, const std::atomic<bool>& cancel) const;
+
+    void SetCwd(std::wstring cwd) { cwd_ = std::move(cwd); }
+
+private:
+    ToolResult RunCommand(const Json& input, const std::atomic<bool>& cancel) const;
+    ToolResult ReadFile(const Json& input) const;
+    ToolResult WriteFile(const Json& input) const;
+    ToolResult EditFile(const Json& input) const;
+    ToolResult ListDirectory(const Json& input) const;
+    std::wstring Resolve(const std::string& path) const;
+
+    SecretStore& secrets_;
+    std::wstring cwd_;
+};
+
+// Answers the CLI's mcp_message requests (initialize, tools/list, tools/call) for our server. A call runs
+// on its own thread; `reply` is called from there with the request id and the control_response payload.
+class ToolHost {
+public:
+    using Reply = std::function<void(const std::string& requestId, Json response)>;
+
+    ToolHost(Tools& tools, Reply reply);
+    ~ToolHost();
+    ToolHost(const ToolHost&) = delete;
+    ToolHost& operator=(const ToolHost&) = delete;
+
+    void HandleMcp(const std::string& requestId, const Json& request);
+    // Stops running commands; their replies still go out (as errors), the CLI is waiting for them.
+    void CancelAll();
+
+private:
+    void Reap();
+
+    struct Job {
+        std::thread thread;
+        std::atomic<bool> done = false;
+        std::atomic<bool> cancel = false;
+    };
+
+    Tools& tools_;
+    Reply reply_;
+    std::mutex mutex_;
+    std::list<Job> jobs_;  // guarded by mutex_
+};
+
+}  // namespace aic

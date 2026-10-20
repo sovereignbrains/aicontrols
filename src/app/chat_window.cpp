@@ -32,7 +32,9 @@
 #include "app/resource.h"
 #include "core/attachment.h"
 #include "core/claude_process.h"
+#include "core/secrets.h"
 #include "core/store.h"
+#include "core/tools.h"
 
 namespace aic {
 namespace {
@@ -67,6 +69,10 @@ constexpr float kEffortWidth = 250.f;
 constexpr float kEffortHeight = 112.f;
 constexpr float kAttachmentRow = 56.f;
 constexpr float kFileChip = 190.f;
+constexpr float kCardPad = 12.f;
+constexpr float kCardTitle = 22.f;
+constexpr float kCardButton = 30.f;
+constexpr float kCardButtonWidth = 112.f;
 
 // Sovereign's palette (src/tray/ui_style.h): dark only, one blue accent.
 constexpr uint32_t kWindow = 0x0e0e0f;
@@ -102,7 +108,10 @@ struct ExitInfo {
     std::string stderrTail;
 };
 
-enum class Kind { User, Assistant, Notice, Error };
+enum class Kind { User, Assistant, Notice, Error, Approval };
+
+// A tool call waiting for the user (Kind::Approval), and what became of it.
+enum class Verdict { Pending, Allowed, Denied, Cancelled };
 
 struct FeedItem {
     Kind kind = Kind::Notice;
@@ -114,6 +123,11 @@ struct FeedItem {
     float textWidth = 0;
     float height = 0;
     float top = 0;  // where it was last painted, for hit tests
+    // Kind::Approval: `text` is what the call does, `title` what kind of call it is.
+    std::wstring title;
+    std::string requestId;  // the CLI's can_use_tool request, answered once
+    Json input;
+    Verdict verdict = Verdict::Pending;
 };
 
 // The panels that open over the window; one at a time.
@@ -135,6 +149,8 @@ enum class Target {
     MoreRow,      // row: an index into the other models
     EffortTrack,
     EffortReset,
+    ApprovalAllow,  // row: the feed item
+    ApprovalDeny,   // row: the same
     InsidePopup,  // on a panel, nothing to click
 };
 
@@ -343,6 +359,14 @@ private:
     void CopyItemAt(float y);
     void Flash(std::wstring status, UINT milliseconds = 1500);
 
+    void AskApproval(const std::string& requestId, const Json& request);
+    void Decide(size_t index, bool allow);
+    void CancelApprovals();  // pending cards are answered "no" and marked as cancelled
+    void StopTurn();
+    static float ApprovalHeight(const FeedItem& item);
+    static void ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& allow, D2D1_RECT_F& deny);
+    void PaintApproval(const Geometry& g, const FeedItem& item, float left);
+
     D2D1_RECT_F AttachmentRect(const Geometry& g, size_t index) const;
     static D2D1_RECT_F RemoveRect(const D2D1_RECT_F& chip);
     void PaintAttachments(const Geometry& g);
@@ -403,6 +427,8 @@ private:
     wil::com_ptr<IDWriteTextFormat> uiRight_;
     wil::com_ptr<IDWriteTextFormat> badge_;
     wil::com_ptr<IDWriteTextFormat> greeting_;
+    wil::com_ptr<IDWriteTextFormat> mono_;
+    wil::com_ptr<IDWriteTextFormat> button_;
 
     std::vector<FeedItem> feed_;
     float scroll_ = 0;
@@ -438,6 +464,10 @@ private:
     std::string userName_;
 
     ClaudeProcess claude_;
+    // Declared after claude_: the tool threads answer through it, so they are joined first.
+    SecretStore secrets_{SecretStore::DefaultPath()};
+    Tools tools_{secrets_, {}};
+    ToolHost host_{tools_, [this](const std::string& id, Json response) { claude_.Respond(id, std::move(response)); }};
     WPARAM generation_ = 0;  // bumped per process; stale posts are dropped
     bool running_ = false;
     bool busy_ = false;
@@ -453,6 +483,8 @@ private:
 
 int ChatWindow::Run(int show) {
     workspace_ = DefaultWorkspace();
+    tools_.SetCwd(workspace_);
+    secrets_.Load();
     settings_ = LoadSettings();
     UseDarkMenus();
     THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d_.put()));
@@ -474,6 +506,8 @@ int ChatWindow::Run(int show) {
     uiRight_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
     badge_ = MakeFormat(kTextFont, 11.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, true);
     greeting_ = MakeFormat(kDisplayFont, 22.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+    mono_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+    button_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, true);
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -783,6 +817,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_DESTROY:
         ++generation_;
+        host_.CancelAll();
         claude_.Stop();
         PostQuitMessage(0);
         return 0;
@@ -850,9 +885,15 @@ void ChatWindow::OnClick(float x, float y) {
         hover_ = {};
         Attached();
         break;
+    case Target::ApprovalAllow:
+        Decide(hit.row, true);
+        break;
+    case Target::ApprovalDeny:
+        Decide(hit.row, false);
+        break;
     case Target::Send:
         if (busy_ && !hasContent()) {
-            claude_.Interrupt();
+            StopTurn();
             Flash(L"останавливаю…");
         } else {
             Submit();  // also while Claude works: the message joins the running turn
@@ -957,7 +998,7 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             return 1;
         }
         if (filter.wParam == VK_ESCAPE && busy_) {
-            claude_.Interrupt();
+            StopTurn();
             Flash(L"останавливаю…");
             return 1;
         }
@@ -1111,6 +1152,22 @@ Hit ChatWindow::HitTest(float x, float y) const {
     case Popup::None:
         break;
     }
+    if (Inside(g.feed, x, y)) {
+        for (size_t i = 0; i < feed_.size(); ++i) {
+            const FeedItem& item = feed_[i];
+            if (item.kind != Kind::Approval || item.verdict != Verdict::Pending) {
+                continue;
+            }
+            D2D1_RECT_F allow{}, deny{};
+            ApprovalButtons(g, item, allow, deny);
+            if (Inside(allow, x, y)) {
+                return {Target::ApprovalAllow, i};
+            }
+            if (Inside(deny, x, y)) {
+                return {Target::ApprovalDeny, i};
+            }
+        }
+    }
     if (Inside(g.history, x, y)) {
         return {Target::History};
     }
@@ -1254,11 +1311,20 @@ void ChatWindow::Check(D2D1_POINT_2F c, uint32_t color) {
 
 void ChatWindow::MeasureFeed(float column) {
     for (FeedItem& item : feed_) {
-        const float width = item.kind == Kind::User ? column * 0.85f - 2 * kBubblePad : column;
+        float width = item.kind == Kind::User ? column * 0.85f - 2 * kBubblePad : column;
+        if (item.kind == Kind::Approval) {
+            width = column - 2 * kCardPad;
+        }
         if (item.layout && item.layoutWidth == width) {
+            if (item.kind == Kind::Approval) {
+                item.height = ApprovalHeight(item);  // the buttons go once it is decided
+            }
             continue;
         }
         IDWriteTextFormat* format = item.kind == Kind::Notice ? notice_.get() : body_.get();
+        if (item.kind == Kind::Approval) {
+            format = mono_.get();
+        }
         item.layout.reset();
         if (FAILED(dwrite_->CreateTextLayout(item.text.c_str(), static_cast<UINT32>(item.text.size()), format,
                                              std::max(width, 1.f), 1e6f, item.layout.put()))) {
@@ -1269,7 +1335,8 @@ void ChatWindow::MeasureFeed(float column) {
         DWRITE_TEXT_METRICS metrics{};
         item.layout->GetMetrics(&metrics);
         item.textWidth = metrics.widthIncludingTrailingWhitespace;
-        item.height = metrics.height + (item.kind == Kind::User ? 2 * kBubblePad : 0.f);
+        item.height = item.kind == Kind::Approval ? ApprovalHeight(item)
+                                                  : metrics.height + (item.kind == Kind::User ? 2 * kBubblePad : 0.f);
     }
 }
 
@@ -1336,7 +1403,9 @@ void ChatWindow::PaintFeed(const Geometry& g) {
     for (FeedItem& item : feed_) {
         item.top = y;
         const bool visible = item.layout && y + item.height >= g.feed.top && y <= g.feed.bottom;
-        if (visible && !(item.kind == Kind::Notice && !HasConversation())) {
+        if (visible && item.kind == Kind::Approval) {
+            PaintApproval(g, item, left);
+        } else if (visible && !(item.kind == Kind::Notice && !HasConversation())) {
             uint32_t color = kPrimary;
             float x = left;
             if (item.kind == Kind::User) {
@@ -1362,6 +1431,53 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         Fill(D2D1::RectF(g.width - 7.f, top, g.width - 3.f, top + thumb), 2.f, kLine);
     }
     target_->PopAxisAlignedClip();
+}
+
+float ChatWindow::ApprovalHeight(const FeedItem& item) {
+    if (!item.layout) {
+        return 0;
+    }
+    DWRITE_TEXT_METRICS metrics{};
+    item.layout->GetMetrics(&metrics);
+    const float buttons = item.verdict == Verdict::Pending ? kCardPad + kCardButton : 0.f;
+    return kCardPad + kCardTitle + 4.f + metrics.height + buttons + kCardPad;
+}
+
+void ChatWindow::ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& allow, D2D1_RECT_F& deny) {
+    const float left = (g.width - g.column) / 2 + kCardPad;
+    const float bottom = item.top + item.height - kCardPad;
+    allow = D2D1::RectF(left, bottom - kCardButton, left + kCardButtonWidth, bottom);
+    deny = D2D1::RectF(allow.right + 8.f, allow.top, allow.right + 8.f + kCardButtonWidth, bottom);
+}
+
+void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float left) {
+    const bool pending = item.verdict == Verdict::Pending;
+    const D2D1_RECT_F card = D2D1::RectF(left, item.top, left + g.column, item.top + item.height);
+    Fill(card, 10.f, kCard);
+    brush_->SetColor(pending ? Color(kAccent, 0.6f) : Color(kLine));
+    target_->DrawRoundedRectangle(D2D1::RoundedRect(card, 10.f, 10.f), brush_.get(), 1.f);
+
+    const float inner = left + kCardPad;
+    const float top = item.top + kCardPad;
+    Text(item.title, uiBold_.get(), D2D1::RectF(inner, top, card.right - kCardPad - 110.f, top + kCardTitle), kPrimary);
+    if (!pending) {
+        const bool allowed = item.verdict == Verdict::Allowed;
+        const wchar_t* label = allowed ? L"Разрешено" : (item.verdict == Verdict::Denied ? L"Отклонено" : L"Отменено");
+        Text(label, uiRight_.get(), D2D1::RectF(card.right - kCardPad - 110.f, top, card.right - kCardPad, top + kCardTitle),
+             allowed ? kSecondary : kDanger);
+    }
+    brush_->SetColor(Color(pending ? kPrimary : kSecondary));
+    target_->DrawTextLayout({inner, top + kCardTitle + 4.f}, item.layout.get(), brush_.get());
+
+    if (pending) {
+        D2D1_RECT_F allow{}, deny{};
+        ApprovalButtons(g, item, allow, deny);
+        const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
+        Fill(allow, 7.f, kAccent, onItem && hover_.target == Target::ApprovalAllow ? 0.85f : 1.f);
+        Text(L"Разрешить", button_.get(), allow, kPrimary);
+        Fill(deny, 7.f, onItem && hover_.target == Target::ApprovalDeny ? kLine : kRaised);
+        Text(L"Отклонить", button_.get(), deny, kPrimary);
+    }
 }
 
 void ChatWindow::PaintHeader(const Geometry& g) {
@@ -2078,6 +2194,12 @@ bool ChatWindow::StartClaude() {
 
 void ChatWindow::Restart() {
     ++generation_;
+    host_.CancelAll();
+    for (FeedItem& item : feed_) {  // the process that asked is gone
+        if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
+            item.verdict = Verdict::Cancelled;
+        }
+    }
     claude_.Stop();
     running_ = false;
     busy_ = false;
@@ -2086,6 +2208,7 @@ void ChatWindow::Restart() {
 
 void ChatWindow::ResetChat() {
     ++generation_;
+    host_.CancelAll();
     claude_.Stop();
     running_ = false;
     busy_ = false;
@@ -2180,7 +2303,7 @@ void ChatWindow::OnClaude(const Json& message) {
                 const std::string blockType = JsonStr(block, "type");
                 if (blockType == "text" && !streamed_.contains(id)) {
                     Add(Kind::Assistant, ToWide(JsonStr(block, "text")));
-                } else if (blockType == "tool_use") {
+                } else if (blockType == "tool_use" && OwnToolName(JsonStr(block, "name")).empty()) {
                     Add(Kind::Notice, L"инструмент: " + ToWide(JsonStr(block, "name")));
                 }
             }
@@ -2230,8 +2353,12 @@ void ChatWindow::OnClaude(const Json& message) {
         }
     } else if (type == "control_request") {
         const std::string id = JsonStr(message, "request_id");
-        if (JsonStr(JsonAt(message, "request"), "subtype") == "can_use_tool") {
-            claude_.Respond(id, Json{{"behavior", "deny"}, {"message", "Tools are not connected in this build yet."}});
+        const Json& request = JsonAt(message, "request");
+        const std::string subtype = JsonStr(request, "subtype");
+        if (subtype == "can_use_tool") {
+            AskApproval(id, request);
+        } else if (subtype == "mcp_message") {
+            host_.HandleMcp(id, request);
         } else {
             claude_.RespondError(id, "Not supported in this build yet.");
         }
@@ -2239,6 +2366,61 @@ void ChatWindow::OnClaude(const Json& message) {
         Add(Kind::Notice, ToWide(JsonStr(message, "text")));
     }
     Refresh();
+}
+
+// The model wants to call a tool. Reading runs at once (a note in the feed); anything that changes
+// something waits on a card for the user's word.
+void ChatWindow::AskApproval(const std::string& requestId, const Json& request) {
+    const std::string name = OwnToolName(JsonStr(request, "tool_name"));
+    const Json& input = JsonAt(request, "input");
+    if (name.empty()) {
+        claude_.Respond(requestId, Json{{"behavior", "deny"}, {"message", "Only AIControls tools are available here."}});
+        return;
+    }
+    ToolSummary summary = SummarizeTool(name, input);
+    if (!ToolNeedsApproval(name)) {
+        Add(Kind::Notice, summary.title + L": " + summary.detail);
+        claude_.Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
+        return;
+    }
+    FeedItem item;
+    item.kind = Kind::Approval;
+    item.title = std::move(summary.title);
+    item.text = std::move(summary.detail);
+    item.requestId = requestId;
+    item.input = input;
+    feed_.push_back(std::move(item));
+    stick_ = true;
+}
+
+void ChatWindow::Decide(size_t index, bool allow) {
+    if (index >= feed_.size() || feed_[index].kind != Kind::Approval || feed_[index].verdict != Verdict::Pending) {
+        return;
+    }
+    FeedItem& item = feed_[index];
+    item.verdict = allow ? Verdict::Allowed : Verdict::Denied;
+    if (allow) {
+        claude_.Respond(item.requestId, Json{{"behavior", "allow"}, {"updatedInput", item.input}});
+    } else {
+        claude_.Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The user declined this call."}});
+    }
+    hover_ = {};
+    Refresh();
+}
+
+void ChatWindow::CancelApprovals() {
+    for (FeedItem& item : feed_) {
+        if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
+            claude_.Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The turn was stopped."}});
+            item.verdict = Verdict::Cancelled;
+        }
+    }
+}
+
+void ChatWindow::StopTurn() {
+    CancelApprovals();
+    host_.CancelAll();
+    claude_.Interrupt();
 }
 
 void ChatWindow::OnClaudeExit(const ExitInfo& exit) {

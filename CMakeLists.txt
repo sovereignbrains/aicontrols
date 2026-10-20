@@ -23,7 +23,9 @@ find_package(nlohmann_json CONFIG REQUIRED)
 add_library(aic_core STATIC
   src/core/attachment.cpp
   src/core/claude_process.cpp
-  src/core/store.cpp)
+  src/core/secrets.cpp
+  src/core/store.cpp
+  src/core/tools.cpp)
 target_include_directories(aic_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs)
 
@@ -34,3 +36,11 @@ add_executable(aicontrols WIN32
   src/app/aicontrols.manifest
   src/app/aicontrols.rc)
 target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32)
+
+# Tools, secrets and the MCP host without the UI: build\<preset>\aic_tools_test.exe
+add_executable(aic_tools_test tests/tools_test.cpp)
+target_link_libraries(aic_tools_test PRIVATE aic_core)
+
+# By hand, spends a request: the real claude.exe calling our tools (see the file's header).
+add_executable(aic_e2e_probe tests/e2e_probe.cpp)
+target_link_libraries(aic_e2e_probe PRIVATE aic_core)

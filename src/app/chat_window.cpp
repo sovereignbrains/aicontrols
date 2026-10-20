@@ -810,6 +810,7 @@ private:
     std::wstring searchText_;
     size_t firstRow_ = 0;
     size_t secretsFirst_ = 0;  // the first secret shown when they do not all fit
+    float wheelRemainder_ = 0;  // wheel movement not yet worth a whole row
     D2D1_POINT_2F mouse_{-1.f, -1.f};  // the pointer in DIPs; off the window after it leaves
     size_t selected_ = 0;
     // Models: indexes into models_.
@@ -1342,16 +1343,24 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         ScreenToClient(hwnd_, &at);
         const float steps = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
         const Geometry g = Layout();
+        // A mouse with a free-spinning wheel or a touchpad sends deltas below 120: the part of a row that does not
+        // move the list yet is kept for the next message.
+        const auto wholeRows = [&](float perNotch) {
+            wheelRemainder_ += steps * perNotch;
+            const auto whole = static_cast<long long>(wheelRemainder_);
+            wheelRemainder_ -= static_cast<float>(whole);
+            return whole;
+        };
         if (popup_ == Popup::None && Inside(g.term, ToDip(at.x), ToDip(at.y))) {
             ScrollTerminal(-static_cast<long long>(std::lround(steps * 3)));
         } else if (popup_ == Popup::None && secretsOpen_ && Inside(g.panel, ToDip(at.x), ToDip(at.y))) {
-            const auto moved = static_cast<long long>(secretsFirst_) + static_cast<long long>(std::lround(steps * 2));
+            const auto moved = static_cast<long long>(secretsFirst_) + wholeRows(2.f);
             secretsFirst_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), secrets_.Names().size(),
                                        SecretRowsFit(g));
             hover_ = HitTest(ToDip(at.x), ToDip(at.y));  // the rows moved under the pointer
             Refresh();
         } else if (popup_ == Popup::None && !secretsOpen_ && Inside(g.sidebar, ToDip(at.x), ToDip(at.y))) {
-            const auto moved = static_cast<long long>(firstRow_) + static_cast<long long>(std::lround(steps * 3));
+            const auto moved = static_cast<long long>(firstRow_) + wholeRows(3.f);
             firstRow_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), filtered_.size(), SidebarRows(g));
             hover_ = HitTest(ToDip(at.x), ToDip(at.y));
             Refresh();

@@ -269,6 +269,26 @@ std::wstring EffortName(const std::string& level) {
     return name;
 }
 
+// Dark native menus: uxtheme's SetPreferredAppMode(ForceDark), as in Sovereign.
+void UseDarkMenus() {
+    HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (uxtheme == nullptr) {
+        return;
+    }
+    using SetPreferredAppModeFn = int(WINAPI*)(int);
+    using FlushMenuThemesFn = void(WINAPI*)();
+    const auto setMode = reinterpret_cast<SetPreferredAppModeFn>(  // NOLINT(performance-no-int-to-ptr)
+        reinterpret_cast<std::uintptr_t>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(135))));
+    const auto flush = reinterpret_cast<FlushMenuThemesFn>(  // NOLINT(performance-no-int-to-ptr)
+        reinterpret_cast<std::uintptr_t>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(136))));
+    if (setMode != nullptr) {
+        setMode(2);
+    }
+    if (flush != nullptr) {
+        flush();
+    }
+}
+
 class ChatWindow {
 public:
     explicit ChatWindow(HINSTANCE instance) : instance_(instance) {}
@@ -329,6 +349,9 @@ private:
     void PickFiles();
     void AttachFile(const std::wstring& path);
     void AttachClipboardImage();
+    void PasteClipboard();
+    void ShowInputMenu(POINT screen);
+    void ShowCopyMenu(POINT screen, float y);
     void Attached();
 
     void OpenPopup(Popup popup);
@@ -431,6 +454,7 @@ private:
 int ChatWindow::Run(int show) {
     workspace_ = DefaultWorkspace();
     settings_ = LoadSettings();
+    UseDarkMenus();
     THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d_.put()));
     THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                         reinterpret_cast<IUnknown**>(dwrite_.put())));
@@ -527,6 +551,20 @@ LRESULT CALLBACK ChatWindow::Proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
 // The input: a placeholder while it is empty.
 LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR,
                                        DWORD_PTR self) {
+    if (message == WM_CONTEXTMENU) {
+        POINT at{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (at.x == -1 && at.y == -1) {  // the keyboard's menu key
+            RECT rect{};
+            GetWindowRect(hwnd, &rect);
+            at = {rect.left + 8, rect.top + 8};
+        }
+        reinterpret_cast<ChatWindow*>(self)->ShowInputMenu(at);
+        return 0;
+    }
+    if (message == WM_PASTE) {
+        reinterpret_cast<ChatWindow*>(self)->PasteClipboard();  // files and pictures too, not only text
+        return 0;
+    }
     const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
     if (message == WM_PAINT && GetWindowTextLengthW(hwnd) == 0) {
         const auto* window = reinterpret_cast<const ChatWindow*>(self);
@@ -673,7 +711,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_RBUTTONUP:
         if (popup_ == Popup::None) {
-            CopyItemAt(CursorDip(lParam).y);
+            const D2D1_POINT_2F at = CursorDip(lParam);
+            POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(hwnd_, &screen);
+            if (Inside(Layout().box, at.x, at.y)) {
+                ShowInputMenu(screen);  // the padding of the input card
+            } else {
+                ShowCopyMenu(screen, at.y);
+            }
         }
         return 0;
     case WM_KEYDOWN:
@@ -928,8 +973,8 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             PickFiles();
             return 1;
         }
-        if (filter.wParam == 'V' && control && ClipboardHasImage()) {
-            AttachClipboardImage();  // a screenshot becomes an attachment, not text
+        if ((filter.wParam == 'V' && control) || (filter.wParam == VK_INSERT && shift)) {
+            PasteClipboard();
             return 1;
         }
     }
@@ -1694,6 +1739,92 @@ void ChatWindow::AttachClipboardImage() {
         Attached();
     } else if (!error.empty()) {
         Flash(error, 5000);
+    }
+}
+
+void ChatWindow::PasteClipboard() {
+    // Files copied in Explorer become attachments; a picture alone (a screenshot) too; else plain text.
+    std::vector<std::wstring> files;
+    if (IsClipboardFormatAvailable(CF_HDROP) && OpenClipboard(hwnd_)) {
+        if (const auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP)); drop != nullptr) {
+            const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < count; ++i) {
+                std::wstring path(DragQueryFileW(drop, i, nullptr, 0), L'\0');
+                DragQueryFileW(drop, i, path.data(), static_cast<UINT>(path.size() + 1));
+                files.push_back(std::move(path));
+            }
+        }
+        CloseClipboard();
+    }
+    if (!files.empty()) {
+        for (const std::wstring& path : files) {
+            AttachFile(path);
+        }
+    } else if (!IsClipboardFormatAvailable(CF_UNICODETEXT) && ClipboardHasImage()) {
+        AttachClipboardImage();
+    } else {
+        SendMessageW(input_, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
+    }
+}
+
+void ChatWindow::ShowInputMenu(POINT screen) {
+    constexpr UINT kUndo = 1;
+    constexpr UINT kCut = 2;
+    constexpr UINT kCopy = 3;
+    constexpr UINT kPaste = 4;
+    constexpr UINT kSelectAll = 5;
+    CHARRANGE selection{};
+    SendMessageW(input_, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const bool selected = selection.cpMax > selection.cpMin;
+    const bool canPaste = IsClipboardFormatAvailable(CF_UNICODETEXT) || IsClipboardFormatAvailable(CF_HDROP) ||
+                          ClipboardHasImage();
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING | (SendMessageW(input_, EM_CANUNDO, 0, 0) != 0 ? 0 : MF_GRAYED), kUndo,
+                L"Отменить\tCtrl+Z");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING | (selected ? 0 : MF_GRAYED), kCut, L"Вырезать\tCtrl+X");
+    AppendMenuW(menu.get(), MF_STRING | (selected ? 0 : MF_GRAYED), kCopy, L"Копировать\tCtrl+C");
+    AppendMenuW(menu.get(), MF_STRING | (canPaste ? 0 : MF_GRAYED), kPaste, L"Вставить\tCtrl+V");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING | (GetWindowTextLengthW(input_) > 0 ? 0 : MF_GRAYED), kSelectAll,
+                L"Выделить всё\tCtrl+A");
+    const UINT chosen = static_cast<UINT>(
+        TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr));
+    switch (chosen) {
+    case kUndo:
+        SendMessageW(input_, EM_UNDO, 0, 0);
+        break;
+    case kCut:
+        SendMessageW(input_, WM_CUT, 0, 0);
+        break;
+    case kCopy:
+        SendMessageW(input_, WM_COPY, 0, 0);
+        break;
+    case kPaste:
+        PasteClipboard();
+        break;
+    case kSelectAll: {
+        const CHARRANGE all{0, -1};
+        SendMessageW(input_, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&all));
+        break;
+    }
+    default:
+        break;
+    }
+    SetFocus(input_);
+}
+
+void ChatWindow::ShowCopyMenu(POINT screen, float y) {
+    const bool onMessage = std::ranges::any_of(feed_, [y](const FeedItem& item) {
+        return y >= item.top && y < item.top + item.height && !item.text.empty();
+    });
+    if (!onMessage) {
+        return;
+    }
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, 1, L"Копировать сообщение");
+    if (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr) == 1) {
+        CopyItemAt(y);
     }
 }
 

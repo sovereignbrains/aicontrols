@@ -37,6 +37,7 @@
 
 #include "app/fonts.h"
 #include "app/resource.h"
+#include "core/app_update.h"
 #include "core/attachment.h"
 #include "core/auth.h"
 #include "core/claude_install.h"
@@ -106,6 +107,8 @@ constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT_PTR kTipTimer = 2;  // the pointer has rested on something long enough for its hint
 constexpr UINT_PTR kPreviewTimer = 3;  // the preview looks whether its file (or one beside it) has changed
 constexpr UINT kPreviewCheck = 700;    // ms
+constexpr UINT_PTR kUpdateTimer = 4;   // a newer AIControls may have been built
+constexpr UINT kUpdateCheck = 30'000;  // ms
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
 
@@ -383,6 +386,7 @@ Limit Current(const Limit& limit) {
 enum class Target {
     None,
     SidebarToggle,
+    Update,  // the header's "update to ..." (only while there is one)
     SidebarSearch,
     FolderChip,     // the chat's folder, under the input: a menu to change it
     SplitSidebar,   // the edge between the sidebar and the chat: drag to resize
@@ -458,6 +462,7 @@ struct Geometry {
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
     D2D1_RECT_F termAdd{};               // "+": another shell
     D2D1_RECT_F terminalBtn{};  // the header's button that shows or hides the terminal
+    D2D1_RECT_F update{};       // ... and left of it, "update to ..." while a newer build is there
     D2D1_RECT_F winMin{};       // minimize, maximize, close: the header is the window's title bar
     D2D1_RECT_F winMax{};
     D2D1_RECT_F winClose{};
@@ -823,7 +828,12 @@ private:
     void PlacePreview();
     void CheckPreview();
     void ShowPreviewMenu(size_t index, POINT screen);
-    void OnPreviewPick(const std::wstring& message);  // Ctrl+click in the page: the element goes into the message
+    void OnPreviewPick(const std::wstring& message);
+
+    // A newer AIControls built here: a button in the header installs it, restarts and opens this chat again.
+    void CheckAppUpdate();
+    void StartUpdate();
+    std::wstring UpdateLabel() const { return update_ ? L"Обновить до " + ToWide(update_->version) : std::wstring(); }  // Ctrl+click in the page: the element goes into the message
     // Wide: the sidebar goes and the chat keeps only a strip, the rest is the preview's; again: as it was.
     void SetPreviewWide(bool wide);
     float MinChat() const { return PreviewShown() ? kMinChatPreview : kMinChat; }
@@ -984,6 +994,8 @@ private:
     wil::com_ptr<ICoreWebView2Controller> webController_;
     wil::com_ptr<ICoreWebView2> webView_;
     bool webCreating_ = false;
+    std::optional<AppUpdate> update_;
+    bool updatePending_ = false;  // asked while Claude was answering: done when the turn ends
     bool previewWide_ = false;
     float wideSavedTerminal_ = kTerminal;  // the widths to go back to
     bool wideSavedSidebar_ = true;
@@ -1172,6 +1184,18 @@ int ChatWindow::Run(int show) {
     LoadRepos();
     CheckClaudeVersions();
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
+    if (!settings_.reopen.empty()) {  // back from an update: the chat it was in
+        const std::string id = std::exchange(settings_.reopen, std::string());
+        SaveSettings(settings_);
+        for (size_t i = 0; i < filtered_.size(); ++i) {
+            if (sessions_[filtered_[i]].id == id) {
+                OpenSession(i);
+                break;
+            }
+        }
+    }
+    CheckAppUpdate();
+    SetTimer(hwnd_, kUpdateTimer, kUpdateCheck, nullptr);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1729,6 +1753,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             Refresh();
         } else if (wParam == kPreviewTimer) {
             CheckPreview();
+        } else if (wParam == kUpdateTimer) {
+            CheckAppUpdate();
         } else if (wParam == kTipTimer) {
             KillTimer(hwnd_, kTipTimer);
             if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
@@ -1898,6 +1924,9 @@ void ChatWindow::OnClick(float x, float y) {
         break;
     case Target::PreviewWide:
         SetPreviewWide(!previewWide_);
+        break;
+    case Target::Update:
+        StartUpdate();
         break;
     case Target::TermTab:
         SelectTerminalTab(hit.row);
@@ -2170,6 +2199,10 @@ Geometry ChatWindow::Layout() const {
     g.winMin = D2D1::RectF(g.winMax.left - kWinButton, 0, g.winMax.left, kHeader);
     g.terminalBtn = D2D1::RectF(g.winMin.left - 10 - kButton, buttonTop, g.winMin.left - 10, buttonTop + kButton);
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
+    if (update_) {
+        const float width = TextWidth(UpdateLabel(), ui_.get()) + 22.f;
+        g.update = D2D1::RectF(g.terminalBtn.left - 8 - width, buttonTop, g.terminalBtn.left - 8, buttonTop + kButton);
+    }
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
     // usage ring sit in a row under it, at the right.
@@ -2421,6 +2454,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.terminalBtn, x, y)) {
         return {Target::TerminalToggle};
+    }
+    if (Inside(g.update, x, y)) {
+        return {Target::Update};
     }
     if (claudeMissing_ && !HasConversation() && Inside(g.signIn, x, y)) {
         return {setupBusy_ ? Target::CancelInstall : Target::InstallClaude};
@@ -2985,7 +3021,11 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     // The title starts where the chat does (as in Claude's app), or after the toggle when the sidebar is hidden.
     const float titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
-    const float titleRight = g.terminalBtn.left - 12;
+    const float titleRight = (update_ ? g.update.left : g.terminalBtn.left) - 12;
+    if (update_) {
+        Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
+        Text(updatePending_ ? L"Обновлю после ответа" : UpdateLabel(), button_.get(), g.update, kPrimary);
+    }
     Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);
     std::wstring state = busy_ ? L"отвечает…" : L"";
     if (!status_.empty()) {
@@ -5774,6 +5814,41 @@ void ChatWindow::OnPreviewPick(const std::wstring& message) {
     Flash(L"Элемент в сообщении: допиши, что с ним сделать");
 }
 
+void ChatWindow::CheckAppUpdate() {
+    std::optional<AppUpdate> found = FindAppUpdate(AppUpdateFolders(), InstalledAppVersion());
+    const bool changed = found.has_value() != update_.has_value() || (found && found->version != update_->version);
+    update_ = std::move(found);
+    if (changed) {
+        hover_ = {};
+        Refresh();
+    }
+}
+
+void ChatWindow::StartUpdate() {
+    if (!update_) {
+        return;
+    }
+    if (busy_) {  // the answer would be cut off: the update waits for the turn's end
+        updatePending_ = true;
+        Flash(L"Обновлю, как только Claude закончит ответ", 4000);
+        return;
+    }
+    updatePending_ = false;
+    settings_.reopen = sessionId_;
+    SaveSettings(settings_);
+    // Silent, and /RELAUNCH brings AIControls back once the files are in (installer\aicontrols.iss).
+    const auto started = reinterpret_cast<INT_PTR>(ShellExecuteW(
+        hwnd_, L"open", update_->installer.c_str(), L"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RELAUNCH", nullptr,
+        SW_SHOWNORMAL));
+    if (started <= 32) {
+        settings_.reopen.clear();
+        SaveSettings(settings_);
+        Flash(L"Не запустился установщик: " + update_->installer, 5000);
+        return;
+    }
+    PostMessageW(hwnd_, WM_CLOSE, 0, 0);  // the installer replaces this exe: out of its way
+}
+
 void ChatWindow::SetPreviewWide(bool wide) {
     if (wide == previewWide_) {
         return;
@@ -5993,6 +6068,9 @@ std::wstring ChatWindow::TooltipText() {
         return L"Скрыть терминал";
     case Target::TermTabClose:
         return L"Закрыть вкладку";
+    case Target::Update:
+        return L"Поставить AIControls " + (update_ ? ToWide(update_->version) : std::wstring()) +
+               L" и перезапустить. Этот чат откроется снова";
     case Target::PreviewWide:
         return previewWide_ ? L"Вернуть как было" : L"Превью на всё окно (чат остаётся полосой слева)";
     case Target::TermTab:
@@ -6833,6 +6911,10 @@ void ChatWindow::OnClaude(const Json& message) {
         }
     } else if (type == "aic_raw") {
         Add(Kind::Notice, ToWide(JsonStr(message, "text")));
+    }
+    if (updatePending_ && !busy_) {  // the turn the update waited for has ended
+        StartUpdate();
+        return;
     }
     Refresh();
 }

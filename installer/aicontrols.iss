@@ -65,6 +65,8 @@ Name: "{autodesktop}\AIControls"; Filename: "{app}\aicontrols.exe"; Tasks: deskt
 [Run]
 ; Not in silent mode: an update started by hand should not pop a window up on its own.
 Filename: "{app}\aicontrols.exe"; Description: "{cm:LaunchProgram,AIControls}"; Flags: postinstall nowait skipifsilent
+; The client's own "update" button runs this silently with /RELAUNCH: it closed itself for it, so it comes back.
+Filename: "{app}\aicontrols.exe"; Flags: nowait; Check: Relaunch
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -73,6 +75,11 @@ Type: filesandordirs; Name: "{app}"
 // Asked before anything goes: the secrets are the one thing that cannot be made again by a reinstall.
 var
   DeleteData: Boolean;
+
+function Relaunch: Boolean;
+begin
+  Result := WizardSilent and (Pos('/RELAUNCH', UpperCase(GetCmdTail)) > 0);
+end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin

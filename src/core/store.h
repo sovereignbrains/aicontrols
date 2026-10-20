@@ -42,6 +42,8 @@ struct Settings {
     // The folder the chats work in (empty: DefaultWorkspace) and the ones used before, newest first.
     std::wstring workspace;
     std::vector<std::wstring> recentFolders;
+    // A chat to open again at the next start (set by an update, which restarts the client); cleared once opened.
+    std::string reopen;
 };
 
 // The old SSH Client's workspace while both clients live side by side: Claude's memory and the

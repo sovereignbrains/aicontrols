@@ -367,6 +367,7 @@ Settings LoadSettings() {
     settings.sidebarWidth = real("sidebarWidth");
     settings.terminalWidth = real("terminalWidth");
     settings.workspace = ToWide(JsonStr(data, "workspace"));
+    settings.reopen = JsonStr(data, "reopen");
     if (const Json& recent = JsonAt(data, "recentFolders"); recent.is_array()) {
         for (const Json& folder : recent) {
             if (folder.is_string()) {
@@ -395,7 +396,8 @@ void SaveSettings(const Settings& settings) {
                 {"sidebarWidth", settings.sidebarWidth},
                 {"terminalWidth", settings.terminalWidth},
                 {"workspace", ToUtf8(settings.workspace)},
-                {"recentFolders", recent}}
+                {"recentFolders", recent},
+                {"reopen", settings.reopen}}
                .dump(2)
         << "\n";
 }

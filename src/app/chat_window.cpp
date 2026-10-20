@@ -646,6 +646,10 @@ private:
     static D2D1_RECT_F SecretRowRect(const Geometry& g, size_t index);
     static D2D1_RECT_F SecretDeleteRect(const D2D1_RECT_F& row);
     static size_t SecretRowsFit(const Geometry& g);
+    // A list that is longer than its room: the first row shown is kept within the list, and a thin thumb on the
+    // panel's edge shows where in the list the window is (brighter while the pointer is over the panel).
+    static size_t ClampFirst(size_t first, size_t total, size_t rows) { return total > rows ? std::min(first, total - rows) : 0; }
+    void PaintListThumb(float x, float top, float bottom, size_t first, size_t rows, size_t total, bool bright);
     std::wstring FieldText(HWND field) const;
     void Ring(D2D1_POINT_2F center, float radius, float fraction, uint32_t color);
     void Text(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect, uint32_t color);
@@ -805,6 +809,8 @@ private:
     std::vector<size_t> filtered_;
     std::wstring searchText_;
     size_t firstRow_ = 0;
+    size_t secretsFirst_ = 0;  // the first secret shown when they do not all fit
+    D2D1_POINT_2F mouse_{-1.f, -1.f};  // the pointer in DIPs; off the window after it leaves
     size_t selected_ = 0;
     // Models: indexes into models_.
     std::vector<size_t> mainModels_;
@@ -1162,6 +1168,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             trackingMouse_ = TrackMouseEvent(&track) != FALSE;
         }
         const D2D1_POINT_2F at = CursorDip(lParam);
+        mouse_ = at;
         if (draggingEffort_) {
             SetEffortAt(at.x);
             return 0;
@@ -1218,6 +1225,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_MOUSELEAVE:
         trackingMouse_ = false;
+        mouse_ = {-1.f, -1.f};
         hover_ = {};
         Refresh();
         return 0;
@@ -1336,11 +1344,16 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         const Geometry g = Layout();
         if (popup_ == Popup::None && Inside(g.term, ToDip(at.x), ToDip(at.y))) {
             ScrollTerminal(-static_cast<long long>(std::lround(steps * 3)));
+        } else if (popup_ == Popup::None && secretsOpen_ && Inside(g.panel, ToDip(at.x), ToDip(at.y))) {
+            const auto moved = static_cast<long long>(secretsFirst_) + static_cast<long long>(std::lround(steps * 2));
+            secretsFirst_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), secrets_.Names().size(),
+                                       SecretRowsFit(g));
+            hover_ = HitTest(ToDip(at.x), ToDip(at.y));  // the rows moved under the pointer
+            Refresh();
         } else if (popup_ == Popup::None && !secretsOpen_ && Inside(g.sidebar, ToDip(at.x), ToDip(at.y))) {
-            const size_t rows = SidebarRows(g);
-            const size_t maxFirst = filtered_.size() > rows ? filtered_.size() - rows : 0;
             const auto moved = static_cast<long long>(firstRow_) + static_cast<long long>(std::lround(steps * 3));
-            firstRow_ = static_cast<size_t>(std::clamp<long long>(moved, 0, static_cast<long long>(maxFirst)));
+            firstRow_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), filtered_.size(), SidebarRows(g));
+            hover_ = HitTest(ToDip(at.x), ToDip(at.y));
             Refresh();
         } else if (popup_ == Popup::None) {
             ScrollBy(steps * 64.f);
@@ -1983,14 +1996,16 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.secretEye, x, y)) {
             return {Target::SecretEye};
         }
-        const size_t shown = std::min(secrets_.Names().size(), SecretRowsFit(g));
+        const size_t total = secrets_.Names().size();
+        const size_t first = ClampFirst(secretsFirst_, total, SecretRowsFit(g));
+        const size_t shown = std::min(total - first, SecretRowsFit(g));
         for (size_t i = 0; i < shown; ++i) {
             const D2D1_RECT_F row = SecretRowRect(g, i);
             if (Inside(SecretDeleteRect(row), x, y)) {
-                return {Target::SecretDelete, i};
+                return {Target::SecretDelete, first + i};
             }
             if (Inside(row, x, y)) {
-                return {Target::SecretRow, i};
+                return {Target::SecretRow, first + i};
             }
         }
         return {};
@@ -2975,9 +2990,14 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
         Text(L"Секретов пока нет.", ui_.get(),
              D2D1::RectF(g.panel.left + kPanelPad, g.secretsTop, g.panel.right - kPanelPad, g.secretsTop + 28), kSecondary);
     }
-    const size_t shown = std::min(names.size(), SecretRowsFit(g));
-    for (size_t i = 0; i < shown; ++i) {
-        const D2D1_RECT_F row = SecretRowRect(g, i);
+    const size_t fit = SecretRowsFit(g);
+    secretsFirst_ = ClampFirst(secretsFirst_, names.size(), fit);
+    const size_t shown = std::min(names.size() - secretsFirst_, fit);
+    PaintListThumb(g.panel.right - 5.f, g.secretsTop, g.secretsTop + static_cast<float>(fit) * kSecretRow, secretsFirst_, fit,
+                   names.size(), Inside(g.panel, mouse_.x, mouse_.y));
+    for (size_t slot = 0; slot < shown; ++slot) {
+        const size_t i = secretsFirst_ + slot;
+        const D2D1_RECT_F row = SecretRowRect(g, slot);
         const bool onRow = (hover_.target == Target::SecretRow || hover_.target == Target::SecretDelete) && hover_.row == i;
         if (onRow || names[i] == editingSecret_) {
             Fill(row, 8.f, kRaised);
@@ -4480,7 +4500,10 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
              D2D1::RectF(g.sidebar.left + 16, g.listTop, g.sidebar.right - 10, g.listTop + kHistoryRow), kSecondary);
         return;
     }
+    firstRow_ = ClampFirst(firstRow_, filtered_.size(), SidebarRows(g));
     const size_t last = std::min(filtered_.size(), firstRow_ + SidebarRows(g));
+    PaintListThumb(g.sidebar.right - 5.f, g.listTop, g.listBottom, firstRow_, SidebarRows(g), filtered_.size(),
+                   Inside(g.sidebar, mouse_.x, mouse_.y));
     for (size_t row = firstRow_; row < last; ++row) {
         const SessionInfo& session = sessions_[filtered_[row]];
         const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
@@ -4493,6 +4516,16 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
              D2D1::RectF(r.left + 10, r.top, r.right - 8, r.bottom), current ? kAccent : kPrimary);
     }
+}
+
+void ChatWindow::PaintListThumb(float x, float top, float bottom, size_t first, size_t rows, size_t total, bool bright) {
+    if (rows == 0 || total <= rows || bottom <= top) {
+        return;
+    }
+    const float track = bottom - top;
+    const float thumb = std::max(24.f, track * static_cast<float>(rows) / static_cast<float>(total));
+    const float at = top + (track - thumb) * static_cast<float>(first) / static_cast<float>(total - rows);
+    Fill(D2D1::RectF(x, at, x + 3.f, at + thumb), 1.5f, bright ? kSecondary : kLine);
 }
 
 void ChatWindow::SetSidebarOpen(bool open) {

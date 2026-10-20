@@ -110,17 +110,17 @@ constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
 
 // Layout, in DIPs.
-constexpr float kHeader = 44.f;     // also the window's title bar
-constexpr float kWinButton = 46.f;  // minimize, maximize, close: as wide as Windows' own
+constexpr float kHeader = 34.f;     // also the window's title bar
+constexpr float kWinButton = 40.f;  // minimize, maximize, close: a little narrower than Windows' own, as in Claude's app
 constexpr float kColumnMax = 720.f;
 constexpr float kSide = 24.f;
 constexpr float kGap = 14.f;
 constexpr float kBubblePad = 10.f;
-constexpr float kBoxPadY = 9.f;       // inside the input box, above and below its row
-constexpr float kChipRow = 30.f;      // under the box: model, effort, usage ring
-constexpr float kChipsBottom = 10.f;
-constexpr float kInputButton = 30.f;  // "+" and send
-constexpr float kRing = 22.f;
+constexpr float kBoxPadY = 5.f;       // inside the input box, above and below its row
+constexpr float kChipRow = 24.f;      // under the box: model, effort, usage ring
+constexpr float kChipsBottom = 6.f;
+constexpr float kInputButton = 26.f;  // "+" and send
+constexpr float kRing = 20.f;
 constexpr float kUsageWidth = 380.f;
 constexpr float kPanelPad = 16.f;
 constexpr float kSecretRow = 38.f;
@@ -129,7 +129,7 @@ constexpr float kSecretsNote = 40.f;
 constexpr float kUsageRow = 58.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
-constexpr float kButton = 32.f;
+constexpr float kButton = 26.f;
 constexpr float kTerminal = 480.f;  // the right column: PowerShell (as wide by default)
 constexpr float kMinTerminal = 300.f;
 constexpr float kMinSidebar = 180.f;
@@ -208,6 +208,7 @@ constexpr uint32_t kUserBubble = 0x1d2738;
 constexpr uint32_t kLine = 0x2c2c31;
 constexpr uint32_t kPrimary = 0xf2f4f8;
 constexpr uint32_t kSecondary = 0x9c9ea4;
+constexpr uint32_t kTitle = 0xc4c6cc;  // the chat's title in the header: quieter than the messages
 constexpr uint32_t kAccent = 0x4c92ff;
 constexpr uint32_t kDanger = 0xf06060;
 
@@ -1131,7 +1132,7 @@ int ChatWindow::Run(int show) {
     THROW_IF_FAILED(d2d_->CreateStrokeStyle(stroke, nullptr, 0, round_.put()));
     body_ = MakeFormat(kTextFont, 15.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     notice_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
-    header_ = MakeFormat(kDisplayFont, 12.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    header_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     ui_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     uiBold_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     uiRight_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
@@ -2970,16 +2971,22 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
 }
 
 void ChatWindow::PaintHeader(const Geometry& g) {
-    brush_->SetColor(Color(kPanel));
-    target_->FillRectangle(D2D1::RectF(0, 0, g.width, kHeader), brush_.get());
-    brush_->SetColor(Color(kLine));
-    target_->FillRectangle(D2D1::RectF(0, kHeader - 1, g.width, kHeader), brush_.get());
+    // No strip of its own, as in Claude's app: over the chat the header is the chat's background, over the side
+    // columns it is their top, their edge line running up to the window's top.
+    for (const D2D1_RECT_F& column : {g.sidebar, g.term}) {
+        if (column.right <= column.left) {
+            continue;
+        }
+        Fill(D2D1::RectF(column.left, 0, column.right, kHeader), 0.f, kPanel);
+        const float edge = column.left == 0.f ? column.right : column.left;
+        Line({edge, 0}, {edge, kHeader}, kLine, 1.f);
+    }
 
     // The title starts where the chat does (as in Claude's app), or after the toggle when the sidebar is hidden.
     const float titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
     const float titleRight = g.terminalBtn.left - 12;
-    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kPrimary);
+    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);
     std::wstring state = busy_ ? L"отвечает…" : L"";
     if (!status_.empty()) {
         state = status_;

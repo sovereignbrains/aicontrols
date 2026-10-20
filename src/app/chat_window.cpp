@@ -355,6 +355,7 @@ private:
     void Add(Kind kind, std::wstring text);
     void Refresh() { InvalidateRect(hwnd_, nullptr, FALSE); }
     bool HasConversation() const;
+    bool hasContent() const { return hasText_ || !attachments_.empty(); }
 
     HINSTANCE instance_;
     HWND hwnd_ = nullptr;
@@ -417,6 +418,7 @@ private:
     WPARAM generation_ = 0;  // bumped per process; stale posts are dropped
     bool running_ = false;
     bool busy_ = false;
+    bool stateEvents_ = false;  // the CLI reports its session state; else a result ends the turn
     std::string sessionId_;
     std::wstring title_;
     std::string currentMessageId_;
@@ -804,11 +806,11 @@ void ChatWindow::OnClick(float x, float y) {
         Attached();
         break;
     case Target::Send:
-        if (busy_) {
+        if (busy_ && !hasContent()) {
             claude_.Interrupt();
             Flash(L"останавливаю…");
         } else {
-            Submit();
+            Submit();  // also while Claude works: the message joins the running turn
         }
         break;
     default:
@@ -1402,13 +1404,13 @@ void ChatWindow::PaintInput(const Geometry& g) {
              effortActive ? kPrimary : kSecondary);
     }
 
-    const bool live = hasText_ || !attachments_.empty() || busy_;
+    const bool live = hasContent() || busy_;
     const D2D1_POINT_2F c{(g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2};
     const float radius = (g.send.right - g.send.left) / 2;
     brush_->SetColor(Color(live ? kAccent : kRaised, live && hover_.target == Target::Send ? 0.85f : 1.f));
     target_->FillEllipse(D2D1::Ellipse(c, radius, radius), brush_.get());
     const uint32_t mark = live ? kPrimary : kSecondary;
-    if (busy_) {  // stop
+    if (busy_ && !hasContent()) {  // stop
         Fill(D2D1::RectF(c.x - 4.5f, c.y - 4.5f, c.x + 4.5f, c.y + 4.5f), 1.5f, mark);
     } else {  // an arrow up
         Line({c.x, c.y + 5.5f}, {c.x, c.y - 5.5f}, mark, 1.8f);
@@ -1938,6 +1940,7 @@ bool ChatWindow::StartClaude() {
         return false;
     }
     running_ = true;
+    stateEvents_ = false;
     Refresh();
     return true;
 }
@@ -2004,8 +2007,12 @@ void ChatWindow::Submit() {
 void ChatWindow::OnClaude(const Json& message) {
     const std::string type = JsonStr(message, "type");
     if (type == "system") {
-        if (JsonStr(message, "subtype") == "init") {
+        const std::string subtype = JsonStr(message, "subtype");
+        if (subtype == "init") {
             sessionId_ = JsonStr(message, "session_id");
+        } else if (subtype == "session_state_changed") {
+            stateEvents_ = true;
+            busy_ = JsonStr(message, "state") != "idle";
         }
     } else if (type == "stream_event") {
         const Json& event = JsonAt(message, "event");
@@ -2048,7 +2055,9 @@ void ChatWindow::OnClaude(const Json& message) {
             }
         }
     } else if (type == "result") {
-        busy_ = false;
+        if (!stateEvents_) {
+            busy_ = false;
+        }
         const Json& isError = JsonAt(message, "is_error");
         if ((isError.is_boolean() && isError.get<bool>()) || JsonStr(message, "subtype") != "success") {
             std::string text = JsonStr(message, "result");

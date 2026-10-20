@@ -140,11 +140,13 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
         cmd += L" --resume " + QuoteArg(ToWide(options.resume));
     }
 
-    std::vector<std::pair<std::wstring, std::wstring>> overrides;
+    // session_state_changed (running / requires_action / idle): the only reliable "is it still working",
+    // since a message sent mid-turn is folded into the running turn and gets no result of its own.
+    std::vector<std::pair<std::wstring, std::wstring>> overrides = {{L"CLAUDE_CODE_SDK_READS_SESSION_STATE", L"1"}};
     if (!options.proxy.empty()) {
-        overrides = {{L"HTTPS_PROXY", options.proxy},
-                     {L"HTTP_PROXY", options.proxy},
-                     {L"NO_PROXY", L"127.0.0.1,localhost,::1"}};
+        overrides.insert(overrides.end(), {{L"HTTPS_PROXY", options.proxy},
+                                           {L"HTTP_PROXY", options.proxy},
+                                           {L"NO_PROXY", L"127.0.0.1,localhost,::1"}});
     }
     std::vector<wchar_t> environment = BuildEnvironment(overrides);
 

@@ -147,6 +147,20 @@ int main() {
         const auto md = ParseMarkdown(L"| h |\r\n|---|\r\n| v |\r\nend");
         Expect(md.text == L"h\n─\nv\n\nend", "table with CRLF", Narrow(md.text));
     }
+    {
+        const auto md = ParseMarkdown(L"open `C:\\Users\\me\\page.html`, or D:\\work\\a.txt. Not `src\\a.cpp` nor ab:\\x");
+        std::vector<std::wstring> urls;
+        for (const aic::MdSpan& span : md.spans) {
+            if ((span.flags & aic::kMdLink) != 0) {
+                urls.push_back(span.url);
+            }
+        }
+        Expect(urls.size() == 2 && urls[0] == L"C:\\Users\\me\\page.html" && urls[1] == L"D:\\work\\a.txt",
+               "paths become links, relative ones and words with a colon do not", std::to_string(urls.size()));
+        Expect(Find(md, aic::kMdCode) != nullptr, "a path in code stays code too");
+        Expect(aic::IsLocalPath(L"\\\\nas\\share") && aic::IsLocalPath(L"c:/x") && !aic::IsLocalPath(L"http://x"),
+               "what a local path is");
+    }
     std::cout << (failures == 0 ? "all passed\n" : "FAILED\n");
     return failures == 0 ? 0 : 1;
 }

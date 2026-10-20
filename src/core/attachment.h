@@ -17,6 +17,7 @@ struct Attachment {
     enum class Type { Image, Document, Text };
     Type type = Type::Image;
     std::wstring name;
+    std::wstring path;      // the file it was read from; empty for a pasted picture
     std::string mediaType;  // image/png, image/jpeg, application/pdf
     std::string base64;     // Image, Document
     std::string text;       // Text: the file's UTF-8 content
@@ -31,5 +32,15 @@ bool ClipboardHasImage();
 
 // The message content block the API expects for it.
 Json ContentBlock(const Attachment& attachment);
+
+// Pictures shown in the chat are kept as files, to be opened, copied and found again later:
+// %LOCALAPPDATA%\AIControls\images\<hash>.<ext>, the same picture always the same file. Empty on failure.
+std::wstring SaveChatImage(const std::string& base64, const std::string& mediaType);
+// A picture file decoded for Direct2D (32bppPBGRA), at most `side` px on its longer side; `width` and
+// `height` get the picture's own size. Null if it cannot be read.
+wil::com_ptr<IWICBitmap> LoadImagePreview(IWICImagingFactory* wic, const std::wstring& path, UINT side, UINT& width,
+                                          UINT& height);
+// The picture on the clipboard as a bitmap and as PNG, for any app to paste.
+bool CopyImageToClipboard(IWICImagingFactory* wic, HWND owner, const std::wstring& path);
 
 }  // namespace aic

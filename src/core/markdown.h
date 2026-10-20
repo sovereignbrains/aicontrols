@@ -30,6 +30,9 @@ struct MdSpan {
     std::wstring url;                   // kMdLink only: where it goes (also for bare http(s):// addresses)
 };
 
+// A path on this computer: C:\..., C:/... or \\server\share. Such `code` and bare ones become links to the file.
+bool IsLocalPath(std::wstring_view text);
+
 // The text to show, without the markup, and how its runs are styled.
 struct MdText {
     std::wstring text;

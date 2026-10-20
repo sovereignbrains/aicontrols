@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <vector>
 
@@ -190,6 +191,27 @@ std::wstring Lower(std::wstring text) {
     return text;
 }
 
+std::vector<uint8_t> FromBase64(const std::string& text) {
+    DWORD length = 0;
+    if (text.empty() || !CryptStringToBinaryA(text.data(), static_cast<DWORD>(text.size()), CRYPT_STRING_BASE64,
+                                              nullptr, &length, nullptr, nullptr)) {
+        return {};
+    }
+    std::vector<uint8_t> bytes(length);
+    if (!CryptStringToBinaryA(text.data(), static_cast<DWORD>(text.size()), CRYPT_STRING_BASE64, bytes.data(), &length,
+                              nullptr, nullptr)) {
+        return {};
+    }
+    bytes.resize(length);
+    return bytes;
+}
+
+fs::path ImagesDir() {
+    wchar_t local[MAX_PATH]{};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    return fs::path(local) / L"AIControls" / L"images";
+}
+
 }  // namespace
 
 std::optional<Attachment> LoadAttachment(IWICImagingFactory* wic, const std::wstring& path, std::wstring& error) {
@@ -204,7 +226,7 @@ std::optional<Attachment> LoadAttachment(IWICImagingFactory* wic, const std::wst
                 error = tooBig ? name + L": PDF больше 24 МБ" : name + L": не прочитался";
                 return std::nullopt;
             }
-            return Attachment{Attachment::Type::Document, name, "application/pdf", Base64(bytes), {}, {}};
+            return Attachment{Attachment::Type::Document, name, path, "application/pdf", Base64(bytes), {}, {}};
         }
 
         wil::com_ptr<IWICBitmapDecoder> decoder;
@@ -214,7 +236,10 @@ std::optional<Attachment> LoadAttachment(IWICImagingFactory* wic, const std::wst
             const std::string type = ImageType(extension);
             const std::vector<uint8_t> original = type.empty() ? std::vector<uint8_t>{}
                                                                : ReadBytes(file, kImageBytes, tooBig);
-            return FromDecoder(wic, decoder.get(), name, original, original.empty() ? std::string{} : type);
+            Attachment attachment =
+                FromDecoder(wic, decoder.get(), name, original, original.empty() ? std::string{} : type);
+            attachment.path = path;
+            return attachment;
         }
 
         bool tooBig = false;
@@ -307,6 +332,126 @@ Json ContentBlock(const Attachment& attachment) {
     }
     return Json{{"type", "text"},
                 {"text", "Файл «" + ToUtf8(attachment.name) + "»:\n\n" + attachment.text}};
+}
+
+std::wstring SaveChatImage(const std::string& base64, const std::string& mediaType) {
+    uint64_t hash = 14695981039346656037ULL;  // FNV-1a: the name tells the same picture again
+    for (const char c : base64) {
+        hash = (hash ^ static_cast<uint8_t>(c)) * 1099511628211ULL;
+    }
+    std::wstring extension = L".png";
+    if (mediaType == "image/jpeg") {
+        extension = L".jpg";
+    } else if (mediaType == "image/gif") {
+        extension = L".gif";
+    } else if (mediaType == "image/webp") {
+        extension = L".webp";
+    }
+    const fs::path dir = ImagesDir();
+    const fs::path file = dir / (std::format(L"{:016x}", hash) + extension);
+    std::error_code error;
+    if (fs::exists(file, error)) {
+        return file.wstring();
+    }
+    const std::vector<uint8_t> bytes = FromBase64(base64);
+    if (bytes.empty()) {
+        return {};
+    }
+    fs::create_directories(dir, error);
+    const fs::path partial = fs::path(file).concat(L".part");
+    {
+        std::ofstream out(partial, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out.good()) {
+            return {};
+        }
+    }
+    fs::rename(partial, file, error);
+    return error ? std::wstring() : file.wstring();
+}
+
+wil::com_ptr<IWICBitmap> LoadImagePreview(IWICImagingFactory* wic, const std::wstring& path, UINT side, UINT& width,
+                                          UINT& height) {
+    width = height = 0;
+    try {
+        wil::com_ptr<IWICBitmapDecoder> decoder;
+        THROW_IF_FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                       WICDecodeMetadataCacheOnDemand, decoder.put()));
+        wil::com_ptr<IWICBitmapFrameDecode> frame;
+        THROW_IF_FAILED(decoder->GetFrame(0, frame.put()));
+        THROW_IF_FAILED(frame->GetSize(&width, &height));
+        const wil::com_ptr<IWICBitmapSource> fitted =
+            Convert(wic, Fit(wic, frame.get(), side).get(), GUID_WICPixelFormat32bppPBGRA);
+        wil::com_ptr<IWICBitmap> bitmap;
+        THROW_IF_FAILED(wic->CreateBitmapFromSource(fitted.get(), WICBitmapCacheOnLoad, bitmap.put()));
+        return bitmap;
+    } catch (const std::exception&) {
+        width = height = 0;
+        return nullptr;
+    }
+}
+
+bool CopyImageToClipboard(IWICImagingFactory* wic, HWND owner, const std::wstring& path) {
+    std::vector<uint8_t> dib;
+    std::vector<uint8_t> png;
+    try {
+        wil::com_ptr<IWICBitmapDecoder> decoder;
+        THROW_IF_FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                       WICDecodeMetadataCacheOnDemand, decoder.put()));
+        wil::com_ptr<IWICBitmapFrameDecode> frame;
+        THROW_IF_FAILED(decoder->GetFrame(0, frame.put()));
+        const wil::com_ptr<IWICBitmapSource> pixels = Convert(wic, frame.get(), GUID_WICPixelFormat32bppBGRA);
+        UINT width = 0;
+        UINT height = 0;
+        THROW_IF_FAILED(pixels->GetSize(&width, &height));
+        const UINT stride = width * 4;
+        std::vector<uint8_t> rows(static_cast<size_t>(stride) * height);
+        THROW_IF_FAILED(pixels->CopyPixels(nullptr, stride, static_cast<UINT>(rows.size()), rows.data()));
+        // CF_DIB: a header and the rows bottom-up.
+        BITMAPINFOHEADER header{};
+        header.biSize = sizeof(header);
+        header.biWidth = static_cast<LONG>(width);
+        header.biHeight = static_cast<LONG>(height);
+        header.biPlanes = 1;
+        header.biBitCount = 32;
+        header.biCompression = BI_RGB;
+        header.biSizeImage = static_cast<DWORD>(rows.size());
+        dib.resize(sizeof(header) + rows.size());
+        std::memcpy(dib.data(), &header, sizeof(header));
+        for (UINT y = 0; y < height; ++y) {
+            std::memcpy(dib.data() + sizeof(header) + static_cast<size_t>(height - 1 - y) * stride,
+                        rows.data() + static_cast<size_t>(y) * stride, stride);
+        }
+        png = Encode(wic, pixels.get(), GUID_ContainerFormatPng);
+    } catch (const std::exception&) {
+        return false;
+    }
+    if (!OpenClipboard(owner)) {
+        return false;
+    }
+    auto close = wil::scope_exit([] { CloseClipboard(); });
+    EmptyClipboard();
+    const auto put = [](UINT format, const std::vector<uint8_t>& bytes) {
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
+        if (memory == nullptr) {
+            return false;
+        }
+        void* data = GlobalLock(memory);
+        if (data == nullptr) {
+            GlobalFree(memory);
+            return false;
+        }
+        std::memcpy(data, bytes.data(), bytes.size());
+        GlobalUnlock(memory);
+        if (SetClipboardData(format, memory) == nullptr) {
+            GlobalFree(memory);
+            return false;
+        }
+        return true;
+    };
+    const bool bitmap = put(CF_DIB, dib);
+    const bool encoded = !png.empty() && put(RegisterClipboardFormatW(L"PNG"), png);
+    return bitmap || encoded;
 }
 
 }  // namespace aic

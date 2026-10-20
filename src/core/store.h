@@ -16,9 +16,15 @@ struct SessionInfo {
 
 enum class EntryKind { User, Assistant, Tool };
 
+struct TranscriptImage {
+    std::string mediaType;
+    std::string base64;
+};
+
 struct TranscriptEntry {
     EntryKind kind = EntryKind::User;
     std::wstring text;  // the tool's name for EntryKind::Tool
+    std::vector<TranscriptImage> images;  // EntryKind::User: the pictures sent with it
 };
 
 struct Settings {

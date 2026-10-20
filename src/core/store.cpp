@@ -71,7 +71,7 @@ void ForEachLine(std::string_view text, Fn&& fn) {
     }
 }
 
-std::wstring TextOf(const Json& content);
+std::wstring TextOf(const Json& content, bool images = true);  // images: a line for each picture
 
 // A chat the CLI never titled is named after its first message: its first line, shortened.
 std::wstring FirstPrompt(std::string_view text) {
@@ -157,7 +157,7 @@ std::wstring CachedReadTitle(const fs::path& file, const WIN32_FILE_ATTRIBUTE_DA
     return entry.title;
 }
 
-std::wstring TextOf(const Json& content) {
+std::wstring TextOf(const Json& content, bool images) {
     if (content.is_string()) {
         return ToWide(content.get<std::string>());
     }
@@ -168,7 +168,7 @@ std::wstring TextOf(const Json& content) {
             std::wstring part;
             if (type == "text") {
                 part = ToWide(JsonStr(block, "text"));
-            } else if (type == "image") {
+            } else if (type == "image" && images) {
                 part = L"📎 фото";
             } else if (type == "document") {
                 part = L"📎 " + (JsonStr(block, "title").empty() ? L"документ" : ToWide(JsonStr(block, "title")));
@@ -294,10 +294,20 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
         const Json& message = JsonAt(entry, "message");
         if (type == "user") {
             lastAssistant.clear();
-            std::wstring text = TextOf(JsonAt(message, "content"));
+            const Json& content = JsonAt(message, "content");
+            std::wstring text = TextOf(content, false);
+            std::vector<TranscriptImage> images;
+            if (content.is_array()) {
+                for (const Json& block : content) {
+                    const Json& source = JsonAt(block, "source");
+                    if (JsonStr(block, "type") == "image" && JsonStr(source, "type") == "base64") {
+                        images.push_back({JsonStr(source, "media_type"), JsonStr(source, "data")});
+                    }
+                }
+            }
             // Tool results carry no text; "<command-…>" and the like are the CLI's own bookkeeping.
-            if (!text.empty() && text.front() != L'<') {
-                entries.push_back({EntryKind::User, std::move(text)});
+            if ((!text.empty() && text.front() != L'<') || (text.empty() && !images.empty())) {
+                entries.push_back({EntryKind::User, std::move(text), std::move(images)});
             }
         } else if (type == "assistant") {
             const std::string messageId = JsonStr(message, "id");

@@ -56,6 +56,11 @@ void Inline(std::wstring_view s, MdText& out) {
                     inner = inner.substr(1, inner.size() - 2);
                 }
                 styled(inner, kMdCode, false);
+                if (IsLocalPath(inner) && inner.find(L'\n') == std::wstring_view::npos) {
+                    MdSpan link{out.text.size() - inner.size(), inner.size(), kMdLink, 1.f, false};
+                    link.url = inner;
+                    out.spans.push_back(std::move(link));
+                }
                 i = close + ticks;
                 continue;
             }
@@ -123,6 +128,20 @@ void Inline(std::wstring_view s, MdText& out) {
                 --end;
             }
             if (end > i + 8) {
+                styled(s.substr(i, end - i), kMdLink, false, s.substr(i, end - i));
+                i = end;
+                continue;
+            }
+        }
+        if (std::iswalpha(c) != 0 && (i == 0 || !IsWordChar(s[i - 1])) && IsLocalPath(s.substr(i))) {
+            size_t end = i;  // a bare path ends at a space: one with spaces in it needs `code`
+            while (end < s.size() && !IsSpace(s[end]) && std::wstring_view(L"<>\"|*?`").find(s[end]) == std::wstring_view::npos) {
+                ++end;
+            }
+            while (end > i + 3 && std::wstring_view(L".,;:!?')*]").find(s[end - 1]) != std::wstring_view::npos) {
+                --end;
+            }
+            if (end > i + 3) {
                 styled(s.substr(i, end - i), kMdLink, false, s.substr(i, end - i));
                 i = end;
                 continue;
@@ -233,6 +252,14 @@ std::optional<std::wstring_view> LineAt(std::wstring_view source, size_t pos) {
 }
 
 }  // namespace
+
+bool IsLocalPath(std::wstring_view text) {
+    if (text.size() >= 3 && ((text[0] >= L'A' && text[0] <= L'Z') || (text[0] >= L'a' && text[0] <= L'z')) &&
+        text[1] == L':' && (text[2] == L'\\' || text[2] == L'/')) {
+        return true;
+    }
+    return text.size() >= 3 && text.starts_with(L"\\\\") && IsWordChar(text[2]);
+}
 
 MdText ParseMarkdown(std::wstring_view source) {
     MdText out;

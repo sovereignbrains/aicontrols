@@ -7,6 +7,7 @@
 #include <dwrite.h>
 #include <richedit.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 
 #include <wil/com.h>
@@ -144,6 +145,11 @@ constexpr float kCardPad = 12.f;
 constexpr float kCardTitle = 22.f;
 constexpr float kCardButton = 30.f;
 constexpr float kCardButtonWidth = 112.f;
+constexpr float kImageWidth = 360.f;   // a picture in the feed fits this box
+constexpr float kImageHeight = 280.f;
+constexpr float kImageGap = 6.f;
+constexpr UINT kPreviewSide = 1024;    // px: sharp at 2x in that box, and quick to decode
+constexpr UINT kViewerSide = 4096;
 
 // Sovereign's palette (src/tray/ui_style.h): dark only, one blue accent.
 constexpr uint32_t kWindow = 0x0e0e0f;
@@ -188,6 +194,17 @@ struct ExitInfo {
 
 enum class Kind { User, Assistant, Notice, Error, Approval };
 
+// A picture sent with a message, shown above its bubble: the file it is kept in and a preview of it.
+struct FeedImage {
+    std::wstring path;
+    wil::com_ptr<IWICBitmap> preview;  // decoded once, at most kPreviewSide px
+    wil::com_ptr<ID2D1Bitmap> bitmap;  // ... on the render target; made again with a new target
+    UINT generation = 0;               // the target it was made on
+    float width = 0;   // its size in the feed's box, in DIPs
+    float height = 0;
+    D2D1_RECT_F at{};  // where it is laid out: x from the column's left edge, y from the item's top
+};
+
 // A tool call waiting for the user (Kind::Approval), and what became of it.
 enum class Verdict { Pending, Allowed, Denied, Cancelled };
 
@@ -199,10 +216,15 @@ struct FeedItem {
     wil::com_ptr<IDWriteTextLayout> layout;
     float layoutWidth = 0;
     float textWidth = 0;
+    float layoutHeight = 0;  // the text's own
     float height = 0;
     float top = 0;  // where it was last painted, for hit tests
     std::vector<MdSpan> spans;  // Kind::Assistant: how the layout's runs are styled (the text is markdown)
     std::wstring shown;         // the text the layout was made of (markdown without its markup ...): selections index it
+    // Kind::User: the pictures above the bubble, and where the bubble starts below them.
+    std::vector<FeedImage> images;
+    float bubbleTop = 0;
+    std::string tool;  // Kind::Approval: the tool's own name (write_file ...)
     // Kind::Approval: `text` is what the call does, `title` what kind of call it is.
     std::wstring title;
     std::string requestId;  // the CLI's can_use_tool request, answered once
@@ -215,8 +237,47 @@ struct FeedItem {
     size_t outputStart = 0;    // where it begins in the card's layout
 };
 
+// A card of write_file or edit_file that wrote a file here (not on a server): it gets "open" and "show in folder".
+bool HasFileActions(const FeedItem& item) {
+    return item.kind == Kind::Approval && (item.tool == "write_file" || item.tool == "edit_file") &&
+           item.verdict == Verdict::Allowed && item.done && !item.outputError && !JsonStr(item.input, "path").empty() &&
+           JsonStr(item.input, "on").empty();
+}
+
+// ... and the file, a relative path being the chat folder's (as the tools resolve it).
+std::wstring WrittenFile(const FeedItem& item, const std::wstring& workspace) {
+    const std::filesystem::path path(ToWide(JsonStr(item.input, "path")));
+    return (path.is_relative() ? std::filesystem::path(workspace) / path : path).lexically_normal().wstring();
+}
+
+// A path as written in an answer, to a file that is there: file.cpp:12 (and :12:5) is file.cpp. Empty if none.
+std::wstring ExistingPath(std::wstring path) {
+    std::error_code error;
+    for (int i = 0; i < 3; ++i) {
+        if (std::filesystem::exists(path, error)) {
+            return path;
+        }
+        const size_t colon = path.find_last_of(L':');
+        if (colon == std::wstring::npos || colon < 2 || colon + 1 == path.size() ||
+            path.find_first_not_of(L"0123456789", colon + 1) != std::wstring::npos) {
+            break;
+        }
+        path.resize(colon);
+    }
+    return {};
+}
+
+// Explorer, at the file's folder with the file selected.
+void RevealInFolder(const std::wstring& path) {
+    PIDLIST_ABSOLUTE item = nullptr;
+    if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &item, 0, nullptr))) {
+        SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
+        CoTaskMemFree(item);
+    }
+}
+
 // The panels that open over the window; one at a time.
-enum class Popup { None, Models, Effort, Usage };
+enum class Popup { None, Models, Effort, Usage, Image };  // Image: a picture over the whole window
 
 // One of the plan's limit windows, from the CLI's rate_limit_event.
 struct Limit {
@@ -269,12 +330,16 @@ enum class Target {
     EffortReset,
     ApprovalAllow,  // row: the feed item
     ApprovalDeny,   // row: the same
+    CardOpen,       // row: a card that wrote a file: open the file
+    CardReveal,     // row: the same: show it in its folder
+    FeedImage,      // row: the feed item, sub: its picture
     InsidePopup,  // on a panel, nothing to click
 };
 
 struct Hit {
     Target target = Target::None;
     size_t row = 0;
+    size_t sub = 0;
     bool operator==(const Hit&) const = default;
 };
 
@@ -699,6 +764,21 @@ private:
     void PaintApproval(const Geometry& g, const FeedItem& item, float left);
     void StyleMarkdown(FeedItem& item);
     void PaintMarkdown(const FeedItem& item, float x, float y, float left, float column);
+    static void ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& open, D2D1_RECT_F& reveal);
+
+    // Pictures in the feed: above the bubble of the message they went with; a click shows one over the window
+    // (the arrows go through the others), the right button copies, opens or finds it.
+    FeedImage MakeFeedImage(std::wstring path) const;
+    static float LayoutImages(FeedItem& item, float column);  // the pictures' height
+    D2D1_RECT_F ImageRect(const Geometry& g, const FeedItem& item, size_t index) const;
+    ID2D1Bitmap* Bitmap(FeedImage& image);
+    void PaintImages(const Geometry& g, FeedItem& item);
+    void OpenViewer(size_t item, size_t image);
+    void StepViewer(int delta);
+    void PaintViewer(const Geometry& g);
+    void ShowImageMenu(const std::wstring& path, POINT screen);
+    void CopyImage(const std::wstring& path);
+    void OpenFile(const std::wstring& path);  // with its app; a flash when it is gone
 
     D2D1_RECT_F AttachmentRect(const Geometry& g, size_t index) const;
     static D2D1_RECT_F RemoveRect(const D2D1_RECT_F& chip);
@@ -804,6 +884,7 @@ private:
     wil::com_ptr<IWICImagingFactory> wic_;
     wil::com_ptr<IDWriteFontCollection> fonts_;
     wil::com_ptr<ID2D1HwndRenderTarget> target_;
+    UINT targetGeneration_ = 0;  // bumped with each new target: bitmaps made on an old one are made again
     wil::com_ptr<ID2D1SolidColorBrush> brush_;
     wil::com_ptr<ID2D1StrokeStyle> round_;
     wil::com_ptr<IDWriteTextFormat> body_;
@@ -827,6 +908,10 @@ private:
     bool inputFocused_ = false;
     bool hasText_ = false;
     std::vector<Attachment> attachments_;  // go with the next message
+    // The picture shown over the window (Popup::Image): which one, and its larger image.
+    size_t viewerItem_ = 0;
+    size_t viewerImage_ = 0;
+    FeedImage viewer_;
     Hit hover_;
     bool trackingMouse_ = false;
 
@@ -1351,6 +1436,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 const std::wstring url = LinkAt(Layout(), at.x, at.y);
                 if (url.starts_with(L"http://") || url.starts_with(L"https://") || url.starts_with(L"mailto:")) {
                     ShellExecuteW(hwnd_, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                } else if (IsLocalPath(url)) {
+                    OpenFile(url);
                 }
             }
             searchFocus_ = false;
@@ -1421,6 +1508,12 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (popup_ == Popup::Image) {
+            POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(hwnd_, &screen);
+            ShowImageMenu(viewer_.path, screen);
+            return 0;
+        }
         if (popup_ == Popup::None) {
             HideTip();
             if (renaming_ != Rename::None) {
@@ -1445,6 +1538,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             case Target::AttachmentChip:
             case Target::RemoveAttachment:
                 ShowAttachmentMenu(hit.row, screen);
+                return 0;
+            case Target::FeedImage:
+                ShowImageMenu(feed_[hit.row].images[hit.sub].path, screen);
                 return 0;
             case Target::Account:
                 ShowAccountMenu();
@@ -1758,6 +1854,19 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::ApprovalDeny:
         Decide(hit.row, false);
         break;
+    case Target::CardOpen:
+        OpenFile(WrittenFile(feed_[hit.row], workspace_));
+        break;
+    case Target::CardReveal:
+        if (const std::wstring file = ExistingPath(WrittenFile(feed_[hit.row], workspace_)); !file.empty()) {
+            RevealInFolder(file);
+        } else {
+            Flash(L"Файла больше нет", 3000);
+        }
+        break;
+    case Target::FeedImage:
+        OpenViewer(hit.row, hit.sub);
+        return;
     case Target::Send:
         if (busy_ && !hasContent()) {
             StopTurn();
@@ -1794,6 +1903,15 @@ void ChatWindow::OnPopupKey(WPARAM key) {
                                           static_cast<long long>(levels.size()) - 1);
             pendingEffort_ = levels[static_cast<size_t>(index)];
             Refresh();
+        }
+        break;
+    case Popup::Image:
+        if (key == VK_LEFT || key == VK_RIGHT) {
+            StepViewer(key == VK_RIGHT ? 1 : -1);
+        } else if (key == 'C' && GetKeyState(VK_CONTROL) < 0) {
+            CopyImage(viewer_.path);
+        } else if (key == VK_RETURN) {
+            OpenFile(viewer_.path);
         }
         break;
     default:
@@ -2067,6 +2185,8 @@ Hit ChatWindow::HitTest(float x, float y) const {
             return {Target::InsidePopup};
         }
         break;
+    case Popup::Image:
+        return {};  // over everything: a click anywhere closes it
     case Popup::None:
         break;
     }
@@ -2170,6 +2290,24 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.feed, x, y)) {
         for (size_t i = 0; i < feed_.size(); ++i) {
             const FeedItem& item = feed_[i];
+            if (y < item.top || y >= item.top + item.height) {
+                continue;
+            }
+            for (size_t k = 0; k < item.images.size(); ++k) {
+                if (Inside(ImageRect(g, item, k), x, y)) {
+                    return {Target::FeedImage, i, k};
+                }
+            }
+            if (HasFileActions(item)) {
+                D2D1_RECT_F open{}, reveal{};
+                ApprovalFileButtons(g, item, open, reveal);
+                if (Inside(open, x, y)) {
+                    return {Target::CardOpen, i};
+                }
+                if (Inside(reveal, x, y)) {
+                    return {Target::CardReveal, i};
+                }
+            }
             if (item.kind != Kind::Approval || item.verdict != Verdict::Pending) {
                 continue;
             }
@@ -2278,6 +2416,7 @@ void ChatWindow::EnsureTarget() {
                                             target_.put()))) {
         return;
     }
+    ++targetGeneration_;
     target_->CreateSolidColorBrush(Color(kPrimary), brush_.put());
 }
 
@@ -2311,6 +2450,10 @@ void ChatWindow::MeasureFeed(float column) {
         if (item.layout && item.layoutWidth == width) {
             if (item.kind == Kind::Approval) {
                 item.height = ApprovalHeight(item);  // the buttons go once it is decided
+            } else if (item.kind == Kind::User) {
+                const float pictures = LayoutImages(item, column);  // the same: the column may have changed
+                item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
+                item.height = item.bubbleTop + (item.text.empty() ? 0.f : item.layoutHeight + 2 * kBubblePad);
             }
             continue;
         }
@@ -2345,9 +2488,46 @@ void ChatWindow::MeasureFeed(float column) {
         DWRITE_TEXT_METRICS metrics{};
         item.layout->GetMetrics(&metrics);
         item.textWidth = metrics.widthIncludingTrailingWhitespace;
-        item.height = item.kind == Kind::Approval ? ApprovalHeight(item)
-                                                  : metrics.height + (item.kind == Kind::User ? 2 * kBubblePad : 0.f);
+        item.layoutHeight = metrics.height;
+        item.height = item.kind == Kind::Approval ? ApprovalHeight(item) : metrics.height;
+        if (item.kind == Kind::User) {  // the pictures, then the bubble (none for pictures alone)
+            const float pictures = LayoutImages(item, column);
+            item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
+            item.height = item.bubbleTop + (item.text.empty() ? 0.f : metrics.height + 2 * kBubblePad);
+        }
     }
+}
+
+float ChatWindow::LayoutImages(FeedItem& item, float column) {
+    // Side by side while they fit in the bubble's room, rows right-aligned like the bubble.
+    const float room = column * 0.85f;
+    float top = 0;
+    size_t first = 0;
+    while (first < item.images.size()) {
+        float rowWidth = 0;
+        float rowHeight = 0;
+        size_t end = first;
+        for (; end < item.images.size(); ++end) {
+            const FeedImage& image = item.images[end];
+            const float scale = std::min(1.f, room / std::max(image.width, 1.f));
+            const float width = image.width * scale;
+            if (end > first && rowWidth + kImageGap + width > room) {
+                break;
+            }
+            rowWidth += (end > first ? kImageGap : 0.f) + width;
+            rowHeight = std::max(rowHeight, image.height * scale);
+        }
+        float x = column - rowWidth;
+        for (size_t i = first; i < end; ++i) {
+            FeedImage& image = item.images[i];
+            const float scale = std::min(1.f, room / std::max(image.width, 1.f));
+            image.at = D2D1::RectF(x, top + rowHeight - image.height * scale, x + image.width * scale, top + rowHeight);
+            x = image.at.right + kImageGap;
+        }
+        top += rowHeight + kImageGap;
+        first = end;
+    }
+    return top > 0 ? top - kImageGap : 0.f;
 }
 
 float ChatWindow::FeedHeight() const {
@@ -2392,6 +2572,9 @@ void ChatWindow::Paint() {
     case Popup::Usage:
         PaintUsage(g);
         break;
+    case Popup::Image:
+        PaintViewer(g);
+        break;
     case Popup::None:
         break;
     }
@@ -2431,11 +2614,16 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         } else if (visible && !(item.kind == Kind::Notice && !HasConversation())) {
             uint32_t color = kPrimary;
             float x = left;
+            float textY = y;
             if (item.kind == Kind::User) {
+                PaintImages(g, item);
                 const float width = item.textWidth + 2 * kBubblePad;
                 x = left + g.column - width;
-                Fill(D2D1::RectF(x, y, x + width, y + item.height), 10.f, kUserBubble);
+                if (!item.text.empty()) {
+                    Fill(D2D1::RectF(x, y + item.bubbleTop, x + width, y + item.height), 10.f, kUserBubble);
+                }
                 x += kBubblePad;
+                textY = y + item.bubbleTop + kBubblePad;
             } else if (item.kind == Kind::Notice) {
                 color = kSecondary;
             } else if (item.kind == Kind::Error) {
@@ -2444,11 +2632,9 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             if (item.kind == Kind::Assistant) {
                 PaintMarkdown(item, x, y, left, g.column);
             }
-            PaintFeedSelection(static_cast<size_t>(&item - feed_.data()),
-                               {x, y + (item.kind == Kind::User ? kBubblePad : 0.f)});
+            PaintFeedSelection(static_cast<size_t>(&item - feed_.data()), {x, textY});
             brush_->SetColor(Color(color));
-            target_->DrawTextLayout({x, y + (item.kind == Kind::User ? kBubblePad : 0.f)}, item.layout.get(),
-                                    brush_.get());
+            target_->DrawTextLayout({x, textY}, item.layout.get(), brush_.get());
         }
         y += item.height + kGap;
     }
@@ -2553,7 +2739,7 @@ float ChatWindow::ApprovalHeight(const FeedItem& item) {
     }
     DWRITE_TEXT_METRICS metrics{};
     item.layout->GetMetrics(&metrics);
-    const float buttons = item.verdict == Verdict::Pending ? kCardPad + kCardButton : 0.f;
+    const float buttons = item.verdict == Verdict::Pending || HasFileActions(item) ? kCardPad + kCardButton : 0.f;
     return kCardPad + kCardTitle + 4.f + metrics.height + buttons + kCardPad;
 }
 
@@ -2562,6 +2748,10 @@ void ChatWindow::ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_R
     const float bottom = item.top + item.height - kCardPad;
     allow = D2D1::RectF(left, bottom - kCardButton, left + kCardButtonWidth, bottom);
     deny = D2D1::RectF(allow.right + 8.f, allow.top, allow.right + 8.f + kCardButtonWidth, bottom);
+}
+
+void ChatWindow::ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& open, D2D1_RECT_F& reveal) {
+    ApprovalButtons(g, item, open, reveal);  // where "allow" and "deny" were
 }
 
 void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float left) {
@@ -2603,6 +2793,14 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
         Text(L"Разрешить", button_.get(), allow, kPrimary);
         Fill(deny, 7.f, onItem && hover_.target == Target::ApprovalDeny ? kLine : kRaised);
         Text(L"Отклонить", button_.get(), deny, kPrimary);
+    } else if (HasFileActions(item)) {
+        D2D1_RECT_F open{}, reveal{};
+        ApprovalFileButtons(g, item, open, reveal);
+        const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
+        Fill(open, 7.f, onItem && hover_.target == Target::CardOpen ? kLine : kRaised);
+        Text(L"Открыть", button_.get(), open, kPrimary);
+        Fill(reveal, 7.f, onItem && hover_.target == Target::CardReveal ? kLine : kRaised);
+        Text(L"В папке", button_.get(), reveal, kPrimary);
     }
 }
 
@@ -4159,7 +4357,7 @@ void ChatWindow::PaintSignIn(const Geometry& g) {
 D2D1_POINT_2F ChatWindow::ItemOrigin(const Geometry& g, const FeedItem& item) const {
     switch (item.kind) {
     case Kind::User:
-        return {g.left + g.column - (item.textWidth + 2 * kBubblePad) + kBubblePad, item.top + kBubblePad};
+        return {g.left + g.column - (item.textWidth + 2 * kBubblePad) + kBubblePad, item.top + item.bubbleTop + kBubblePad};
     case Kind::Approval:
         return {g.left + kCardPad, item.top + kCardPad + kCardTitle + 4.f};
     default:
@@ -5073,7 +5271,7 @@ void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
 // The feed's menu: what is under the pointer can be taken: a selection, a link, a code block or table,
 // the whole message.
 void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
-    constexpr UINT kSelection = 1, kOpenLink = 2, kCopyLink = 3, kCopyCode = 4, kCopyMessage = 5;
+    constexpr UINT kSelection = 1, kOpenLink = 2, kCopyLink = 3, kCopyCode = 4, kCopyMessage = 5, kReveal = 6;
     const Geometry g = Layout();
     const float y = at.y;
     const FeedItem* codeOwner = nullptr;
@@ -5091,7 +5289,13 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
     if (HasFeedSelection()) {
         AppendMenuW(menu.get(), MF_STRING, kSelection, L"Копировать выделенное\tCtrl+C");
     }
-    if (link != nullptr && !link->url.empty()) {
+    const bool path = link != nullptr && IsLocalPath(link->url);
+    if (path) {  // a file on this computer
+        separate();
+        AppendMenuW(menu.get(), MF_STRING, kOpenLink, L"Открыть");
+        AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
+        AppendMenuW(menu.get(), MF_STRING, kCopyLink, L"Копировать путь");
+    } else if (link != nullptr && !link->url.empty()) {
         separate();
         AppendMenuW(menu.get(), MF_STRING, kOpenLink, L"Открыть ссылку");
         AppendMenuW(menu.get(), MF_STRING, kCopyLink, L"Копировать ссылку");
@@ -5113,9 +5317,18 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
         CopyFeedSelection();
         break;
     case kOpenLink:
-        if (link != nullptr && (link->url.starts_with(L"http://") || link->url.starts_with(L"https://") ||
-                                link->url.starts_with(L"mailto:"))) {
+        if (path) {
+            OpenFile(link->url);
+        } else if (link != nullptr && (link->url.starts_with(L"http://") || link->url.starts_with(L"https://") ||
+                                       link->url.starts_with(L"mailto:"))) {
             ShellExecuteW(hwnd_, L"open", link->url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        break;
+    case kReveal:
+        if (const std::wstring file = path ? ExistingPath(link->url) : std::wstring(); !file.empty()) {
+            RevealInFolder(file);
+        } else {
+            Flash(L"Нет такого файла", 3000);
         }
         break;
     case kCopyLink:
@@ -5133,6 +5346,179 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
         break;
     default:
         break;
+    }
+}
+
+// ---- Pictures in the feed --------------------------------------------------------------------------
+
+FeedImage ChatWindow::MakeFeedImage(std::wstring path) const {
+    FeedImage image;
+    UINT width = 0;
+    UINT height = 0;
+    image.preview = LoadImagePreview(wic_.get(), path, kPreviewSide, width, height);
+    image.path = std::move(path);
+    if (image.preview && width > 0 && height > 0) {
+        const float scale = std::min({1.f, kImageWidth / static_cast<float>(width), kImageHeight / static_cast<float>(height)});
+        image.width = static_cast<float>(width) * scale;
+        image.height = static_cast<float>(height) * scale;
+    }
+    return image;
+}
+
+D2D1_RECT_F ChatWindow::ImageRect(const Geometry& g, const FeedItem& item, size_t index) const {
+    const D2D1_RECT_F& at = item.images[index].at;
+    return D2D1::RectF(g.left + at.left, item.top + at.top, g.left + at.right, item.top + at.bottom);
+}
+
+ID2D1Bitmap* ChatWindow::Bitmap(FeedImage& image) {
+    if (!image.preview) {
+        return nullptr;
+    }
+    if (!image.bitmap || image.generation != targetGeneration_) {
+        image.bitmap.reset();
+        if (FAILED(target_->CreateBitmapFromWicBitmap(image.preview.get(), nullptr, image.bitmap.put()))) {
+            return nullptr;
+        }
+        image.generation = targetGeneration_;
+    }
+    return image.bitmap.get();
+}
+
+void ChatWindow::PaintImages(const Geometry& g, FeedItem& item) {
+    const size_t index = static_cast<size_t>(&item - feed_.data());
+    for (size_t k = 0; k < item.images.size(); ++k) {
+        const D2D1_RECT_F rect = ImageRect(g, item, k);
+        if (rect.bottom < g.feed.top || rect.top > g.feed.bottom) {
+            continue;
+        }
+        if (ID2D1Bitmap* bitmap = Bitmap(item.images[k]); bitmap != nullptr) {
+            target_->DrawBitmap(bitmap, rect, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+        const bool hovered = hover_.target == Target::FeedImage && hover_.row == index && hover_.sub == k;
+        brush_->SetColor(Color(hovered ? kAccent : kLine));
+        target_->DrawRectangle(rect, brush_.get(), 1.f);
+    }
+}
+
+void ChatWindow::OpenViewer(size_t item, size_t image) {
+    if (item >= feed_.size() || image >= feed_[item].images.size()) {
+        return;
+    }
+    if (popup_ != Popup::Image) {
+        HideTip();
+        OpenPopup(Popup::Image);
+    }
+    viewerItem_ = item;
+    viewerImage_ = image;
+    viewer_ = {};
+    viewer_.path = feed_[item].images[image].path;
+    UINT width = 0;
+    UINT height = 0;
+    viewer_.preview = LoadImagePreview(wic_.get(), viewer_.path, kViewerSide, width, height);
+    viewer_.width = static_cast<float>(width);  // here: the picture's own pixels
+    viewer_.height = static_cast<float>(height);
+    if (!viewer_.preview) {
+        const std::wstring path = viewer_.path;
+        ClosePopup();
+        Flash(L"Не открывается картинка: " + path, 4000);
+        return;
+    }
+    Refresh();
+}
+
+// The arrows: the picture before or after this one, across all messages.
+void ChatWindow::StepViewer(int delta) {
+    std::vector<std::pair<size_t, size_t>> all;
+    size_t at = 0;
+    for (size_t i = 0; i < feed_.size(); ++i) {
+        for (size_t k = 0; k < feed_[i].images.size(); ++k) {
+            if (i == viewerItem_ && k == viewerImage_) {
+                at = all.size();
+            }
+            all.emplace_back(i, k);
+        }
+    }
+    const long long next = static_cast<long long>(at) + delta;
+    if (next >= 0 && next < static_cast<long long>(all.size())) {
+        OpenViewer(all[static_cast<size_t>(next)].first, all[static_cast<size_t>(next)].second);
+    }
+}
+
+void ChatWindow::PaintViewer(const Geometry& g) {
+    Fill(D2D1::RectF(0, 0, g.width, g.height), 0.f, 0x000000, 0.9f);
+    constexpr float kMargin = 28.f;
+    constexpr float kBar = 44.f;
+    if (ID2D1Bitmap* bitmap = Bitmap(viewer_); bitmap != nullptr) {
+        const float natural = 96.f / Dpi();  // a pixel of the picture as one of the screen
+        const float width = viewer_.width * natural;
+        const float height = viewer_.height * natural;
+        const float scale = std::min({1.f, (g.width - 2 * kMargin) / width, (g.height - 2 * kMargin - kBar) / height});
+        const float w = width * scale;
+        const float h = height * scale;
+        const float x = (g.width - w) / 2;
+        const float y = kMargin + (g.height - 2 * kMargin - kBar - h) / 2;
+        target_->DrawBitmap(bitmap, D2D1::RectF(x, y, x + w, y + h), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    }
+    size_t total = 0;
+    size_t number = 0;
+    for (size_t i = 0; i < feed_.size(); ++i) {
+        for (size_t k = 0; k < feed_[i].images.size(); ++k) {
+            ++total;
+            if (i == viewerItem_ && k == viewerImage_) {
+                number = total;
+            }
+        }
+    }
+    std::wstring line = std::filesystem::path(viewer_.path).filename().wstring();
+    if (total > 1) {
+        line += std::format(L"   {} из {}   ← →", number, total);
+    }
+    line += L"   ·   Ctrl+C — копировать   ·   Enter — открыть в программе   ·   Esc — закрыть";
+    Text(line, button_.get(), D2D1::RectF(kMargin, g.height - kMargin - kBar + 12.f, g.width - kMargin, g.height - kMargin),
+         kSecondary);
+}
+
+void ChatWindow::ShowImageMenu(const std::wstring& path, POINT screen) {
+    constexpr UINT kCopy = 1, kOpen = 2, kReveal = 3, kCopyPath = 4;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, kCopy, L"Копировать картинку\tCtrl+C");
+    AppendMenuW(menu.get(), MF_STRING, kOpen, L"Открыть в программе");
+    AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kCopyPath, L"Копировать путь");
+    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    case kCopy:
+        CopyImage(path);
+        break;
+    case kOpen:
+        OpenFile(path);
+        break;
+    case kReveal:
+        RevealInFolder(path);
+        break;
+    case kCopyPath:
+        if (SetClipboardText(hwnd_, path)) {
+            Flash(L"Путь скопирован");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void ChatWindow::CopyImage(const std::wstring& path) {
+    Flash(CopyImageToClipboard(wic_.get(), hwnd_, path) ? L"Картинка скопирована" : L"Не удалось скопировать картинку");
+}
+
+void ChatWindow::OpenFile(const std::wstring& path) {
+    const std::wstring file = ExistingPath(path);
+    if (file.empty()) {
+        Flash(L"Нет такого файла: " + path, 4000);
+        return;
+    }
+    // A file no app is set for gets Windows' "open with".
+    if (reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd_, L"open", file.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
+        ShellExecuteW(hwnd_, L"openas", file.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 }
 
@@ -5171,6 +5557,11 @@ std::wstring ChatWindow::TooltipText() {
         return hover_.row < attachments_.size() ? attachments_[hover_.row].name : std::wstring();
     case Target::RemoveAttachment:
         return L"Убрать";
+    case Target::FeedImage:
+        return L"Открыть здесь. Правая кнопка: копировать, открыть в программе, показать в папке";
+    case Target::CardOpen:
+    case Target::CardReveal:
+        return hover_.row < feed_.size() ? WrittenFile(feed_[hover_.row], workspace_) : std::wstring();
     case Target::ModelChip:
         return L"Модель";
     case Target::EffortChip:
@@ -5532,6 +5923,7 @@ void ChatWindow::OpenPopup(Popup popup) {
         pendingEffort_ = settings_.effort;
         break;
     case Popup::Usage:
+    case Popup::Image:
     case Popup::None:
         break;
     }
@@ -5549,6 +5941,9 @@ void ChatWindow::ClosePopup() {
     popup_ = Popup::None;
     moreOpen_ = false;
     hover_ = {};
+    if (was == Popup::Image) {
+        viewer_ = {};
+    }
     if (was == Popup::Effort && pendingEffort_ != settings_.effort) {
         Settings next = settings_;
         next.effort = pendingEffort_;
@@ -5605,6 +6000,11 @@ void ChatWindow::OpenSession(size_t filteredIndex) {
         switch (entry.kind) {
         case EntryKind::User:
             Add(Kind::User, entry.text);
+            for (const TranscriptImage& picture : entry.images) {
+                if (FeedImage image = MakeFeedImage(SaveChatImage(picture.base64, picture.mediaType)); image.preview) {
+                    feed_.back().images.push_back(std::move(image));
+                }
+            }
             break;
         case EntryKind::Assistant:
             Add(Kind::Assistant, entry.text);
@@ -5815,8 +6215,17 @@ void ChatWindow::Submit() {
     // Attachments first, then the words about them, as Claude's own apps send it.
     Json content = Json::array();
     std::wstring shown;
+    std::vector<FeedImage> images;  // shown as pictures above the bubble, not as lines in it
     for (const Attachment& attachment : attachments_) {
         content.push_back(ContentBlock(attachment));
+        if (attachment.type == Attachment::Type::Image) {
+            const std::wstring path =
+                attachment.path.empty() ? SaveChatImage(attachment.base64, attachment.mediaType) : attachment.path;
+            if (FeedImage image = MakeFeedImage(path); image.preview) {
+                images.push_back(std::move(image));
+                continue;
+            }
+        }
         shown += (shown.empty() ? L"" : L"\n") + (L"📎 " + attachment.name);
     }
     if (!text.empty()) {
@@ -5825,6 +6234,7 @@ void ChatWindow::Submit() {
     }
     claude_.SendUserContent(std::move(content));
     Add(Kind::User, std::move(shown));
+    feed_.back().images = std::move(images);
     attachments_.clear();
     SetWindowTextW(input_, L"");
     PlaceChildren();
@@ -5982,6 +6392,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     item.text = std::move(summary.detail);
     item.requestId = requestId;
     item.toolUseId = JsonStr(request, "tool_use_id");
+    item.tool = name;
     item.input = input;
     feed_.push_back(std::move(item));
     stick_ = true;

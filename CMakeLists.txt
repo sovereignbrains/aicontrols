@@ -18,6 +18,7 @@ endif()
 
 find_package(wil CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(unofficial-webview2 CONFIG REQUIRED)  # the HTML preview: the static loader, Edge's runtime does the rest
 
 # Everything that is not UI: claude.exe and its protocol.
 add_library(aic_core STATIC
@@ -42,7 +43,7 @@ add_executable(aicontrols WIN32
   src/app/fonts.cpp
   src/app/aicontrols.manifest
   src/app/aicontrols.rc)
-target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32)
+target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32 shlwapi unofficial::webview2::webview2)
 
 # Tests of the core without the UI: `ctest --test-dir build/dev`.
 enable_testing()

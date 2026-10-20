@@ -8,7 +8,10 @@
 #include <richedit.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <shobjidl.h>
+#include <WebView2.h>
+#include <wrl/event.h>
 
 #include <wil/com.h>
 #include <wil/resource.h>
@@ -101,6 +104,8 @@ struct CloneDone {
 };
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT_PTR kTipTimer = 2;  // the pointer has rested on something long enough for its hint
+constexpr UINT_PTR kPreviewTimer = 3;  // the preview looks whether its file (or one beside it) has changed
+constexpr UINT kPreviewCheck = 700;    // ms
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
 
@@ -267,6 +272,44 @@ std::wstring ExistingPath(std::wstring path) {
     return {};
 }
 
+std::wstring LowerExtension(const std::wstring& path) {
+    std::wstring extension = std::filesystem::path(path).extension().wstring();
+    for (wchar_t& c : extension) {
+        c = static_cast<wchar_t>(std::towlower(c));
+    }
+    return extension;
+}
+
+// A page the preview shows (and opens by itself when a tool writes one).
+bool IsPreviewable(const std::wstring& path) {
+    const std::wstring extension = LowerExtension(path);
+    return extension == L".html" || extension == L".htm" || extension == L".svg";
+}
+
+// The newest change to a page and the web files beside it (its CSS, scripts, pictures; not subfolders).
+std::filesystem::file_time_type FolderStamp(const std::wstring& page) {
+    namespace fs = std::filesystem;
+    static constexpr std::wstring_view kWeb[] = {L".html", L".htm", L".css", L".js",  L".mjs", L".svg",
+                                                 L".png",  L".jpg", L".jpeg", L".gif", L".webp", L".json"};
+    std::error_code error;
+    fs::file_time_type newest = fs::last_write_time(page, error);
+    if (error) {
+        newest = {};
+    }
+    size_t seen = 0;
+    for (const fs::directory_entry& entry : fs::directory_iterator(fs::path(page).parent_path(), error)) {
+        if (++seen > 500) {
+            break;
+        }
+        std::error_code entryError;
+        const std::wstring extension = LowerExtension(entry.path().wstring());
+        if (std::ranges::find(kWeb, extension) != std::end(kWeb) && entry.is_regular_file(entryError)) {
+            newest = std::max(newest, entry.last_write_time(entryError));
+        }
+    }
+    return newest;
+}
+
 // Explorer, at the file's folder with the file selected.
 void RevealInFolder(const std::wstring& path) {
     PIDLIST_ABSOLUTE item = nullptr;
@@ -338,6 +381,7 @@ enum class Target {
     EffortReset,
     ApprovalAllow,  // row: the feed item
     ApprovalDeny,   // row: the same
+    CardPreview,    // row: a card that wrote a page: show it in the preview
     CardOpen,       // row: a card that wrote a file: open the file
     CardReveal,     // row: the same: show it in its folder
     FeedImage,      // row: the feed item, sub: its picture
@@ -696,6 +740,7 @@ private:
         int number = 1;            // "Терминал 1", "Терминал 2" ...
         bool exited = false;
         size_t scroll = 0;         // lines scrolled back from the bottom
+        std::wstring preview;      // the preview tab (one at most, no shell): the HTML file it shows
     };
     TermTab* Tab() const { return activeTab_ < tabs_.size() ? tabs_[activeTab_].get() : nullptr; }
     VtScreen* Screen() const { return Tab() != nullptr ? Tab()->screen.get() : nullptr; }
@@ -721,6 +766,17 @@ private:
     size_t TermFirstLine() const;
     TermPoint TermCellAt(const Geometry& g, float x, float y) const;
     void ScrollTerminal(long long lines);
+
+    // The preview: an HTML file in a tab beside the shells (WebView2), loaded again whenever it or a file beside
+    // it changes. Opens by itself when a tool writes such a file here.
+    bool PreviewShown() const { return terminalOpen_ && Tab() != nullptr && !Tab()->preview.empty(); }
+    TermTab* PreviewTab() const;
+    void OpenPreview(const std::wstring& path);
+    void EnsureWebView();
+    void NavigatePreview();
+    void PlacePreview();
+    void CheckPreview();
+    void ShowPreviewMenu(size_t index, POINT screen);
 
     // The sidebar: search, the way to the secrets, the chats (or the secrets view in their place).
     void PaintSidebar(const Geometry& g);
@@ -772,7 +828,9 @@ private:
     void PaintApproval(const Geometry& g, const FeedItem& item, float left);
     void StyleMarkdown(FeedItem& item);
     void PaintMarkdown(const FeedItem& item, float x, float y, float left, float column);
-    static void ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& open, D2D1_RECT_F& reveal);
+    // A page gets "preview" first; other files have it empty.
+    static void ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& preview, D2D1_RECT_F& open,
+                                    D2D1_RECT_F& reveal);
 
     // Pictures in the feed: above the bubble of the message they went with; a click shows one over the window
     // (the arrows go through the others), the right button copies, opens or finds it.
@@ -873,6 +931,11 @@ private:
     std::vector<std::unique_ptr<TermTab>> tabs_;
     size_t activeTab_ = 0;
     WPARAM nextTabId_ = 0;
+    wil::com_ptr<ICoreWebView2Controller> webController_;
+    wil::com_ptr<ICoreWebView2> webView_;
+    bool webCreating_ = false;
+    std::wstring webShown_;  // the file the preview has loaded
+    std::filesystem::file_time_type previewStamp_{};  // ... and the newest change in its folder then
     wil::com_ptr<IDWriteTextFormat> termFont_;
     wil::com_ptr<IDWriteTextFormat> termBold_;
     float sidebarWidth_ = kSidebar;   // as dragged; kept in the settings
@@ -1444,6 +1507,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 const std::wstring url = LinkAt(Layout(), at.x, at.y);
                 if (url.starts_with(L"http://") || url.starts_with(L"https://") || url.starts_with(L"mailto:")) {
                     ShellExecuteW(hwnd_, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                } else if (IsLocalPath(url) && IsPreviewable(url)) {
+                    OpenPreview(url);
                 } else if (IsLocalPath(url)) {
                     OpenFile(url);
                 }
@@ -1608,6 +1673,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd_, kStatusTimer);
             status_.clear();
             Refresh();
+        } else if (wParam == kPreviewTimer) {
+            CheckPreview();
         } else if (wParam == kTipTimer) {
             KillTimer(hwnd_, kTipTimer);
             if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
@@ -1657,6 +1724,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_DESTROY:
+        if (webController_) {
+            webController_->Close();  // the browser processes go with the window
+            webController_.reset();
+            webView_.reset();
+        }
         authCancel_ = true;  // a sign-in in progress ends at once
         if (authThread_.joinable()) {
             authThread_.join();
@@ -1862,6 +1934,9 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::ApprovalDeny:
         Decide(hit.row, false);
         break;
+    case Target::CardPreview:
+        OpenPreview(WrittenFile(feed_[hit.row], workspace_));
+        return;
     case Target::CardOpen:
         OpenFile(WrittenFile(feed_[hit.row], workspace_));
         break;
@@ -2307,8 +2382,11 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 }
             }
             if (HasFileActions(item)) {
-                D2D1_RECT_F open{}, reveal{};
-                ApprovalFileButtons(g, item, open, reveal);
+                D2D1_RECT_F preview{}, open{}, reveal{};
+                ApprovalFileButtons(g, item, preview, open, reveal);
+                if (Inside(preview, x, y)) {
+                    return {Target::CardPreview, i};
+                }
                 if (Inside(open, x, y)) {
                     return {Target::CardOpen, i};
                 }
@@ -2409,6 +2487,7 @@ void ChatWindow::PlaceChildren() {
     SendMessageW(input_, EM_REQUESTRESIZE, 0, 0);
     PlaceSecretFields();
     SyncTerminalSize();
+    PlacePreview();
 }
 
 void ChatWindow::EnsureTarget() {
@@ -2758,8 +2837,20 @@ void ChatWindow::ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_R
     deny = D2D1::RectF(allow.right + 8.f, allow.top, allow.right + 8.f + kCardButtonWidth, bottom);
 }
 
-void ChatWindow::ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& open, D2D1_RECT_F& reveal) {
-    ApprovalButtons(g, item, open, reveal);  // where "allow" and "deny" were
+void ChatWindow::ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& preview, D2D1_RECT_F& open,
+                                     D2D1_RECT_F& reveal) {
+    D2D1_RECT_F first{}, second{};
+    ApprovalButtons(g, item, first, second);  // where "allow" and "deny" were
+    if (!IsPreviewable(ToWide(JsonStr(item.input, "path")))) {
+        preview = {};
+        open = first;
+        reveal = second;
+        return;
+    }
+    const float step = second.left - first.left;
+    preview = first;
+    open = second;
+    reveal = D2D1::RectF(second.left + step, second.top, second.right + step, second.bottom);
 }
 
 void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float left) {
@@ -2802,9 +2893,13 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
         Fill(deny, 7.f, onItem && hover_.target == Target::ApprovalDeny ? kLine : kRaised);
         Text(L"Отклонить", button_.get(), deny, kPrimary);
     } else if (HasFileActions(item)) {
-        D2D1_RECT_F open{}, reveal{};
-        ApprovalFileButtons(g, item, open, reveal);
+        D2D1_RECT_F preview{}, open{}, reveal{};
+        ApprovalFileButtons(g, item, preview, open, reveal);
         const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
+        if (preview.right > preview.left) {
+            Fill(preview, 7.f, kAccent, onItem && hover_.target == Target::CardPreview ? 0.85f : 1.f);
+            Text(L"Превью", button_.get(), preview, kPrimary);
+        }
         Fill(open, 7.f, onItem && hover_.target == Target::CardOpen ? kLine : kRaised);
         Text(L"Открыть", button_.get(), open, kPrimary);
         Fill(reveal, 7.f, onItem && hover_.target == Target::CardReveal ? kLine : kRaised);
@@ -3399,6 +3494,9 @@ void ChatWindow::TerminalGrid(int& cols, int& rows) const {
 }
 
 std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
+    if (!tab.preview.empty()) {
+        return L"Превью · " + std::filesystem::path(tab.preview).filename().wstring();
+    }
     if (!tab.name.empty()) {
         return tab.name;
     }
@@ -3417,6 +3515,7 @@ void ChatWindow::AddTerminalTab() {
     selAnchor_.reset();
     selEnd_.reset();
     StartShell(*tabs_.back());
+    PlacePreview();
     Refresh();
 }
 
@@ -3461,6 +3560,10 @@ void ChatWindow::CloseTerminalTab(size_t index) {
     selAnchor_.reset();
     selEnd_.reset();
     hover_ = {};
+    if (PreviewTab() == nullptr) {
+        webShown_.clear();
+    }
+    PlacePreview();
     if (tabs_.empty()) {
         activeTab_ = 0;
         SetTerminalOpen(false);
@@ -3470,6 +3573,7 @@ void ChatWindow::CloseTerminalTab(size_t index) {
         activeTab_ = activeTab_ == 0 ? 0 : activeTab_ - 1;
     }
     activeTab_ = std::min(activeTab_, tabs_.size() - 1);
+    PlacePreview();
     Refresh();
 }
 
@@ -3479,9 +3583,10 @@ void ChatWindow::SelectTerminalTab(size_t index) {
         selAnchor_.reset();
         selEnd_.reset();
     }
-    termFocus_ = true;
+    termFocus_ = !PreviewShown();  // the page takes its own clicks and keys
     searchFocus_ = false;
     SetFocus(hwnd_);
+    PlacePreview();
     Refresh();
 }
 
@@ -5280,7 +5385,8 @@ void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
 // The feed's menu: what is under the pointer can be taken: a selection, a link, a code block or table,
 // the whole message.
 void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
-    constexpr UINT kSelection = 1, kOpenLink = 2, kCopyLink = 3, kCopyCode = 4, kCopyMessage = 5, kReveal = 6;
+    constexpr UINT kSelection = 1, kOpenLink = 2, kCopyLink = 3, kCopyCode = 4, kCopyMessage = 5, kReveal = 6,
+                   kPreview = 7;
     const Geometry g = Layout();
     const float y = at.y;
     const FeedItem* codeOwner = nullptr;
@@ -5301,7 +5407,10 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
     const bool path = link != nullptr && IsLocalPath(link->url);
     if (path) {  // a file on this computer
         separate();
-        AppendMenuW(menu.get(), MF_STRING, kOpenLink, L"Открыть");
+        if (IsPreviewable(link->url)) {
+            AppendMenuW(menu.get(), MF_STRING, kPreview, L"Превью");
+        }
+        AppendMenuW(menu.get(), MF_STRING, kOpenLink, IsPreviewable(link->url) ? L"Открыть в браузере" : L"Открыть");
         AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
         AppendMenuW(menu.get(), MF_STRING, kCopyLink, L"Копировать путь");
     } else if (link != nullptr && !link->url.empty()) {
@@ -5333,6 +5442,11 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
             ShellExecuteW(hwnd_, L"open", link->url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
         break;
+    case kPreview:
+        if (path) {
+            OpenPreview(link->url);
+        }
+        break;
     case kReveal:
         if (const std::wstring file = path ? ExistingPath(link->url) : std::wstring(); !file.empty()) {
             RevealInFolder(file);
@@ -5352,6 +5466,187 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
         break;
     case kCopyMessage:
         CopyItemAt(y);
+        break;
+    default:
+        break;
+    }
+}
+
+// ---- The preview -----------------------------------------------------------------------------------
+
+ChatWindow::TermTab* ChatWindow::PreviewTab() const {
+    for (const auto& tab : tabs_) {
+        if (!tab->preview.empty()) {
+            return tab.get();
+        }
+    }
+    return nullptr;
+}
+
+void ChatWindow::OpenPreview(const std::wstring& path) {
+    const std::wstring file = ExistingPath(path);
+    if (file.empty()) {
+        Flash(L"Нет такого файла: " + path, 4000);
+        return;
+    }
+    TermTab* tab = PreviewTab();
+    if (tab == nullptr) {
+        auto created = std::make_unique<TermTab>();
+        created->id = ++nextTabId_;
+        tabs_.push_back(std::move(created));
+        tab = tabs_.back().get();
+    }
+    tab->preview = file;
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        if (tabs_[i].get() == tab) {
+            activeTab_ = i;
+        }
+    }
+    selAnchor_.reset();
+    selEnd_.reset();
+    SetTerminalOpen(true);
+    termFocus_ = false;  // typing stays in the chat
+    SetFocus(input_);
+    EnsureWebView();
+    if (webShown_ != file) {
+        NavigatePreview();
+    }
+    PlacePreview();
+    SetTimer(hwnd_, kPreviewTimer, kPreviewCheck, nullptr);
+    Refresh();
+}
+
+void ChatWindow::EnsureWebView() {
+    if (webController_ || webCreating_) {
+        return;
+    }
+    webCreating_ = true;
+    const auto failed = [this] {
+        webCreating_ = false;
+        Flash(L"Превью не запустилось: нужен WebView2 (Microsoft Edge)", 5000);
+    };
+    wchar_t local[MAX_PATH]{};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    const std::wstring data = (std::filesystem::path(local) / L"AIControls" / L"WebView2").wstring();
+    const HRESULT started = CreateCoreWebView2EnvironmentWithOptions(
+        nullptr, data.c_str(), nullptr,
+        Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [this, failed](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
+                if (FAILED(result) || environment == nullptr) {
+                    failed();
+                    return S_OK;
+                }
+                const HRESULT creating = environment->CreateCoreWebView2Controller(
+                    hwnd_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                               [this, failed](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
+                                   if (FAILED(created) || controller == nullptr) {
+                                       failed();
+                                       return S_OK;
+                                   }
+                                   webCreating_ = false;
+                                   webController_ = controller;
+                                   webController_->get_CoreWebView2(webView_.put());
+                                   if (const auto colored = webController_.try_query<ICoreWebView2Controller2>()) {
+                                       colored->put_DefaultBackgroundColor(COREWEBVIEW2_COLOR{255, 0x12, 0x12, 0x13});
+                                   }
+                                   wil::com_ptr<ICoreWebView2Settings> settings;
+                                   if (webView_ && SUCCEEDED(webView_->get_Settings(settings.put()))) {
+                                       settings->put_IsStatusBarEnabled(FALSE);
+                                   }
+                                   webShown_.clear();
+                                   NavigatePreview();
+                                   PlacePreview();
+                                   return S_OK;
+                               })
+                               .Get());
+                if (FAILED(creating)) {
+                    failed();
+                }
+                return S_OK;
+            })
+            .Get());
+    if (FAILED(started)) {
+        failed();
+    }
+}
+
+void ChatWindow::NavigatePreview() {
+    const TermTab* tab = PreviewTab();
+    if (!webView_ || tab == nullptr) {
+        return;
+    }
+    std::wstring url(4096, L'\0');
+    DWORD length = static_cast<DWORD>(url.size());
+    if (FAILED(UrlCreateFromPathW(tab->preview.c_str(), url.data(), &length, 0))) {
+        return;
+    }
+    url.resize(length);
+    webView_->Navigate(url.c_str());
+    webShown_ = tab->preview;
+    previewStamp_ = FolderStamp(tab->preview);
+}
+
+// The page covers the panel under the tabs while its tab is the active one (and no picture is over the window).
+void ChatWindow::PlacePreview() {
+    if (!webController_) {
+        return;
+    }
+    const bool shown = PreviewShown() && popup_ != Popup::Image;
+    if (shown) {
+        const Geometry g = Layout();
+        const RECT bounds{ToPx(g.term.left + 1.f), ToPx(g.termScreen.top), ToPx(g.term.right), ToPx(g.term.bottom)};
+        webController_->put_Bounds(bounds);
+    }
+    webController_->put_IsVisible(shown ? TRUE : FALSE);
+}
+
+void ChatWindow::CheckPreview() {
+    const TermTab* tab = PreviewTab();
+    if (tab == nullptr) {
+        KillTimer(hwnd_, kPreviewTimer);
+        return;
+    }
+    if (!webView_ || !PreviewShown()) {
+        return;  // looked at again once it shows
+    }
+    if (webShown_ != tab->preview) {
+        NavigatePreview();
+    } else if (const auto stamp = FolderStamp(tab->preview); stamp != previewStamp_) {
+        previewStamp_ = stamp;
+        webView_->Reload();
+    }
+}
+
+void ChatWindow::ShowPreviewMenu(size_t index, POINT screen) {
+    const std::wstring page = tabs_[index]->preview;
+    constexpr UINT kReload = 1, kBrowser = 2, kReveal = 3, kCopyPath = 4, kClose = 5;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, kReload, L"Обновить");
+    AppendMenuW(menu.get(), MF_STRING, kBrowser, L"Открыть в браузере");
+    AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
+    AppendMenuW(menu.get(), MF_STRING, kCopyPath, L"Копировать путь");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kClose, L"Закрыть");
+    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    case kReload:
+        if (webView_) {
+            previewStamp_ = FolderStamp(page);
+            webView_->Reload();
+        }
+        break;
+    case kBrowser:
+        OpenFile(page);
+        break;
+    case kReveal:
+        RevealInFolder(page);
+        break;
+    case kCopyPath:
+        if (SetClipboardText(hwnd_, page)) {
+            Flash(L"Путь скопирован");
+        }
+        break;
+    case kClose:
+        CloseTerminalTab(index);
         break;
     default:
         break;
@@ -5568,6 +5863,7 @@ std::wstring ChatWindow::TooltipText() {
         return L"Убрать";
     case Target::FeedImage:
         return L"Открыть здесь. Правая кнопка: копировать, открыть в программе, показать в папке";
+    case Target::CardPreview:
     case Target::CardOpen:
     case Target::CardReveal:
         return hover_.row < feed_.size() ? WrittenFile(feed_[hover_.row], workspace_) : std::wstring();
@@ -5786,6 +6082,10 @@ void ChatWindow::ShowTabMenu(size_t index, POINT screen) {
     if (index >= tabs_.size()) {
         return;
     }
+    if (!tabs_[index]->preview.empty()) {
+        ShowPreviewMenu(index, screen);
+        return;
+    }
     constexpr UINT kRename = 1, kClear = 2, kNew = 3, kClose = 4;
     wil::unique_hmenu menu(CreatePopupMenu());
     AppendMenuW(menu.get(), MF_STRING, kRename, L"Переименовать");
@@ -5939,6 +6239,7 @@ void ChatWindow::OpenPopup(Popup popup) {
     searchFocus_ = false;
     termFocus_ = false;
     SetFocus(hwnd_);  // the panel's keys: digits, arrows
+    PlacePreview();   // a picture over the window covers the page too
     Refresh();
 }
 
@@ -5952,6 +6253,7 @@ void ChatWindow::ClosePopup() {
     hover_ = {};
     if (was == Popup::Image) {
         viewer_ = {};
+        PlacePreview();
     }
     if (was == Popup::Effort && pendingEffort_ != settings_.effort) {
         Settings next = settings_;
@@ -6441,6 +6743,9 @@ void ChatWindow::OnToolResult(const Json& block) {
         item.outputError = JsonAt(block, "is_error").is_boolean() && JsonAt(block, "is_error").get<bool>();
         item.done = true;
         item.layout.reset();
+        if (HasFileActions(item) && IsPreviewable(WrittenFile(item, workspace_))) {
+            OpenPreview(WrittenFile(item, workspace_));  // a page just written: shown at once, as it changes
+        }
         return;
     }
 }

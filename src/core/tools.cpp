@@ -536,6 +536,10 @@ std::string Tools::SystemPrompt() {
            "and set -e do not carry over, so use cwd or chain with &&. "
            "Stored secrets are passed with env_secrets or written as {{secret:NAME}}; their values are cut out of "
            "every output, so you never see them. "
+           "An HTML or SVG file you write or edit on this computer opens in the client's live preview beside the "
+           "chat, and it reloads whenever the file or a CSS/JS file beside it changes: for an interface mockup, write "
+           "one self-contained HTML file and refine it in place with edit_file. Paths you mention as C:\\... are "
+           "clickable for the user. "
            "Prefer non-interactive commands (no pagers, no editors; -y only when the user asked for changes). "
            "Reply in the language the user writes in.";
 }

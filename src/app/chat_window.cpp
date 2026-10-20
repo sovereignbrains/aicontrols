@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -109,6 +110,15 @@ constexpr UINT_PTR kPreviewTimer = 3;  // the preview looks whether its file (or
 constexpr UINT kPreviewCheck = 700;    // ms
 constexpr UINT_PTR kUpdateTimer = 4;   // a newer AIControls may have been built
 constexpr UINT kUpdateCheck = 30'000;  // ms
+// The mascot puffs up and back: in rhythm while Claude answers, now and then while idle. The window is drawn
+// again only during a puff.
+constexpr UINT_PTR kPuffTimer = 5;       // a frame of a puff
+constexpr UINT_PTR kPuffIdleTimer = 6;   // the next puff while idle
+constexpr UINT kPuffFrame = 33;          // ms
+constexpr UINT kPuffIdle = 7'000;        // ms between puffs while idle
+constexpr float kPuffSeconds = 1.2f;     // one puff, up and back
+constexpr float kPuffBusy = 0.18f;       // how much bigger at its fullest, while answering
+constexpr float kPuffCalm = 0.10f;       // ... and while idle
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
 
@@ -837,6 +847,10 @@ private:
     // A newer AIControls built here: a button in the header installs it, restarts and opens this chat again.
     void CheckAppUpdate();
     void StartUpdate();
+
+    void StartPuff();
+    void OnPuffFrame();
+    float PuffScale() const;
     std::wstring UpdateLabel() const { return update_ ? L"Обновить до " + ToWide(update_->version) : std::wstring(); }  // Ctrl+click in the page: the element goes into the message
     // Wide: the sidebar goes and the chat keeps only a strip, the rest is the preview's; again: as it was.
     void SetPreviewWide(bool wide);
@@ -1053,6 +1067,8 @@ private:
     size_t viewerImage_ = 0;
     FeedImage viewer_;
     FeedImage mascot_;  // sits on the input box, as the one in Claude's app
+    bool puffing_ = false;
+    std::chrono::steady_clock::time_point puffStart_{};
     Hit hover_;
     bool trackingMouse_ = false;
 
@@ -1209,6 +1225,7 @@ int ChatWindow::Run(int show) {
     }
     CheckAppUpdate();
     SetTimer(hwnd_, kUpdateTimer, kUpdateCheck, nullptr);
+    SetTimer(hwnd_, kPuffIdleTimer, kPuffIdle, nullptr);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1770,6 +1787,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             CheckPreview();
         } else if (wParam == kUpdateTimer) {
             CheckAppUpdate();
+        } else if (wParam == kPuffTimer) {
+            OnPuffFrame();
+        } else if (wParam == kPuffIdleTimer) {
+            StartPuff();
         } else if (wParam == kTipTimer) {
             KillTimer(hwnd_, kTipTimer);
             if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
@@ -3134,9 +3155,10 @@ void ChatWindow::PaintInput(const Geometry& g) {
     brush_->SetColor(inputFocused_ ? Color(kAccent, 0.75f) : Color(kLine));
     target_->DrawRoundedRectangle(D2D1::RoundedRect(g.box, 12.f, 12.f), brush_.get(), 1.f);
     if (ID2D1Bitmap* mascot = Bitmap(mascot_); mascot != nullptr && g.box.right - g.box.left > 200.f) {
-        constexpr float kMascot = 32.f;  // on the box's top edge, near its right end
-        const D2D1_RECT_F at = D2D1::RectF(g.box.right - 24.f - kMascot, g.box.top - kMascot + 3.f, g.box.right - 24.f,
-                                           g.box.top + 3.f);
+        constexpr float kMascot = 32.f;  // on the box's top edge, near its right end; a puff grows it from there
+        const float size = kMascot * PuffScale();
+        const float middle = g.box.right - 24.f - kMascot / 2;
+        const D2D1_RECT_F at = D2D1::RectF(middle - size / 2, g.box.top + 3.f - size, middle + size / 2, g.box.top + 3.f);
         target_->DrawBitmap(mascot, at, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
 
@@ -5836,6 +5858,40 @@ void ChatWindow::OnPreviewPick(const std::wstring& message) {
     Flash(L"Элемент в сообщении: допиши, что с ним сделать");
 }
 
+void ChatWindow::StartPuff() {
+    if (puffing_ || !mascot_.preview) {
+        return;
+    }
+    KillTimer(hwnd_, kPuffIdleTimer);
+    puffing_ = true;
+    puffStart_ = std::chrono::steady_clock::now();
+    SetTimer(hwnd_, kPuffTimer, kPuffFrame, nullptr);
+}
+
+void ChatWindow::OnPuffFrame() {
+    const auto puff = std::chrono::duration<float>(kPuffSeconds);
+    if (std::chrono::steady_clock::now() - puffStart_ >= puff) {
+        if (busy_) {  // still answering: the next breath at once
+            puffStart_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(puff);
+        } else {
+            puffing_ = false;
+            KillTimer(hwnd_, kPuffTimer);
+            SetTimer(hwnd_, kPuffIdleTimer, kPuffIdle, nullptr);
+        }
+    }
+    Refresh();
+}
+
+// 1 at rest; up to 1 + kPuffBusy (or kPuffCalm) halfway through a puff, eased in and out.
+float ChatWindow::PuffScale() const {
+    if (!puffing_) {
+        return 1.f;
+    }
+    const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - puffStart_).count() / kPuffSeconds;
+    const float wave = std::sin(std::numbers::pi_v<float> * std::clamp(t, 0.f, 1.f));
+    return 1.f + (busy_ ? kPuffBusy : kPuffCalm) * wave * wave;
+}
+
 void ChatWindow::CheckAppUpdate() {
     std::optional<AppUpdate> found = FindAppUpdate(AppUpdateFolders(), InstalledAppVersion());
     const bool changed = found.has_value() != update_.has_value() || (found && found->version != update_->version);
@@ -6878,6 +6934,7 @@ void ChatWindow::Submit() {
     PlaceChildren();
     busy_ = true;
     stick_ = true;
+    StartPuff();
     Refresh();
 }
 
@@ -7019,6 +7076,9 @@ void ChatWindow::OnClaude(const Json& message) {
     if (updatePending_ && !busy_) {  // the turn the update waited for has ended
         StartUpdate();
         return;
+    }
+    if (busy_) {
+        StartPuff();
     }
     Refresh();
 }

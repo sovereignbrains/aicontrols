@@ -139,6 +139,49 @@ constexpr float kSidebar = 252.f;  // the left column: search, secrets, the chat
 constexpr float kHistoryRow = 34.f;
 constexpr float kNavRow = 34.f;
 constexpr float kMinChat = 420.f;  // the chat never gets narrower than this: side panels give way first
+constexpr float kMinChatPreview = 340.f;  // ... but beside a preview it may be a strip
+
+// Put into every page the preview loads: Ctrl shows the element under the pointer, Ctrl+click tells the window
+// which one it is (a short CSS path and its text), to be named in the message being typed.
+constexpr const wchar_t* kPickScript = LR"JS((() => {
+  if (window.__aicPick) return;
+  window.__aicPick = true;
+  let box = null;
+  const mark = (el) => {
+    if (!box) {
+      box = document.createElement('div');
+      box.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #4c92ff;' +
+                          'border-radius:3px;background:rgba(76,146,255,.12)';
+      document.documentElement.appendChild(box);
+    }
+    const r = el.getBoundingClientRect();
+    Object.assign(box.style, {left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px',
+                              display: 'block'});
+  };
+  const hide = () => { if (box) box.style.display = 'none'; };
+  const path = (el) => {
+    const parts = [];
+    while (el && el.nodeType === 1 && el !== document.body && el !== document.documentElement && parts.length < 4) {
+      let part = el.tagName.toLowerCase();
+      if (el.id) { parts.unshift(part + '#' + el.id); break; }
+      const classes = [...el.classList].slice(0, 2);
+      if (classes.length) part += '.' + classes.join('.');
+      parts.unshift(part);
+      el = el.parentElement;
+    }
+    return parts.join(' > ');
+  };
+  document.addEventListener('mousemove', (e) => { if (e.ctrlKey) mark(e.target); else hide(); }, true);
+  document.addEventListener('keyup', (e) => { if (e.key === 'Control') hide(); }, true);
+  document.addEventListener('click', (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    e.stopPropagation();
+    hide();
+    const text = (e.target.innerText || e.target.value || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    window.chrome.webview.postMessage(JSON.stringify({selector: path(e.target), text}));
+  }, true);
+})();)JS";
 constexpr float kMenuRow = 30.f;
 constexpr float kModelsWidth = 270.f;
 constexpr float kMoreWidth = 230.f;
@@ -358,6 +401,7 @@ enum class Target {
     TermTabClose,  // row: the same
     TermAdd,
     TermScreen,
+    PreviewWide,   // the preview over the window, or back
     NewChat,
     Attach,
     AttachmentChip,    // row: an index into the attachments; shows its remove button
@@ -408,6 +452,7 @@ struct Geometry {
     D2D1_RECT_F splitTerminal{};  // ... and of the terminal's
     D2D1_RECT_F term{};  // the terminal column (empty when closed)
     D2D1_RECT_F termClose{};
+    D2D1_RECT_F termWide{};   // beside a preview: widen it over the window, or back
     D2D1_RECT_F termScreen{};
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
     D2D1_RECT_F termAdd{};               // "+": another shell
@@ -777,6 +822,10 @@ private:
     void PlacePreview();
     void CheckPreview();
     void ShowPreviewMenu(size_t index, POINT screen);
+    void OnPreviewPick(const std::wstring& message);  // Ctrl+click in the page: the element goes into the message
+    // Wide: the sidebar goes and the chat keeps only a strip, the rest is the preview's; again: as it was.
+    void SetPreviewWide(bool wide);
+    float MinChat() const { return PreviewShown() ? kMinChatPreview : kMinChat; }
 
     // The sidebar: search, the way to the secrets, the chats (or the secrets view in their place).
     void PaintSidebar(const Geometry& g);
@@ -934,6 +983,9 @@ private:
     wil::com_ptr<ICoreWebView2Controller> webController_;
     wil::com_ptr<ICoreWebView2> webView_;
     bool webCreating_ = false;
+    bool previewWide_ = false;
+    float wideSavedTerminal_ = kTerminal;  // the widths to go back to
+    bool wideSavedSidebar_ = true;
     std::wstring webShown_;  // the file the preview has loaded
     std::filesystem::file_time_type previewStamp_{};  // ... and the newest change in its folder then
     wil::com_ptr<IDWriteTextFormat> termFont_;
@@ -1366,11 +1418,12 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (dragging_ != Target::None) {  // a splitter: the panel follows the mouse, within limits
             const Geometry g = Layout();
+            previewWide_ = false;  // dragged by hand: that is the width now
             if (dragging_ == Target::SplitSidebar) {
-                const float most = std::max(kMinSidebar, g.width - (g.width - g.area) - kMinChat);
+                const float most = std::max(kMinSidebar, g.width - (g.width - g.area) - MinChat());
                 sidebarWidth_ = std::clamp(at.x, kMinSidebar, std::min(kMaxSidebar, most));
             } else {
-                const float most = std::max(kMinTerminal, g.width - g.areaLeft - kMinChat);
+                const float most = std::max(kMinTerminal, g.width - g.areaLeft - MinChat());
                 terminalWidth_ = std::clamp(g.width - at.x, kMinTerminal, most);
             }
             PlaceChildren();
@@ -1842,6 +1895,9 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::TermClose:
         SetTerminalOpen(false);
         break;
+    case Target::PreviewWide:
+        SetPreviewWide(!previewWide_);
+        break;
     case Target::TermTab:
         SelectTerminalTab(hit.row);
         keepFocus = true;
@@ -2091,10 +2147,10 @@ Geometry ChatWindow::Layout() const {
     g.width = ToDip(client.right);
     g.height = ToDip(client.bottom);
     // The sidebar docks at the left and the chat takes what is left, as in Claude's app.
-    const float sidebarWidth = sidebarOpen_ ? std::min(sidebarWidth_, std::max(0.f, g.width - kMinChat)) : 0.f;
+    const float sidebarWidth = sidebarOpen_ ? std::min(sidebarWidth_, std::max(0.f, g.width - MinChat())) : 0.f;
     g.areaLeft = sidebarWidth;
     const float termWidth =
-        terminalOpen_ ? std::min(terminalWidth_, std::max(0.f, g.width - sidebarWidth - kMinChat)) : 0.f;
+        terminalOpen_ ? std::min(terminalWidth_, std::max(0.f, g.width - sidebarWidth - MinChat())) : 0.f;
     if (sidebarWidth > 0) {
         g.splitSidebar = D2D1::RectF(sidebarWidth - 3, kHeader, sidebarWidth + 4, g.height);
     }
@@ -2173,6 +2229,9 @@ Geometry ChatWindow::Layout() const {
             tabLeft += width + 4;
         }
         g.termAdd = D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + 28, g.term.top + 36);
+        if (PreviewShown() || previewWide_) {
+            g.termWide = D2D1::RectF(g.termClose.left - 4 - 28, g.termClose.top, g.termClose.left - 4, g.termClose.bottom);
+        }
     }
     if (secretsOpen_ && sidebarWidth > 0) {
         g.panel = g.sidebar;
@@ -2330,6 +2389,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.term, x, y)) {
         if (Inside(g.termClose, x, y)) {
             return {Target::TermClose};
+        }
+        if (Inside(g.termWide, x, y)) {
+            return {Target::PreviewWide};
         }
         for (size_t i = 0; i < g.termTabs.size(); ++i) {
             if (Inside(TabCloseRect(g.termTabs[i]), x, y)) {
@@ -3952,6 +4014,24 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.5f);
         Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.5f);
     }
+    if (g.termWide.right > g.termWide.left) {  // arrows out to the corners (widen), or in (back)
+        const bool active = hover_.target == Target::PreviewWide;
+        if (active || previewWide_) {
+            Fill(g.termWide, 6.f, kRaised);
+        }
+        const D2D1_POINT_2F c{(g.termWide.left + g.termWide.right) / 2, (g.termWide.top + g.termWide.bottom) / 2};
+        const uint32_t color = active ? kPrimary : kSecondary;
+        const float in = previewWide_ ? 1.5f : 5.5f;  // where each arrow's tip is, from the centre
+        const float out = previewWide_ ? 5.5f : 1.5f;
+        for (const float sx : {-1.f, 1.f}) {
+            const float sy = -sx;  // top right and bottom left
+            const D2D1_POINT_2F tip{c.x + sx * in, c.y + sy * in};
+            Line({c.x + sx * out, c.y + sy * out}, tip, color, 1.4f);
+            const float back = previewWide_ ? 1.f : -1.f;  // the arrowhead's two strokes point back along it
+            Line(tip, {tip.x + back * sx * 3.5f, tip.y}, color, 1.4f);
+            Line(tip, {tip.x, tip.y + back * sy * 3.5f}, color, 1.4f);
+        }
+    }
     if (!Screen()) {
         return;
     }
@@ -5553,6 +5633,21 @@ void ChatWindow::EnsureWebView() {
                                    if (webView_ && SUCCEEDED(webView_->get_Settings(settings.put()))) {
                                        settings->put_IsStatusBarEnabled(FALSE);
                                    }
+                                   if (webView_) {
+                                       webView_->AddScriptToExecuteOnDocumentCreated(kPickScript, nullptr);
+                                       EventRegistrationToken token{};
+                                       webView_->add_WebMessageReceived(
+                                           Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                               [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) {
+                                                   wil::unique_cotaskmem_string message;
+                                                   if (SUCCEEDED(args->TryGetWebMessageAsString(&message)) && message) {
+                                                       OnPreviewPick(message.get());
+                                                   }
+                                                   return S_OK;
+                                               })
+                                               .Get(),
+                                           &token);
+                                   }
                                    webShown_.clear();
                                    NavigatePreview();
                                    PlacePreview();
@@ -5651,6 +5746,44 @@ void ChatWindow::ShowPreviewMenu(size_t index, POINT screen) {
     default:
         break;
     }
+}
+
+void ChatWindow::OnPreviewPick(const std::wstring& message) {
+    const Json pick = Json::parse(ToUtf8(message), nullptr, false);
+    const TermTab* tab = PreviewTab();
+    if (pick.is_discarded() || tab == nullptr) {
+        return;
+    }
+    // "[mockup.html: div.card > button.edit «Изменить»] ": enough for the model to find it in the file.
+    std::wstring reference = L"[" + std::filesystem::path(tab->preview).filename().wstring() + L": " +
+                             ToWide(JsonStr(pick, "selector"));
+    if (const std::wstring text = ToWide(JsonStr(pick, "text")); !text.empty()) {
+        reference += L" «" + text + L"»";
+    }
+    reference += L"] ";
+    termFocus_ = false;
+    SetFocus(input_);
+    SendMessageW(input_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(reference.c_str()));
+    Flash(L"Элемент в сообщении: допиши, что с ним сделать");
+}
+
+void ChatWindow::SetPreviewWide(bool wide) {
+    if (wide == previewWide_) {
+        return;
+    }
+    previewWide_ = wide;
+    if (wide) {
+        wideSavedTerminal_ = terminalWidth_;
+        wideSavedSidebar_ = sidebarOpen_;
+        terminalWidth_ = 1e5f;  // the layout leaves the chat its least
+        SetSidebarOpen(false);
+    } else {
+        terminalWidth_ = wideSavedTerminal_;
+        SetSidebarOpen(wideSavedSidebar_);
+    }
+    hover_ = {};
+    PlaceChildren();
+    Refresh();
 }
 
 // ---- Pictures in the feed --------------------------------------------------------------------------
@@ -5853,7 +5986,12 @@ std::wstring ChatWindow::TooltipText() {
         return L"Скрыть терминал";
     case Target::TermTabClose:
         return L"Закрыть вкладку";
+    case Target::PreviewWide:
+        return previewWide_ ? L"Вернуть как было" : L"Превью на всё окно (чат остаётся полосой слева)";
     case Target::TermTab:
+        if (hover_.row < tabs_.size() && !tabs_[hover_.row]->preview.empty()) {
+            return L"Ctrl+клик по элементу страницы — вставить его в сообщение. Правая кнопка — меню";
+        }
         return L"Правый клик: переименовать, очистить";
     case Target::Attach:
         return L"Прикрепить файлы или фото (Ctrl+U)";

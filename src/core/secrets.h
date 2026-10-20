@@ -2,6 +2,7 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,6 +26,8 @@ public:
 
     std::vector<std::string> Names() const;
     bool Has(const std::string& name) const;
+    // The value, for the secrets panel's editor only (it never reaches the chat).
+    std::optional<std::string> Get(const std::string& name) const;
     void Set(const std::string& name, std::string value);
     bool Remove(const std::string& name);
 

@@ -116,6 +116,14 @@ bool SecretStore::Has(const std::string& name) const {
     return values_.contains(name);
 }
 
+std::optional<std::string> SecretStore::Get(const std::string& name) const {
+    std::lock_guard lock(mutex_);
+    if (const auto it = values_.find(name); it != values_.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
 void SecretStore::Set(const std::string& name, std::string value) {
     std::lock_guard lock(mutex_);
     values_[name] = std::move(value);

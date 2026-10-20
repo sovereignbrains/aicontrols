@@ -48,6 +48,7 @@ int main() {
         const std::string bytes((std::istreambuf_iterator<char>(raw)), std::istreambuf_iterator<char>());
         Expect(!Has(bytes, "hunter2value"), "secrets file is encrypted");
     }
+    Expect(secrets.Get("TOKEN_A") == std::optional<std::string>("hunter2value") && !secrets.Get("NOPE"), "Get");
     std::vector<std::string> missing;
     Expect(secrets.Substitute("x {{secret:TOKEN_A}} y {{secret:NOPE}}", missing) == "x hunter2value y {{secret:NOPE}}" &&
                missing.size() == 1 && missing[0] == "NOPE",

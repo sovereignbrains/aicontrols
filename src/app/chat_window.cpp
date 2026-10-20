@@ -215,6 +215,8 @@ enum class Target {
     SecretRow,     // row: an index into the secrets' names
     SecretDelete,  // row: the same
     SecretSave,
+    SecretEye,     // show or hide the value being typed
+    SecretCancel,  // leave editing a secret
     Send,
     HistoryRow,   // row: an index into the filtered history
     ModelRow,     // row: an index into the main models
@@ -258,6 +260,8 @@ struct Geometry {
     D2D1_RECT_F nameField{};
     D2D1_RECT_F valueField{};
     D2D1_RECT_F saveButton{};
+    D2D1_RECT_F secretEye{};     // inside the value field, at its right
+    D2D1_RECT_F secretCancel{};  // beside the save button while a secret is edited
     float secretsTop = 0;  // the first secret's row
     D2D1_RECT_F newItem{};  // the sidebar's "new chat" row
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
@@ -568,6 +572,9 @@ private:
     void SetSecretsOpen(bool open);
     void PlaceSecretFields();
     void SubmitSecret();
+    void EditSecret(const std::string& name);
+    void CancelSecretEdit();
+    void SetShowValue(bool show);
     void DeleteSecret(const std::string& name);
     void PaintSecrets(const Geometry& g);
     static D2D1_RECT_F SecretRowRect(const Geometry& g, size_t index);
@@ -667,6 +674,8 @@ private:
     bool sidebarOpen_ = true;
     bool searchFocus_ = false;  // typing goes to the sidebar's search (drawn here, no caret)
     bool secretsOpen_ = false;  // the sidebar shows the secrets instead of the chats
+    std::string editingSecret_;  // the secret the form holds (its old name: renaming replaces it); empty: a new one
+    bool showValue_ = false;     // the value field shows its text instead of dots
     HWND nameEdit_ = nullptr;   // the panel's two fields; hidden while it is closed
     HWND valueEdit_ = nullptr;  // (a password field: the value never shows)
     wil::unique_hbrush fieldBrush_;
@@ -968,7 +977,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case kSecretKey: {
         const auto from = reinterpret_cast<HWND>(lParam);
         if (wParam == VK_ESCAPE) {
-            SetSecretsOpen(false);
+            if (!editingSecret_.empty()) {
+                CancelSecretEdit();
+            } else {
+                SetSecretsOpen(false);
+            }
         } else if (wParam == VK_TAB || (wParam == VK_RETURN && from == nameEdit_)) {
             SetFocus(from == nameEdit_ ? valueEdit_ : nameEdit_);
         } else {
@@ -1407,17 +1420,23 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::SecretsClose:
         SetSecretsOpen(false);
         break;
-    case Target::SecretRow: {  // pick a secret to replace: its name goes into the form, the value is typed anew
+    case Target::SecretRow: {  // edit a secret: its name and value go into the form
         const std::vector<std::string> names = secrets_.Names();
         if (hit.row < names.size()) {
-            SetWindowTextW(nameEdit_, ToWide(names[hit.row]).c_str());
-            SetWindowTextW(valueEdit_, L"");
-            SetFocus(valueEdit_);
+            EditSecret(names[hit.row]);
             keepFocus = true;
-            Refresh();
         }
         break;
     }
+    case Target::SecretEye:
+        SetShowValue(!showValue_);
+        SetFocus(valueEdit_);
+        keepFocus = true;
+        break;
+    case Target::SecretCancel:
+        CancelSecretEdit();
+        keepFocus = true;
+        break;
     case Target::SecretDelete: {
         const std::vector<std::string> names = secrets_.Names();
         if (hit.row < names.size()) {
@@ -1664,6 +1683,12 @@ Geometry ChatWindow::Layout() const {
                                    g.panel.bottom - kPanelPad);
         g.valueField = D2D1::RectF(fieldLeft, g.saveButton.top - 8 - kFieldHeight, fieldRight, g.saveButton.top - 8);
         g.nameField = D2D1::RectF(fieldLeft, g.valueField.top - 8 - kFieldHeight, fieldRight, g.valueField.top - 8);
+        g.secretEye = D2D1::RectF(g.valueField.right - 34, g.valueField.top + 3, g.valueField.right - 4, g.valueField.bottom - 3);
+        if (!editingSecret_.empty()) {  // "save" and "cancel" side by side
+            const float split = fieldLeft + (fieldRight - fieldLeft) * 0.6f;
+            g.secretCancel = D2D1::RectF(split + 4, g.saveButton.top, fieldRight, g.saveButton.bottom);
+            g.saveButton.right = split - 4;
+        }
         g.secretsTop = g.panel.top + 46 + kSecretsNote;
     }
 
@@ -1752,6 +1777,12 @@ Hit ChatWindow::HitTest(float x, float y) const {
         }
         if (Inside(g.saveButton, x, y)) {
             return {Target::SecretSave};
+        }
+        if (Inside(g.secretCancel, x, y)) {
+            return {Target::SecretCancel};
+        }
+        if (Inside(g.secretEye, x, y)) {
+            return {Target::SecretEye};
         }
         const size_t shown = std::min(secrets_.Names().size(), SecretRowsFit(g));
         for (size_t i = 0; i < shown; ++i) {
@@ -2543,7 +2574,8 @@ void ChatWindow::PlaceSecretFields() {
         constexpr float kInset = 10.f;
         for (const auto& [edit, slot] : {std::pair{nameEdit_, g.nameField}, std::pair{valueEdit_, g.valueField}}) {
             const float top = slot.top + (slot.bottom - slot.top - kText) / 2;
-            MoveChild(edit, D2D1::RectF(slot.left + kInset, top, slot.right - kInset, top + kText));
+            const float right = slot.right - kInset - (edit == valueEdit_ ? 30.f : 0.f);  // room for the eye
+            MoveChild(edit, D2D1::RectF(slot.left + kInset, top, right, top + kText));
             SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_.get()), TRUE);
         }
     }
@@ -2563,6 +2595,8 @@ void ChatWindow::SetSecretsOpen(bool open) {
     secretsOpen_ = open;
     hover_ = {};
     if (!open) {
+        editingSecret_.clear();
+        SetShowValue(false);
         SetWindowTextW(nameEdit_, L"");
         SetWindowTextW(valueEdit_, L"");
     }
@@ -2587,17 +2621,67 @@ void ChatWindow::SubmitSecret() {
         return;
     }
     const std::string key = ToUtf8(name);
-    const bool replaced = secrets_.Has(key);
+    const bool renaming = !editingSecret_.empty() && editingSecret_ != key;
+    if (renaming && secrets_.Has(key)) {
+        Flash(L"Секрет с таким именем уже есть", 3000);
+        SetFocus(nameEdit_);
+        return;
+    }
+    const bool replaced = secrets_.Has(key) || renaming;
     secrets_.Set(key, ToUtf8(value));
+    if (renaming) {
+        secrets_.Remove(editingSecret_);
+    }
     SecureZeroMemory(value.data(), value.size() * sizeof(wchar_t));
     if (!secrets_.Save()) {
         Flash(L"Не удалось сохранить файл секретов", 3500);
         return;
     }
+    editingSecret_.clear();
+    SetShowValue(false);
     SetWindowTextW(nameEdit_, L"");
     SetWindowTextW(valueEdit_, L"");
+    PlaceSecretFields();
     SetFocus(nameEdit_);
     Flash(replaced ? L"Секрет обновлён" : L"Секрет добавлен");
+    Refresh();
+}
+
+// A secret into the form: its name, and its value behind dots (the eye shows it). Saving replaces it, renamed or not.
+void ChatWindow::EditSecret(const std::string& name) {
+    std::optional<std::string> value = secrets_.Get(name);
+    if (!value) {
+        return;
+    }
+    editingSecret_ = name;
+    SetShowValue(false);
+    SetWindowTextW(nameEdit_, ToWide(name).c_str());
+    std::wstring wide = ToWide(*value);
+    SetWindowTextW(valueEdit_, wide.c_str());
+    SecureZeroMemory(wide.data(), wide.size() * sizeof(wchar_t));
+    SecureZeroMemory(value->data(), value->size());
+    PlaceSecretFields();  // the save button makes room for "cancel"
+    SetFocus(valueEdit_);
+    SendMessageW(valueEdit_, EM_SETSEL, 0, -1);
+    Refresh();
+}
+
+void ChatWindow::CancelSecretEdit() {
+    editingSecret_.clear();
+    SetShowValue(false);
+    SetWindowTextW(nameEdit_, L"");
+    SetWindowTextW(valueEdit_, L"");
+    PlaceSecretFields();
+    SetFocus(nameEdit_);
+    Refresh();
+}
+
+void ChatWindow::SetShowValue(bool show) {
+    showValue_ = show;
+    if (valueEdit_ != nullptr) {
+        SendMessageW(valueEdit_, EM_SETPASSWORDCHAR, show ? 0 : 0x25CF, 0);
+        InvalidateRect(valueEdit_, nullptr, TRUE);
+    }
     Refresh();
 }
 
@@ -2605,6 +2689,9 @@ void ChatWindow::DeleteSecret(const std::string& name) {
     const std::wstring question = L"Удалить секрет " + ToWide(name) + L"?\nЭто нельзя отменить.";
     if (MessageBoxW(hwnd_, question.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
+    }
+    if (name == editingSecret_) {
+        CancelSecretEdit();
     }
     secrets_.Remove(name);
     if (!secrets_.Save()) {
@@ -2660,8 +2747,11 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
     for (size_t i = 0; i < shown; ++i) {
         const D2D1_RECT_F row = SecretRowRect(g, i);
         const bool onRow = (hover_.target == Target::SecretRow || hover_.target == Target::SecretDelete) && hover_.row == i;
-        if (onRow) {
+        if (onRow || names[i] == editingSecret_) {
             Fill(row, 8.f, kRaised);
+        }
+        if (names[i] == editingSecret_) {  // the one in the form: a mark at its left edge
+            Fill(D2D1::RectF(row.left, row.top + 8, row.left + 3, row.bottom - 8), 1.5f, kAccent);
         }
         Text(ToWide(names[i]), ui_.get(), D2D1::RectF(row.left + 10, row.top, row.right - 100, row.bottom), kPrimary);
         Text(L"••••••••", uiRight_.get(), D2D1::RectF(row.right - 96, row.top, row.right - 40, row.bottom), kSecondary);
@@ -2682,9 +2772,29 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
     Fill(g.valueField, 8.f, kRaised);
     const std::wstring name = Trimmed(FieldText(nameEdit_));
     const bool ready = !name.empty();
-    const bool replacing = ready && secrets_.Has(ToUtf8(name));
+    const bool editing = !editingSecret_.empty();
+    const bool replacing = ready && (editing || secrets_.Has(ToUtf8(name)));
     Fill(g.saveButton, 8.f, ready ? kAccent : kRaised, ready && hover_.target == Target::SecretSave ? 0.85f : 1.f);
-    Text(replacing ? L"Обновить" : L"Добавить", button_.get(), g.saveButton, ready ? kPrimary : kSecondary);
+    Text(editing ? L"Сохранить" : (replacing ? L"Обновить" : L"Добавить"), button_.get(), g.saveButton,
+         ready ? kPrimary : kSecondary);
+    if (editing) {
+        Fill(g.secretCancel, 8.f, hover_.target == Target::SecretCancel ? kLine : kRaised);
+        Text(L"Отмена", button_.get(), g.secretCancel, kPrimary);
+    }
+    {  // the eye: shows the value, struck through while it is hidden
+        const bool active = hover_.target == Target::SecretEye;
+        if (active) {
+            Fill(g.secretEye, 6.f, kLine);
+        }
+        const D2D1_POINT_2F c{(g.secretEye.left + g.secretEye.right) / 2, (g.secretEye.top + g.secretEye.bottom) / 2};
+        const uint32_t color = active || showValue_ ? kPrimary : kSecondary;
+        brush_->SetColor(Color(color));
+        target_->DrawEllipse(D2D1::Ellipse(c, 7.f, 4.f), brush_.get(), 1.3f);
+        target_->FillEllipse(D2D1::Ellipse(c, 1.8f, 1.8f), brush_.get());
+        if (!showValue_) {
+            Line({c.x - 6.f, c.y + 5.f}, {c.x + 6.f, c.y - 5.f}, color, 1.3f);
+        }
+    }
 }
 
 // ---- The terminal -------------------------------------------------------------------------------

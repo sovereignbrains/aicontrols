@@ -38,6 +38,8 @@ std::wstring DefaultWorkspace();
 
 std::vector<SessionInfo> ListSessions(const std::wstring& workspace);  // newest first
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);
+// Moves a chat to the Recycle Bin: its transcript and the folder the CLI keeps beside it. False if it could not.
+bool DeleteSession(const std::wstring& workspace, const std::string& id);
 // The last `limit` entries of a chat, for showing it again before it is resumed.
 std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
                                             bool& truncated);

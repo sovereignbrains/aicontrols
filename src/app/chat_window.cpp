@@ -69,7 +69,8 @@ constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
 
 // Layout, in DIPs.
-constexpr float kHeader = 44.f;
+constexpr float kHeader = 44.f;     // also the window's title bar
+constexpr float kWinButton = 46.f;  // minimize, maximize, close: as wide as Windows' own
 constexpr float kColumnMax = 720.f;
 constexpr float kSide = 24.f;
 constexpr float kGap = 14.f;
@@ -189,6 +190,9 @@ enum class Target {
     None,
     SidebarToggle,
     SidebarSearch,
+    WinMin,    // the window's own buttons, drawn in the header (the system caption is gone)
+    WinMax,
+    WinClose,
     SignIn,
     CancelLogin,
     CopyLoginUrl,
@@ -244,6 +248,9 @@ struct Geometry {
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
     D2D1_RECT_F termAdd{};               // "+": another shell
     D2D1_RECT_F terminalBtn{};  // the header's button that shows or hides the terminal
+    D2D1_RECT_F winMin{};       // minimize, maximize, close: the header is the window's title bar
+    D2D1_RECT_F winMax{};
+    D2D1_RECT_F winClose{};
     D2D1_RECT_F sideToggle{};   // the header's button that shows or hides the sidebar
     D2D1_RECT_F secrets{};     // the sidebar's entry for the secrets
     D2D1_RECT_F panel{};       // the secrets view: the sidebar itself while it is open
@@ -470,6 +477,8 @@ private:
     void Paint();
     void PaintFeed(const Geometry& g);
     void PaintHeader(const Geometry& g);
+    void PaintWindowButtons(const Geometry& g);
+    LRESULT HitTestFrame(LPARAM lParam);
     void PaintInput(const Geometry& g);
     void PaintPanel(const D2D1_RECT_F& rect);
     void PaintModels(const Geometry& g);
@@ -596,6 +605,7 @@ private:
     void PasteClipboard();
     void ShowInputMenu(POINT screen);
     void ShowCopyMenu(POINT screen, float y);
+    void ShowChatMenu(size_t filteredIndex, POINT screen);
     void Attached();
 
     void OpenPopup(Popup popup);
@@ -896,8 +906,28 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         CreateFonts();
         CreateInput();
         DragAcceptFiles(hwnd_, TRUE);
+        // The frame is recalculated without the caption (WM_NCCALCSIZE).
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
         return 0;
     }
+    case WM_NCCALCSIZE:
+        // No system caption: the header is the title bar. The side and bottom frames stay (they are the
+        // invisible resize borders); a maximized window, which hangs over the screen by its frame, is kept inside.
+        if (wParam == TRUE) {
+            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            const LONG top = params->rgrc[0].top;
+            DefWindowProcW(hwnd_, WM_NCCALCSIZE, wParam, lParam);
+            params->rgrc[0].top = top;
+            if (IsZoomed(hwnd_)) {
+                const UINT dpi = GetDpiForWindow(hwnd_);
+                params->rgrc[0].top += GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
+                                       GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            }
+            return 0;
+        }
+        break;
+    case WM_NCHITTEST:
+        return HitTestFrame(lParam);
     case WM_CTLCOLOREDIT:
         if (const auto field = reinterpret_cast<HWND>(lParam); field == nameEdit_ || field == valueEdit_) {
             const auto dc = reinterpret_cast<HDC>(wParam);
@@ -1156,6 +1186,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             const D2D1_POINT_2F at = CursorDip(lParam);
             POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ClientToScreen(hwnd_, &screen);
+            if (const Hit hit = HitTest(at.x, at.y); hit.target == Target::HistoryRow) {
+                ShowChatMenu(hit.row, screen);
+                return 0;
+            }
             if (Inside(Layout().box, at.x, at.y)) {
                 ShowInputMenu(screen);  // the padding of the input card
             } else {
@@ -1297,6 +1331,15 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::SidebarToggle:
         SetSidebarOpen(!sidebarOpen_);
         break;
+    case Target::WinMin:
+        ShowWindow(hwnd_, SW_MINIMIZE);
+        return;
+    case Target::WinMax:
+        ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
+        return;
+    case Target::WinClose:
+        PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+        return;
     case Target::SignIn:
         SignIn();
         break;
@@ -1546,7 +1589,10 @@ Geometry ChatWindow::Layout() const {
     const float right = left + g.column;
 
     const float buttonTop = (kHeader - kButton) / 2;
-    g.terminalBtn = D2D1::RectF(g.width - 10 - kButton, buttonTop, g.width - 10, buttonTop + kButton);
+    g.winClose = D2D1::RectF(g.width - kWinButton, 0, g.width, kHeader);
+    g.winMax = D2D1::RectF(g.winClose.left - kWinButton, 0, g.winClose.left, kHeader);
+    g.winMin = D2D1::RectF(g.winMax.left - kWinButton, 0, g.winMax.left, kHeader);
+    g.terminalBtn = D2D1::RectF(g.winMin.left - 10 - kButton, buttonTop, g.winMin.left - 10, buttonTop + kButton);
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
@@ -1756,6 +1802,15 @@ Hit ChatWindow::HitTest(float x, float y) const {
             return {Target::TermAdd};
         }
         return Inside(g.termScreen, x, y) ? Hit{Target::TermScreen} : Hit{};
+    }
+    if (Inside(g.winClose, x, y)) {
+        return {Target::WinClose};
+    }
+    if (Inside(g.winMax, x, y)) {
+        return {Target::WinMax};
+    }
+    if (Inside(g.winMin, x, y)) {
+        return {Target::WinMin};
     }
     if (Inside(g.sideToggle, x, y)) {
         return {Target::SidebarToggle};
@@ -1973,6 +2028,7 @@ void ChatWindow::Paint() {
     target_->Clear(Color(kWindow));
     PaintFeed(g);
     PaintHeader(g);
+    PaintWindowButtons(g);
     PaintInput(g);
     PaintSidebar(g);
     PaintTerminal(g);
@@ -2221,6 +2277,64 @@ void ChatWindow::PaintHeader(const Geometry& g) {
             Line({c.x - 6.f, c.y - 4.f}, {c.x - 1.5f, c.y}, color, 1.5f);
             Line({c.x - 1.5f, c.y}, {c.x - 6.f, c.y + 4.f}, color, 1.5f);
             Line({c.x + 1.f, c.y + 5.f}, {c.x + 7.f, c.y + 5.f}, color, 1.5f);
+        }
+    }
+}
+
+// The window's edges and its title bar, which is the header: the top border resizes, the header's free
+// space drags the window (a double click maximizes, a right click opens the system menu), its buttons are ours.
+LRESULT ChatWindow::HitTestFrame(LPARAM lParam) {
+    const LRESULT standard = DefWindowProcW(hwnd_, WM_NCHITTEST, 0, lParam);
+    if (standard != HTCLIENT) {
+        return standard;  // the side and bottom borders
+    }
+    POINT at{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+    ScreenToClient(hwnd_, &at);
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const UINT dpi = GetDpiForWindow(hwnd_);
+    const int border = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    if (!IsZoomed(hwnd_) && at.y < border) {
+        if (at.x < border * 2) {
+            return HTTOPLEFT;
+        }
+        if (at.x >= client.right - border * 2) {
+            return HTTOPRIGHT;
+        }
+        return HTTOP;
+    }
+    const float x = ToDip(at.x);
+    const float y = ToDip(at.y);
+    if (y < kHeader && HitTest(x, y).target == Target::None) {
+        return HTCAPTION;
+    }
+    return HTCLIENT;
+}
+
+// Minimize, maximize (restore when maximized), close: drawn like Windows 11's own.
+void ChatWindow::PaintWindowButtons(const Geometry& g) {
+    for (const Target button : {Target::WinMin, Target::WinMax, Target::WinClose}) {
+        const D2D1_RECT_F& r = button == Target::WinMin ? g.winMin : (button == Target::WinMax ? g.winMax : g.winClose);
+        const bool hovered = hover_.target == button;
+        if (hovered) {
+            Fill(r, 0.f, button == Target::WinClose ? 0xc42b1c : kRaised);
+        }
+        const D2D1_POINT_2F c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
+        const uint32_t color = hovered ? kPrimary : kSecondary;
+        brush_->SetColor(Color(color));
+        if (button == Target::WinMin) {
+            Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.f);
+        } else if (button == Target::WinMax) {
+            if (IsZoomed(hwnd_)) {  // two windows: restore
+                target_->DrawRectangle(D2D1::RectF(c.x - 5.f, c.y - 3.f, c.x + 3.f, c.y + 5.f), brush_.get(), 1.f);
+                Line({c.x - 3.f, c.y - 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.f);
+                Line({c.x + 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 3.f}, color, 1.f);
+            } else {
+                target_->DrawRectangle(D2D1::RectF(c.x - 5.f, c.y - 5.f, c.x + 5.f, c.y + 5.f), brush_.get(), 1.f);
+            }
+        } else {
+            Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.f);
+            Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.f);
         }
     }
 }
@@ -4013,6 +4127,47 @@ void ChatWindow::ShowInputMenu(POINT screen) {
         break;
     }
     SetFocus(input_);
+}
+
+// A chat's menu in the sidebar: delete it (to the Recycle Bin, so it can still be brought back).
+void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
+    if (filteredIndex >= filtered_.size()) {
+        return;
+    }
+    const SessionInfo session = sessions_[filtered_[filteredIndex]];
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, 1, L"Открыть");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, 2, L"Удалить чат");
+    const auto chosen = TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr);
+    if (chosen == 1) {
+        OpenSession(filteredIndex);
+        SetFocus(input_);
+        return;
+    }
+    if (chosen != 2) {
+        return;
+    }
+    const std::wstring title = session.title.empty() ? L"без названия" : session.title;
+    const std::wstring question = L"Удалить чат «" + title + L"»?\nОн уйдёт в корзину Windows, оттуда его можно вернуть.";
+    if (MessageBoxW(hwnd_, question.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    const bool current = session.id == sessionId_;
+    if (current) {  // the CLI holds the file open: it goes first
+        ResetChat();
+    }
+    if (DeleteSession(workspace_, session.id)) {
+        Flash(L"Чат удалён");
+    } else {
+        Flash(L"Не удалось удалить чат", 3000);
+    }
+    if (current) {
+        StartClaude();
+    }
+    RefreshSessions();
+    hover_ = {};
+    Refresh();
 }
 
 void ChatWindow::ShowCopyMenu(POINT screen, float y) {

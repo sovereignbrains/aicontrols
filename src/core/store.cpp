@@ -1,5 +1,6 @@
 #include "core/store.h"
 
+#include <shellapi.h>
 #include <shlobj.h>
 
 #include <algorithm>
@@ -220,6 +221,31 @@ std::vector<SessionInfo> ListSessions(const std::wstring& workspace) {
         return ToTicks(a.modified) > ToTicks(b.modified);
     });
     return sessions;
+}
+
+bool DeleteSession(const std::wstring& workspace, const std::string& id) {
+    if (id.empty() || id.find_first_of("/\\.:") != std::string::npos) {
+        return false;  // an id is a plain name; anything else could reach outside the chats' folder
+    }
+    const fs::path file = SessionFile(workspace, id);
+    const fs::path folder = ProjectDir(workspace) / ToWide(id);
+    std::error_code error;
+    std::wstring paths;  // SHFileOperation's list: each path ends in \0, the list in one more
+    for (const fs::path& path : {file, folder}) {
+        if (fs::exists(path, error)) {
+            paths += path.wstring();
+            paths += L'\0';
+        }
+    }
+    if (paths.empty()) {
+        return false;
+    }
+    paths += L'\0';
+    SHFILEOPSTRUCTW operation{};
+    operation.wFunc = FO_DELETE;
+    operation.pFrom = paths.c_str();
+    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted && !fs::exists(file, error);
 }
 
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id) {

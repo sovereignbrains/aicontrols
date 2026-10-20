@@ -1237,12 +1237,6 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         const std::wstring hello = userName_.empty() ? L"Что дальше?" : L"Что дальше, " + ToWide(userName_) + L"?";
         const float middle = (g.feed.top + g.feed.bottom) / 2;
         Text(hello, greeting_.get(), D2D1::RectF(left, middle - 40, left + g.column, middle), kPrimary);
-        std::wstring hint = L"Enter — отправить · Shift+Enter — новая строка · Esc — стоп\n"
-                            L"Ctrl+N — новый чат · Ctrl+H — история · правый клик по сообщению — копировать";
-        if (!route_.empty()) {
-            hint += L"\nсеть: " + route_;
-        }
-        Text(hint, notice_.get(), D2D1::RectF(left, middle + 4, left + g.column, middle + 70), kSecondary);
     }
 
     MeasureFeed(g.column);
@@ -1504,8 +1498,8 @@ void ChatWindow::PaintEffort(const Geometry& g) {
             target_->FillEllipse(D2D1::Ellipse({x, middle}, 2.f, 2.f), brush_.get());
         }
     }
-    const std::wstring note = pendingEffort_.empty() ? L"Auto — решает модель · ← → на клавиатуре"
-                                                     : L"Применится, когда закроешь панель";
+    const std::wstring note = pendingEffort_.empty() ? L"Auto — решает модель"
+                                                     : L"Применится при закрытии";
     Text(note, ui_.get(), D2D1::RectF(titleLeft, g.track.bottom + 4, g.popup.right - 14, g.popup.bottom - 4),
          kSecondary);
 }

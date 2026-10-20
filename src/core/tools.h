@@ -37,7 +37,9 @@ class Tools {
 public:
     Tools(SecretStore& secrets, std::wstring cwd);
 
-    static Json Definitions();  // the MCP tools/list payload
+    Json Definitions() const;  // the MCP tools/list payload; run_command names the stored secrets
+    // What the model is told about this client, appended to the CLI's system prompt.
+    static std::string SystemPrompt();
     // Blocks until done; `cancel` stops a running command. Output is scrubbed of secret values.
     ToolResult Execute(const std::string& name, const Json& input, const std::atomic<bool>& cancel) const;
 

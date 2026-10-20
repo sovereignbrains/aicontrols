@@ -173,6 +173,16 @@ int main() {
     Expect(aic::SummarizeTool("run_command", {{"command", "ls"}, {"on", "root@h"}}).detail.starts_with(L"→ root@h\n"),
            "the card names the server");
 
+    {  // what the model is told: the stored secrets by name (never the values), and how to use the tools
+        const std::string listed = tools.Definitions().dump();
+        Expect(Has(listed, "TOKEN_A") && Has(listed, "SHORT") && !Has(listed, "hunter2value"),
+               "run_command's description names the secrets, not their values");
+        Expect(Has(listed, "\"on\""), "every tool accepts on");
+        const std::string prompt = aic::Tools::SystemPrompt();
+        Expect(Has(prompt, "mcp__aic__") && Has(prompt, "`on`") && Has(prompt, "language the user writes"),
+               "system prompt");
+    }
+
     // `on` is checked before ssh is started: nothing that looks like an option or a shell word gets through.
     for (const char* bad : {"-oProxyCommand=calc", "root@-oProxyCommand=x", "a b@host", "host;ls", "@host", "user@",
                             "root@host:", "root@host:12x", "u@h@x", "root@h$(id)"}) {

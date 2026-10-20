@@ -5198,6 +5198,7 @@ bool ChatWindow::StartClaude() {
         return false;
     }
     options.cwd = workspace_;
+    options.appendSystemPrompt = Tools::SystemPrompt();
     options.proxy = PickProxy();
     options.model = settings_.model;
     options.effort = settings_.effort;

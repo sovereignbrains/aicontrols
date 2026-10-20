@@ -40,6 +40,7 @@ int wmain(int argc, wchar_t** argv) {
 
     aic::ClaudeOptions options;
     options.cwd = workspace;
+    options.appendSystemPrompt = aic::Tools::SystemPrompt();  // as the window starts it
     options.proxy = aic::PickProxy();
     options.model = argc >= 3 ? aic::ToUtf8(argv[2]) : "haiku";
     options.includePartial = false;

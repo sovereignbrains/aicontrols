@@ -131,6 +131,9 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     if (options.includePartial) {
         cmd += L" --include-partial-messages";
     }
+    if (!options.appendSystemPrompt.empty()) {
+        cmd += L" --append-system-prompt " + QuoteArg(ToWide(options.appendSystemPrompt));
+    }
     if (!options.model.empty()) {
         cmd += L" --model " + QuoteArg(ToWide(options.model));
     }

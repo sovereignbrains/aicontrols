@@ -522,7 +522,30 @@ ToolSummary SummarizeTool(const std::string& name, const Json& input) {
 
 Tools::Tools(SecretStore& secrets, std::wstring cwd) : secrets_(secrets), cwd_(std::move(cwd)) {}
 
-Json Tools::Definitions() {
+std::string Tools::SystemPrompt() {
+    return "You are running inside AIControls, a native Windows chat client, on the user's computer. Claude Code's "
+           "own local tools are off: use only the mcp__aic__* tools run_command, read_file, list_directory, "
+           "write_file and edit_file. On this computer run_command is PowerShell 5.1 (non-interactive). Paths are "
+           "paths on this computer; relative ones resolve against the chat's working directory. Every run_command, "
+           "write_file and edit_file call, and anything aimed at a server, is shown to the user for approval, so "
+           "keep commands focused and say briefly why you run them. "
+           "Every tool accepts `on`: user@host[:port] makes it act on that server instead, through ssh with key "
+           "login only (no passwords): run_command runs bash or sh there, the file tools read and write the "
+           "server's files (remote paths are absolute or ~/...). This is the only chat: a task that spans this "
+           "computer and any number of servers stays in one conversation. Each call is a fresh shell: cd, export "
+           "and set -e do not carry over, so use cwd or chain with &&. "
+           "Stored secrets are passed with env_secrets or written as {{secret:NAME}}; their values are cut out of "
+           "every output, so you never see them. "
+           "Prefer non-interactive commands (no pagers, no editors; -y only when the user asked for changes). "
+           "Reply in the language the user writes in.";
+}
+
+Json Tools::Definitions() const {
+    std::string secretList;
+    for (const std::string& name : secrets_.Names()) {
+        secretList += (secretList.empty() ? "" : ", ") + name;
+    }
+    const std::string known = secretList.empty() ? std::string(" No secrets are stored yet.") : " Stored secrets: " + secretList + ".";
     const Json str{{"type", "string"}};
     const Json on{{"type", "string"},
                   {"description",
@@ -534,7 +557,7 @@ Json Tools::Definitions() {
               "Run a PowerShell command on this computer (non-interactive; with `on`, a bash/sh command on that "
               "server) and return its combined output and exit "
               "code. Secrets: list names in env_secrets (they arrive as environment variables) or write "
-              "{{secret:NAME}} in the command; their values are cut out of the output, so you never see them."},
+              "{{secret:NAME}} in the command; their values are cut out of the output, so you never see them." + known},
              {"inputSchema",
               Schema({{"on", on},
                       {"command", {{"type", "string"}, {"description", "PowerShell command (bash/sh with `on`)"}}},
@@ -874,7 +897,7 @@ void ToolHost::HandleMcp(const std::string& requestId, const Json& request) {
                     {"capabilities", {{"tools", Json::object()}}},
                     {"serverInfo", {{"name", kToolServer}, {"version", "0.1.0"}}}});
     } else if (method == "tools/list") {
-        answer(Json{{"tools", Tools::Definitions()}});
+        answer(Json{{"tools", tools_.Definitions()}});
     } else if (method == "tools/call") {
         std::lock_guard lock(mutex_);
         Job& job = jobs_.emplace_back();

@@ -254,10 +254,14 @@ void ClaudeProcess::Stop() {
 }
 
 void ClaudeProcess::SendUserText(std::string_view text) {
+    SendUserContent(Json(std::string(text)));
+}
+
+void ClaudeProcess::SendUserContent(Json content) {
     Send(Json{{"type", "user"},
               {"session_id", "default"},
               {"parent_tool_use_id", nullptr},
-              {"message", {{"role", "user"}, {"content", std::string(text)}}}},
+              {"message", {{"role", "user"}, {"content", std::move(content)}}}},
          true);
 }
 

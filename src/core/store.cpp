@@ -130,11 +130,17 @@ std::wstring TextOf(const Json& content) {
     std::wstring text;
     if (content.is_array()) {
         for (const Json& block : content) {
-            if (JsonStr(block, "type") == "text") {
-                if (!text.empty()) {
-                    text += L"\n\n";
-                }
-                text += ToWide(JsonStr(block, "text"));
+            const std::string type = JsonStr(block, "type");
+            std::wstring part;
+            if (type == "text") {
+                part = ToWide(JsonStr(block, "text"));
+            } else if (type == "image") {
+                part = L"📎 фото";
+            } else if (type == "document") {
+                part = L"📎 " + (JsonStr(block, "title").empty() ? L"документ" : ToWide(JsonStr(block, "title")));
+            }
+            if (!part.empty()) {
+                text += (text.empty() ? L"" : L"\n\n") + part;
             }
         }
     }

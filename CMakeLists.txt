@@ -21,10 +21,11 @@ find_package(nlohmann_json CONFIG REQUIRED)
 
 # Everything that is not UI: claude.exe and its protocol.
 add_library(aic_core STATIC
+  src/core/attachment.cpp
   src/core/claude_process.cpp
   src/core/store.cpp)
 target_include_directories(aic_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32)
+target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs)
 
 add_executable(aicontrols WIN32
   src/app/main.cpp

@@ -46,6 +46,8 @@ public:
     void Stop();
 
     void SendUserText(std::string_view text);
+    // A message as content blocks: pictures, documents, text.
+    void SendUserContent(Json content);
     void Interrupt();
     void Respond(const std::string& requestId, Json response);
     void RespondError(const std::string& requestId, std::string_view error);

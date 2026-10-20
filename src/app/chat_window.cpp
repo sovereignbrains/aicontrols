@@ -6,12 +6,15 @@
 #include <dwmapi.h>
 #include <dwrite.h>
 #include <richedit.h>
+#include <shellapi.h>
+#include <shobjidl.h>
 
 #include <wil/com.h>
 #include <wil/resource.h>
 #include <wil/result.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -19,11 +22,13 @@
 #include <exception>
 #include <format>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "core/attachment.h"
 #include "core/claude_process.h"
 #include "core/store.h"
 
@@ -57,6 +62,8 @@ constexpr float kModelsWidth = 270.f;
 constexpr float kMoreWidth = 230.f;
 constexpr float kEffortWidth = 250.f;
 constexpr float kEffortHeight = 112.f;
+constexpr float kAttachmentRow = 56.f;
+constexpr float kFileChip = 190.f;
 
 // Sovereign's palette (src/tray/ui_style.h): dark only, one blue accent.
 constexpr uint32_t kWindow = 0x0e0e0f;
@@ -108,6 +115,9 @@ enum class Target {
     None,
     History,
     NewChat,
+    Attach,
+    AttachmentChip,    // row: an index into the attachments; shows its remove button
+    RemoveAttachment,  // row: the same
     ModelChip,
     EffortChip,
     Send,
@@ -135,7 +145,9 @@ struct Geometry {
     D2D1_RECT_F newChat{};
     D2D1_RECT_F feed{};
     D2D1_RECT_F box{};
+    D2D1_RECT_F attachments{};  // the row of attached files above the text
     D2D1_RECT_F text{};
+    D2D1_RECT_F attach{};
     D2D1_RECT_F limits{};
     D2D1_RECT_F model{};
     D2D1_RECT_F effort{};  // empty when the model has no effort levels
@@ -300,7 +312,15 @@ private:
     float FeedHeight() const;
     void ScrollBy(float delta);
     void CopyItemAt(float y);
-    void Flash(std::wstring status);
+    void Flash(std::wstring status, UINT milliseconds = 1500);
+
+    D2D1_RECT_F AttachmentRect(const Geometry& g, size_t index) const;
+    static D2D1_RECT_F RemoveRect(const D2D1_RECT_F& chip);
+    void PaintAttachments(const Geometry& g);
+    void PickFiles();
+    void AttachFile(const std::wstring& path);
+    void AttachClipboardImage();
+    void Attached();
 
     void OpenPopup(Popup popup);
     void ClosePopup();
@@ -335,6 +355,7 @@ private:
 
     wil::com_ptr<ID2D1Factory> d2d_;
     wil::com_ptr<IDWriteFactory> dwrite_;
+    wil::com_ptr<IWICImagingFactory> wic_;
     wil::com_ptr<ID2D1HwndRenderTarget> target_;
     wil::com_ptr<ID2D1SolidColorBrush> brush_;
     wil::com_ptr<ID2D1StrokeStyle> round_;
@@ -355,6 +376,7 @@ private:
     float textHeight_ = kTextMin;  // the input's text area, grows with what is typed
     bool inputFocused_ = false;
     bool hasText_ = false;
+    std::vector<Attachment> attachments_;  // go with the next message
     Hit hover_;
     bool trackingMouse_ = false;
 
@@ -398,6 +420,8 @@ int ChatWindow::Run(int show) {
     THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d_.put()));
     THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                         reinterpret_cast<IUnknown**>(dwrite_.put())));
+    THROW_IF_FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                     IID_PPV_ARGS(wic_.put())));
     D2D1_STROKE_STYLE_PROPERTIES stroke = D2D1::StrokeStyleProperties();
     stroke.startCap = stroke.endCap = D2D1_CAP_STYLE_ROUND;
     stroke.lineJoin = D2D1_LINE_JOIN_ROUND;
@@ -506,6 +530,19 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         DwmSetWindowAttribute(hwnd_, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
         CreateFonts();
         CreateInput();
+        DragAcceptFiles(hwnd_, TRUE);
+        return 0;
+    }
+    case WM_DROPFILES: {
+        const auto drop = reinterpret_cast<HDROP>(wParam);
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < count; ++i) {
+            std::wstring path(DragQueryFileW(drop, i, nullptr, 0), L'\0');
+            DragQueryFileW(drop, i, path.data(), static_cast<UINT>(path.size() + 1));
+            AttachFile(path);
+        }
+        DragFinish(drop);
+        SetForegroundWindow(hwnd_);
         return 0;
     }
     case WM_SIZE:
@@ -570,7 +607,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT && reinterpret_cast<HWND>(wParam) == hwnd_) {
-            const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup;
+            const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup &&
+                                   hover_.target != Target::AttachmentChip;
             SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
@@ -735,6 +773,14 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::NewChat:
         NewChat();
         break;
+    case Target::Attach:
+        PickFiles();
+        break;
+    case Target::RemoveAttachment:
+        attachments_.erase(attachments_.begin() + static_cast<std::ptrdiff_t>(hit.row));
+        hover_ = {};
+        Attached();
+        break;
     case Target::Send:
         if (busy_) {
             claude_.Interrupt();
@@ -851,9 +897,20 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             OpenPopup(Popup::History);
             return 1;
         }
+        if (filter.wParam == 'U' && control) {
+            PickFiles();
+            return 1;
+        }
+        if (filter.wParam == 'V' && control && ClipboardHasImage()) {
+            AttachClipboardImage();  // a screenshot becomes an attachment, not text
+            return 1;
+        }
     }
     if (filter.msg == WM_CHAR && filter.wParam == L'\r' && !shift) {
         return 1;  // the Enter that sent the message
+    }
+    if (filter.msg == WM_CHAR && filter.wParam == 0x15) {
+        return 1;  // Ctrl+U's character
     }
     return 0;
 }
@@ -873,11 +930,15 @@ Geometry ChatWindow::Layout() const {
     g.history = D2D1::RectF(g.newChat.left - 4 - kButton, buttonTop, g.newChat.left - 4, buttonTop + kButton);
 
     const float boxBottom = g.height - kBoxBottom;
-    const float boxTop = boxBottom - (kBoxPad + textHeight_ + 4 + kToolbar);
+    const float attachmentsHeight = attachments_.empty() ? 0.f : kAttachmentRow + 8;
+    const float boxTop = boxBottom - (kBoxPad + attachmentsHeight + textHeight_ + 4 + kToolbar);
     g.box = D2D1::RectF(left, boxTop, right, boxBottom);
-    g.text = D2D1::RectF(left + 14, boxTop + kBoxPad, right - 14, boxTop + kBoxPad + textHeight_);
+    g.attachments = D2D1::RectF(left + 12, boxTop + kBoxPad, right - 12, boxTop + kBoxPad + kAttachmentRow);
+    const float textTop = boxTop + kBoxPad + attachmentsHeight;
+    g.text = D2D1::RectF(left + 14, textTop, right - 14, textTop + textHeight_);
     const float toolTop = boxBottom - kToolbar + 4;
     const float toolBottom = boxBottom - 6;
+    g.attach = D2D1::RectF(left + 8, toolTop, left + 8 + (toolBottom - toolTop), toolBottom);
     g.send = D2D1::RectF(right - 8 - (toolBottom - toolTop), toolTop, right - 8, toolBottom);
     float chipsRight = g.send.left - 8;
     if (!EffortLevels().empty()) {
@@ -887,7 +948,7 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, toolTop + 3, chipsRight, toolBottom - 3);
-    g.limits = D2D1::RectF(left + 14, toolTop, g.model.left - 10, toolBottom);
+    g.limits = D2D1::RectF(g.attach.right + 10, toolTop, g.model.left - 10, toolBottom);
     g.feed = D2D1::RectF(0, kHeader, g.width, boxTop - 8);
 
     switch (popup_) {
@@ -983,6 +1044,18 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.newChat, x, y)) {
         return {Target::NewChat};
+    }
+    if (Inside(g.attach, x, y)) {
+        return {Target::Attach};
+    }
+    for (size_t i = 0; i < attachments_.size(); ++i) {
+        const D2D1_RECT_F chip = AttachmentRect(g, i);
+        if (Inside(RemoveRect(chip), x, y)) {
+            return {Target::RemoveAttachment, i};
+        }
+        if (Inside(chip, x, y)) {
+            return {Target::AttachmentChip, i};
+        }
     }
     if (Inside(g.model, x, y)) {
         return {Target::ModelChip};
@@ -1240,6 +1313,18 @@ void ChatWindow::PaintInput(const Geometry& g) {
     brush_->SetColor(inputFocused_ ? Color(kAccent, 0.75f) : Color(kLine));
     target_->DrawRoundedRectangle(D2D1::RoundedRect(g.box, 12.f, 12.f), brush_.get(), 1.f);
 
+    PaintAttachments(g);
+    {  // "+": attach files or photos
+        const bool active = hover_.target == Target::Attach;
+        if (active) {
+            Fill(g.attach, 6.f, kRaised);
+        }
+        const D2D1_POINT_2F c{(g.attach.left + g.attach.right) / 2, (g.attach.top + g.attach.bottom) / 2};
+        const uint32_t color = active ? kPrimary : kSecondary;
+        Line({c.x - 6.f, c.y}, {c.x + 6.f, c.y}, color, 1.6f);
+        Line({c.x, c.y - 6.f}, {c.x, c.y + 6.f}, color, 1.6f);
+    }
+
     if (!limits_.empty()) {
         Text(limits_, ui_.get(), g.limits, kSecondary);
     }
@@ -1263,7 +1348,7 @@ void ChatWindow::PaintInput(const Geometry& g) {
              effortActive ? kPrimary : kSecondary);
     }
 
-    const bool live = hasText_ || busy_;
+    const bool live = hasText_ || !attachments_.empty() || busy_;
     const D2D1_POINT_2F c{(g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2};
     const float radius = (g.send.right - g.send.left) / 2;
     brush_->SetColor(Color(live ? kAccent : kRaised, live && hover_.target == Target::Send ? 0.85f : 1.f));
@@ -1442,9 +1527,123 @@ void ChatWindow::CopyItemAt(float y) {
     }
 }
 
-void ChatWindow::Flash(std::wstring status) {
+void ChatWindow::Flash(std::wstring status, UINT milliseconds) {
     status_ = std::move(status);
-    SetTimer(hwnd_, kStatusTimer, 1500, nullptr);
+    SetTimer(hwnd_, kStatusTimer, milliseconds, nullptr);
+    Refresh();
+}
+
+D2D1_RECT_F ChatWindow::AttachmentRect(const Geometry& g, size_t index) const {
+    float x = g.attachments.left;
+    for (size_t i = 0; i <= index && i < attachments_.size(); ++i) {
+        const float width = attachments_[i].type == Attachment::Type::Image ? kAttachmentRow : kFileChip;
+        if (i == index) {
+            return D2D1::RectF(x, g.attachments.top, x + width, g.attachments.bottom);
+        }
+        x += width + 8;
+    }
+    return {};
+}
+
+D2D1_RECT_F ChatWindow::RemoveRect(const D2D1_RECT_F& chip) {
+    return D2D1::RectF(chip.right - 20, chip.top + 2, chip.right - 2, chip.top + 20);
+}
+
+void ChatWindow::PaintAttachments(const Geometry& g) {
+    for (size_t i = 0; i < attachments_.size(); ++i) {
+        const Attachment& attachment = attachments_[i];
+        const D2D1_RECT_F chip = AttachmentRect(g, i);
+        if (chip.right > g.attachments.right) {
+            break;  // no room left in the row
+        }
+        Fill(chip, 8.f, kRaised);
+        wil::com_ptr<ID2D1Bitmap> bitmap;
+        if (attachment.thumbnail &&
+            SUCCEEDED(target_->CreateBitmapFromWicBitmap(attachment.thumbnail.get(), nullptr, bitmap.put()))) {
+            // Cover the square: the middle of the picture.
+            const D2D1_SIZE_F size = bitmap->GetSize();
+            const float side = std::min(size.width, size.height);
+            const D2D1_RECT_F source = D2D1::RectF((size.width - side) / 2, (size.height - side) / 2,
+                                                   (size.width + side) / 2, (size.height + side) / 2);
+            target_->DrawBitmap(bitmap.get(), chip, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &source);
+        } else {
+            const std::wstring kind = attachment.type == Attachment::Type::Document ? L"PDF" : L"текст";
+            Text(attachment.name, ui_.get(), D2D1::RectF(chip.left + 12, chip.top + 6, chip.right - 24, chip.top + 30),
+                 kPrimary);
+            Text(kind, ui_.get(), D2D1::RectF(chip.left + 12, chip.top + 28, chip.right - 12, chip.bottom - 6),
+                 kSecondary);
+        }
+        const bool hovered = (hover_.target == Target::AttachmentChip || hover_.target == Target::RemoveAttachment) &&
+                             hover_.row == i;
+        if (hovered) {
+            const D2D1_RECT_F close = RemoveRect(chip);
+            const D2D1_POINT_2F c{(close.left + close.right) / 2, (close.top + close.bottom) / 2};
+            brush_->SetColor(Color(kWindow, 0.85f));
+            target_->FillEllipse(D2D1::Ellipse(c, 8.f, 8.f), brush_.get());
+            const uint32_t color = hover_.target == Target::RemoveAttachment ? kPrimary : kSecondary;
+            Line({c.x - 3.f, c.y - 3.f}, {c.x + 3.f, c.y + 3.f}, color, 1.4f);
+            Line({c.x + 3.f, c.y - 3.f}, {c.x - 3.f, c.y + 3.f}, color, 1.4f);
+        }
+    }
+}
+
+void ChatWindow::PickFiles() {
+    wil::com_ptr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(dialog.put())))) {
+        return;
+    }
+    FILEOPENDIALOGOPTIONS options{};
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    const std::array<COMDLG_FILTERSPEC, 2> filters{{
+        {L"Фото и файлы",
+         L"*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.pdf;*.txt;*.md;*.json;*.log;*.csv;*.xml;*.yml;*.yaml;*.toml;"
+         L"*.ini;*.cfg;*.conf;*.cpp;*.h;*.hpp;*.c;*.py;*.js;*.ts;*.go;*.rs;*.ps1;*.cmd;*.sh"},
+        {L"Все файлы", L"*.*"},
+    }};
+    dialog->SetFileTypes(static_cast<UINT>(filters.size()), filters.data());
+    dialog->SetTitle(L"Прикрепить фото или файлы");
+    if (FAILED(dialog->Show(hwnd_))) {
+        return;  // cancelled
+    }
+    wil::com_ptr<IShellItemArray> items;
+    DWORD count = 0;
+    if (FAILED(dialog->GetResults(items.put())) || FAILED(items->GetCount(&count))) {
+        return;
+    }
+    for (DWORD i = 0; i < count; ++i) {
+        wil::com_ptr<IShellItem> item;
+        wil::unique_cotaskmem_string path;
+        if (SUCCEEDED(items->GetItemAt(i, item.put())) &&
+            SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, path.put()))) {
+            AttachFile(path.get());
+        }
+    }
+}
+
+void ChatWindow::AttachFile(const std::wstring& path) {
+    std::wstring error;
+    if (std::optional<Attachment> attachment = LoadAttachment(wic_.get(), path, error)) {
+        attachments_.push_back(std::move(*attachment));
+        Attached();
+    } else {
+        Flash(error, 5000);
+    }
+}
+
+void ChatWindow::AttachClipboardImage() {
+    std::wstring error;
+    if (std::optional<Attachment> attachment = ClipboardImage(wic_.get(), hwnd_, error)) {
+        attachments_.push_back(std::move(*attachment));
+        Attached();
+    } else if (!error.empty()) {
+        Flash(error, 5000);
+    }
+}
+
+void ChatWindow::Attached() {
+    PlaceChildren();
+    SetFocus(input_);
     Refresh();
 }
 
@@ -1720,16 +1919,29 @@ void ChatWindow::NewChat() {
 void ChatWindow::Submit() {
     std::wstring text = NormalizeNewlines(WindowText(input_));
     const size_t first = text.find_first_not_of(L" \t\n");
-    if (first == std::wstring::npos) {
+    text = first == std::wstring::npos ? L"" : text.substr(first, text.find_last_not_of(L" \t\n") - first + 1);
+    if (text.empty() && attachments_.empty()) {
         return;
     }
-    text = text.substr(first, text.find_last_not_of(L" \t\n") - first + 1);
     if (!running_ && !StartClaude()) {
         return;
     }
-    claude_.SendUserText(ToUtf8(text));
-    Add(Kind::User, std::move(text));
+    // Attachments first, then the words about them, as Claude's own apps send it.
+    Json content = Json::array();
+    std::wstring shown;
+    for (const Attachment& attachment : attachments_) {
+        content.push_back(ContentBlock(attachment));
+        shown += (shown.empty() ? L"" : L"\n") + (L"📎 " + attachment.name);
+    }
+    if (!text.empty()) {
+        content.push_back(Json{{"type", "text"}, {"text", ToUtf8(text)}});
+        shown += (shown.empty() ? L"" : L"\n\n") + text;
+    }
+    claude_.SendUserContent(std::move(content));
+    Add(Kind::User, std::move(shown));
+    attachments_.clear();
     SetWindowTextW(input_, L"");
+    PlaceChildren();
     busy_ = true;
     stick_ = true;
     Refresh();
@@ -1856,6 +2068,12 @@ void ChatWindow::Add(Kind kind, std::wstring text) {
 }  // namespace
 
 int RunChatWindow(HINSTANCE instance, int show) {
+    // The file dialog and WIC are COM; plain CoInitialize (not OleInitialize) also keeps RichEdit
+    // from registering itself as a drop target, so dropped files reach the window.
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+        return 1;
+    }
+    auto uninitialize = wil::scope_exit([] { CoUninitialize(); });
     try {
         ChatWindow window(instance);
         return window.Run(show);

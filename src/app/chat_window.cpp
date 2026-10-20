@@ -63,18 +63,18 @@ constexpr float kChipsBottom = 10.f;
 constexpr float kInputButton = 30.f;  // "+" and send
 constexpr float kRing = 22.f;
 constexpr float kUsageWidth = 380.f;
-constexpr float kSidePanel = 340.f;   // the secrets panel, docked at the right
 constexpr float kPanelPad = 16.f;
 constexpr float kSecretRow = 38.f;
 constexpr float kFieldHeight = 34.f;
-constexpr float kSecretsNote = 50.f;
+constexpr float kSecretsNote = 40.f;
 constexpr float kUsageRow = 58.f;
 constexpr float kTextMin = 22.f;
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 32.f;
-constexpr float kHistoryWidth = 380.f;
-constexpr float kHistoryRow = 36.f;
-constexpr size_t kHistoryRows = 12;
+constexpr float kSidebar = 252.f;  // the left column: search, secrets, the chats
+constexpr float kHistoryRow = 34.f;
+constexpr float kNavRow = 34.f;
+constexpr float kMinChat = 420.f;  // the chat never gets narrower than this: side panels give way first
 constexpr float kMenuRow = 30.f;
 constexpr float kModelsWidth = 270.f;
 constexpr float kMoreWidth = 230.f;
@@ -145,7 +145,7 @@ struct FeedItem {
 };
 
 // The panels that open over the window; one at a time.
-enum class Popup { None, History, Models, Effort, Usage };
+enum class Popup { None, Models, Effort, Usage };
 
 // One of the plan's limit windows, from the CLI's rate_limit_event.
 struct Limit {
@@ -155,7 +155,8 @@ struct Limit {
 
 enum class Target {
     None,
-    History,
+    SidebarToggle,
+    SidebarSearch,
     NewChat,
     Attach,
     AttachmentChip,    // row: an index into the attachments; shows its remove button
@@ -163,8 +164,8 @@ enum class Target {
     ModelChip,
     EffortChip,
     UsageChip,
-    Secrets,       // the key in the header
-    SecretsClose,
+    Secrets,       // the sidebar's entry that opens the secrets
+    SecretsClose,  // ... and the way back to the chats
     SecretRow,     // row: an index into the secrets' names
     SecretDelete,  // row: the same
     SecretSave,
@@ -191,16 +192,18 @@ struct Geometry {
     float width = 0;
     float height = 0;
     float column = 0;
-    float area = 0;  // the chat's width: the window's, less the secrets panel when it is open
-    float left = 0;  // where the chat column starts
-    D2D1_RECT_F secrets{};  // the header's key
-    D2D1_RECT_F panel{};    // the secrets panel (empty when closed)
+    float areaLeft = 0;  // the chat's left edge: right of the sidebar
+    float area = 0;      // ... and its right edge
+    float left = 0;      // where the chat column starts
+    D2D1_RECT_F sidebar{};
+    D2D1_RECT_F sideToggle{};  // the header's button that shows or hides the sidebar
+    D2D1_RECT_F secrets{};     // the sidebar's entry for the secrets
+    D2D1_RECT_F panel{};       // the secrets view: the sidebar itself while it is open
     D2D1_RECT_F panelClose{};
     D2D1_RECT_F nameField{};
     D2D1_RECT_F valueField{};
     D2D1_RECT_F saveButton{};
     float secretsTop = 0;  // the first secret's row
-    D2D1_RECT_F history{};
     D2D1_RECT_F newChat{};
     D2D1_RECT_F feed{};
     D2D1_RECT_F box{};
@@ -381,12 +384,20 @@ private:
     void PaintHeader(const Geometry& g);
     void PaintInput(const Geometry& g);
     void PaintPanel(const D2D1_RECT_F& rect);
-    void PaintHistory(const Geometry& g);
     void PaintModels(const Geometry& g);
     void PaintEffort(const Geometry& g);
     void PaintUsage(const Geometry& g);
 
-    // The secrets panel: names and masked values, delete, and a form to add or replace one.
+    // The sidebar: search, the way to the secrets, the chats (or the secrets view in their place).
+    void PaintSidebar(const Geometry& g);
+    static size_t SidebarRows(const Geometry& g);
+    void SetSidebarOpen(bool open);
+    void FocusSearch();
+    void RefreshSessions();
+    void OnSearchKey(WPARAM key);
+    void OnSearchChar(wchar_t c);
+
+    // The secrets view: names and masked values, delete, and a form to add or replace one.
     static LRESULT CALLBACK SecretEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id,
                                            DWORD_PTR self);
     HWND CreateSecretField(bool password, const wchar_t* hint);
@@ -462,7 +473,9 @@ private:
     HWND input_ = nullptr;
     wil::unique_hmodule richEdit_;
     wil::unique_hfont uiFont_;
-    bool secretsOpen_ = false;
+    bool sidebarOpen_ = true;
+    bool searchFocus_ = false;  // typing goes to the sidebar's search (drawn here, no caret)
+    bool secretsOpen_ = false;  // the sidebar shows the secrets instead of the chats
     HWND nameEdit_ = nullptr;   // the panel's two fields; hidden while it is closed
     HWND valueEdit_ = nullptr;  // (a password field: the value never shows)
     wil::unique_hbrush fieldBrush_;
@@ -599,6 +612,7 @@ int ChatWindow::Run(int show) {
     if (!fonts_) {
         Add(Kind::Error, L"Встроенные шрифты не загрузились — показываю системным.");
     }
+    RefreshSessions();
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
 
     MSG message{};
@@ -820,8 +834,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         ScreenToClient(hwnd_, &at);
         const float steps = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
         const Geometry g = Layout();
-        if (popup_ == Popup::History && Inside(g.popup, ToDip(at.x), ToDip(at.y))) {
-            const size_t maxFirst = filtered_.size() > kHistoryRows ? filtered_.size() - kHistoryRows : 0;
+        if (popup_ == Popup::None && !secretsOpen_ && Inside(g.sidebar, ToDip(at.x), ToDip(at.y))) {
+            const size_t rows = SidebarRows(g);
+            const size_t maxFirst = filtered_.size() > rows ? filtered_.size() - rows : 0;
             const auto moved = static_cast<long long>(firstRow_) + static_cast<long long>(std::lround(steps * 3));
             firstRow_ = static_cast<size_t>(std::clamp<long long>(moved, 0, static_cast<long long>(maxFirst)));
             Refresh();
@@ -845,15 +860,19 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_KEYDOWN:
         if (popup_ != Popup::None) {
             OnPopupKey(wParam);
+        } else if (searchFocus_) {
+            OnSearchKey(wParam);
         }
         return 0;
     case WM_CHAR:
         if (popup_ != Popup::None) {
             OnPopupChar(static_cast<wchar_t>(wParam));
+        } else if (searchFocus_) {
+            OnSearchChar(static_cast<wchar_t>(wParam));
         }
         return 0;
     case WM_SETFOCUS:
-        if (popup_ == Popup::None) {  // with a panel open the keys stay here
+        if (popup_ == Popup::None && !searchFocus_) {  // with a panel open or the search active the keys stay here
             SetFocus(input_);
         }
         return 0;
@@ -916,12 +935,12 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
 
 void ChatWindow::OnClick(float x, float y) {
     const Hit hit = HitTest(x, y);
-    bool keepFocus = false;  // the secrets panel's own clicks leave focus in its fields
+    bool keepFocus = false;  // the secrets view's and the search's own clicks keep focus where they put it
+    if (hit.target != Target::SidebarSearch) {
+        searchFocus_ = false;
+    }
     if (popup_ != Popup::None) {
         switch (hit.target) {
-        case Target::HistoryRow:
-            OpenSession(hit.row);
-            return;
         case Target::ModelRow:
             ChooseModel(mainModels_[hit.row]);
             return;
@@ -945,8 +964,7 @@ void ChatWindow::OnClick(float x, float y) {
         // A click outside closes the panel; on the button that opened it, that is all it does.
         const Popup was = popup_;
         ClosePopup();
-        const bool sameButton = (hit.target == Target::History && was == Popup::History) ||
-                                (hit.target == Target::ModelChip && was == Popup::Models) ||
+        const bool sameButton = (hit.target == Target::ModelChip && was == Popup::Models) ||
                                 (hit.target == Target::EffortChip && was == Popup::Effort) ||
                                 (hit.target == Target::UsageChip && was == Popup::Usage);
         if (sameButton) {
@@ -954,8 +972,17 @@ void ChatWindow::OnClick(float x, float y) {
         }
     }
     switch (hit.target) {
-    case Target::History:
-        OpenPopup(Popup::History);
+    case Target::SidebarToggle:
+        SetSidebarOpen(!sidebarOpen_);
+        break;
+    case Target::SidebarSearch:
+        searchFocus_ = true;
+        SetFocus(hwnd_);
+        keepFocus = true;
+        Refresh();
+        break;
+    case Target::HistoryRow:
+        OpenSession(hit.row);
         break;
     case Target::ModelChip:
         OpenPopup(Popup::Models);
@@ -967,7 +994,7 @@ void ChatWindow::OnClick(float x, float y) {
         OpenPopup(Popup::Usage);
         break;
     case Target::Secrets:
-        SetSecretsOpen(!secretsOpen_);
+        SetSecretsOpen(true);
         keepFocus = true;
         break;
     case Target::SecretsClose:
@@ -1030,23 +1057,11 @@ void ChatWindow::OnClick(float x, float y) {
 }
 
 void ChatWindow::OnPopupKey(WPARAM key) {
-    const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     if (key == VK_ESCAPE) {
         ClosePopup();
         return;
     }
     switch (popup_) {
-    case Popup::History:
-        if (key == VK_RETURN && selected_ < filtered_.size()) {
-            OpenSession(selected_);
-        } else if (key == VK_DOWN || key == VK_UP) {
-            MoveSelection(key == VK_DOWN ? 1 : -1);
-        } else if (key == 'V' && control) {
-            searchText_ += ClipboardText(hwnd_);
-            std::erase_if(searchText_, [](wchar_t c) { return c == L'\r' || c == L'\n'; });
-            FilterSessions();
-        }
-        break;
     case Popup::Effort:
         if (key == VK_RETURN) {
             ClosePopup();
@@ -1075,21 +1090,6 @@ void ChatWindow::OnPopupChar(wchar_t c) {
         }
         return;
     }
-    if (popup_ != Popup::History) {
-        return;
-    }
-    if (c == L'\b') {
-        if (!searchText_.empty()) {
-            searchText_.pop_back();
-        }
-    } else if (c == 0x7f) {  // Ctrl+Backspace
-        searchText_.clear();
-    } else if (c >= L' ') {
-        searchText_ += c;
-    } else {
-        return;
-    }
-    FilterSessions();
 }
 
 void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
@@ -1110,6 +1110,7 @@ void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
     } else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
         inputFocused_ = code == EN_SETFOCUS;
         if (inputFocused_) {
+            searchFocus_ = false;
             ClosePopup();  // a click into the input
         }
         Refresh();
@@ -1135,7 +1136,7 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             return 1;
         }
         if (filter.wParam == 'H' && control) {
-            OpenPopup(Popup::History);
+            FocusSearch();
             return 1;
         }
         if (filter.wParam == 'U' && control) {
@@ -1162,18 +1163,18 @@ Geometry ChatWindow::Layout() const {
     GetClientRect(hwnd_, &client);
     g.width = ToDip(client.right);
     g.height = ToDip(client.bottom);
-    // The secrets panel docks at the right and the chat takes what is left, as the terminal does in Claude's app.
-    const float panelWidth = secretsOpen_ ? std::min(kSidePanel, std::max(0.f, g.width - 320.f)) : 0.f;
-    g.area = g.width - panelWidth;
-    g.column = std::max(0.f, std::min(g.area - 2 * kSide, kColumnMax));
-    const float left = (g.area - g.column) / 2;
+    // The sidebar docks at the left and the chat takes what is left, as in Claude's app.
+    const float sidebarWidth = sidebarOpen_ ? std::min(kSidebar, std::max(0.f, g.width - kMinChat)) : 0.f;
+    g.areaLeft = sidebarWidth;
+    g.area = g.width;
+    g.column = std::max(0.f, std::min(g.area - g.areaLeft - 2 * kSide, kColumnMax));
+    const float left = g.areaLeft + (g.area - g.areaLeft - g.column) / 2;
     g.left = left;
     const float right = left + g.column;
 
     const float buttonTop = (kHeader - kButton) / 2;
     g.newChat = D2D1::RectF(g.width - 10 - kButton, buttonTop, g.width - 10, buttonTop + kButton);
-    g.history = D2D1::RectF(g.newChat.left - 4 - kButton, buttonTop, g.newChat.left - 4, buttonTop + kButton);
-    g.secrets = D2D1::RectF(g.history.left - 4 - kButton, buttonTop, g.history.left - 4, buttonTop + kButton);
+    g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
     // usage ring sit in a row under it, at the right.
@@ -1204,10 +1205,16 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
-    g.feed = D2D1::RectF(0, kHeader, g.area, boxTop - 8);
+    g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
 
-    if (secretsOpen_) {
-        g.panel = D2D1::RectF(g.area, kHeader, g.width, g.height);
+    if (sidebarWidth > 0) {
+        g.sidebar = D2D1::RectF(0, kHeader, sidebarWidth, g.height);
+        g.search = D2D1::RectF(10, kHeader + 10, sidebarWidth - 10, kHeader + 10 + kFieldHeight);
+        g.secrets = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
+        g.listTop = g.secrets.bottom + 8 + 26;  // under the "chats" label
+    }
+    if (secretsOpen_ && sidebarWidth > 0) {
+        g.panel = g.sidebar;
         g.panelClose = D2D1::RectF(g.panel.right - 12 - 28, g.panel.top + 10, g.panel.right - 12, g.panel.top + 38);
         const float fieldLeft = g.panel.left + kPanelPad;
         const float fieldRight = g.panel.right - kPanelPad;
@@ -1219,16 +1226,6 @@ Geometry ChatWindow::Layout() const {
     }
 
     switch (popup_) {
-    case Popup::History: {
-        const float width = std::min(kHistoryWidth, g.width - 20);
-        const float top = kHeader + 4;
-        g.search = D2D1::RectF(g.width - 10 - width + 10, top + 10, g.width - 20, top + 42);
-        g.listTop = g.search.bottom + 8;
-        const size_t rows = std::max<size_t>(1, std::min(kHistoryRows, filtered_.size()));
-        g.popup = D2D1::RectF(g.width - 10 - width, top, g.width - 10,
-                              g.listTop + static_cast<float>(rows) * kHistoryRow + 8);
-        break;
-    }
     case Popup::Models: {
         const float rows = static_cast<float>(mainModels_.size());
         const float height = 12 + rows * kMenuRow + (moreModels_.empty() ? 0 : 9 + kMenuRow);
@@ -1272,17 +1269,6 @@ Geometry ChatWindow::Layout() const {
 Hit ChatWindow::HitTest(float x, float y) const {
     const Geometry g = Layout();
     switch (popup_) {
-    case Popup::History:
-        if (Inside(g.popup, x, y)) {
-            if (y >= g.listTop) {
-                const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
-                if (row < filtered_.size() && row < firstRow_ + kHistoryRows) {
-                    return {Target::HistoryRow, row};
-                }
-            }
-            return {Target::InsidePopup};
-        }
-        break;
     case Popup::Models:
         if (moreOpen_ && Inside(g.submenu, x, y)) {
             const auto row = static_cast<size_t>(std::max(0.f, y - g.submenu.top - 6) / kMenuRow);
@@ -1318,7 +1304,7 @@ Hit ChatWindow::HitTest(float x, float y) const {
     case Popup::None:
         break;
     }
-    if (secretsOpen_ && Inside(g.panel, x, y)) {
+    if (secretsOpen_ && Inside(g.panel, x, y)) {  // the sidebar in its secrets view
         if (Inside(g.panelClose, x, y)) {
             return {Target::SecretsClose};
         }
@@ -1337,8 +1323,23 @@ Hit ChatWindow::HitTest(float x, float y) const {
         }
         return {};
     }
-    if (Inside(g.secrets, x, y)) {
-        return {Target::Secrets};
+    if (Inside(g.sidebar, x, y)) {
+        if (Inside(g.search, x, y)) {
+            return {Target::SidebarSearch};
+        }
+        if (Inside(g.secrets, x, y)) {
+            return {Target::Secrets};
+        }
+        if (y >= g.listTop) {
+            const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
+            if (row < filtered_.size() && row < firstRow_ + SidebarRows(g)) {
+                return {Target::HistoryRow, row};
+            }
+        }
+        return {};
+    }
+    if (Inside(g.sideToggle, x, y)) {
+        return {Target::SidebarToggle};
     }
     if (Inside(g.feed, x, y)) {
         for (size_t i = 0; i < feed_.size(); ++i) {
@@ -1355,9 +1356,6 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 return {Target::ApprovalDeny, i};
             }
         }
-    }
-    if (Inside(g.history, x, y)) {
-        return {Target::History};
     }
     if (Inside(g.newChat, x, y)) {
         return {Target::NewChat};
@@ -1569,11 +1567,8 @@ void ChatWindow::Paint() {
     PaintFeed(g);
     PaintHeader(g);
     PaintInput(g);
-    PaintSecrets(g);
+    PaintSidebar(g);
     switch (popup_) {
-    case Popup::History:
-        PaintHistory(g);
-        break;
     case Popup::Models:
         PaintModels(g);
         break;
@@ -1771,15 +1766,16 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     brush_->SetColor(Color(kLine));
     target_->FillRectangle(D2D1::RectF(0, kHeader - 1, g.width, kHeader), brush_.get());
 
-    float titleLeft = 16;
+    float titleLeft = g.sideToggle.right + 12;
     if (logo_) {
         const float top = (kHeader - kLogo) / 2;
-        target_->DrawBitmap(logo_.get(), D2D1::RectF(14, top, 14 + kLogo, top + kLogo), 1.f,
+        const float logoLeft = g.sideToggle.right + 6;
+        target_->DrawBitmap(logo_.get(), D2D1::RectF(logoLeft, top, logoLeft + kLogo, top + kLogo), 1.f,
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        titleLeft = 14 + kLogo + 10;
+        titleLeft = logoLeft + kLogo + 10;
     }
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
-    const float titleRight = g.secrets.left - 12;
+    const float titleRight = g.newChat.left - 12;
     Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kPrimary);
     std::wstring state = busy_ ? L"отвечает…" : L"";
     if (!status_.empty()) {
@@ -1790,26 +1786,19 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Text(state, ui_.get(), D2D1::RectF(titleLeft + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
     }
 
-    for (const Target button : {Target::Secrets, Target::History, Target::NewChat}) {
-        const D2D1_RECT_F& r = button == Target::Secrets ? g.secrets : (button == Target::History ? g.history : g.newChat);
-        const bool active = hover_.target == button || (button == Target::History && popup_ == Popup::History) ||
-                            (button == Target::Secrets && secretsOpen_);
+    for (const Target button : {Target::SidebarToggle, Target::NewChat}) {
+        const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle : g.newChat;
+        const bool active = hover_.target == button || (button == Target::SidebarToggle && sidebarOpen_);
         if (active) {
             Fill(r, 6.f, kRaised);
         }
         const D2D1_POINT_2F c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
         const uint32_t color = active ? kPrimary : kSecondary;
-        if (button == Target::Secrets) {  // a key
+        if (button == Target::SidebarToggle) {  // a window with its left column marked
             brush_->SetColor(Color(color));
-            target_->DrawEllipse(D2D1::Ellipse({c.x - 3.5f, c.y + 3.5f}, 3.5f, 3.5f), brush_.get(), 1.5f);
-            Line({c.x - 1.f, c.y + 1.f}, {c.x + 6.5f, c.y - 6.5f}, color, 1.5f);
-            Line({c.x + 3.5f, c.y - 3.f}, {c.x + 6.f, c.y - 0.5f}, color, 1.5f);
-            Line({c.x + 5.f, c.y - 4.5f}, {c.x + 7.5f, c.y - 2.f}, color, 1.5f);
-        } else if (button == Target::History) {  // a clock
-            brush_->SetColor(Color(color));
-            target_->DrawEllipse(D2D1::Ellipse(c, 7.5f, 7.5f), brush_.get(), 1.5f);
-            Line(c, {c.x, c.y - 4.5f}, color, 1.5f);
-            Line(c, {c.x + 3.5f, c.y + 1.5f}, color, 1.5f);
+            target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 8.f, c.y - 6.5f, c.x + 8.f, c.y + 6.5f), 2.5f, 2.5f),
+                                          brush_.get(), 1.4f);
+            Line({c.x - 3.f, c.y - 6.5f}, {c.x - 3.f, c.y + 6.5f}, color, 1.4f);
         } else {  // a plus
             Line({c.x - 6.5f, c.y}, {c.x + 6.5f, c.y}, color, 1.6f);
             Line({c.x, c.y - 6.5f}, {c.x, c.y + 6.5f}, color, 1.6f);
@@ -2024,6 +2013,10 @@ void ChatWindow::SetSecretsOpen(bool open) {
         return;
     }
     ClosePopup();
+    searchFocus_ = false;
+    if (open) {
+        sidebarOpen_ = true;  // the secrets live in the sidebar
+    }
     secretsOpen_ = open;
     hover_ = {};
     if (!open) {
@@ -2098,8 +2091,6 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
     if (!secretsOpen_) {
         return;
     }
-    Fill(g.panel, 0.f, kPanel);
-    Line({g.panel.left, g.panel.top}, {g.panel.left, g.panel.bottom}, kLine, 1.f);
     Text(L"Секреты", uiBold_.get(),
          D2D1::RectF(g.panel.left + kPanelPad, g.panel.top + 10, g.panelClose.left - 8, g.panel.top + 38), kPrimary);
     {  // a cross
@@ -2112,8 +2103,7 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
         Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.5f);
         Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.5f);
     }
-    Text(L"Значения шифруются на этом компьютере. Claude видит только имена и подставляет значения сам: "
-         L"в команде, через переменную окружения.",
+    Text(L"Значения хранятся зашифрованными. Claude видит только имена.",
          small_.get(),
          D2D1::RectF(g.panel.left + kPanelPad, g.panel.top + 44, g.panel.right - kPanelPad, g.panel.top + 44 + kSecretsNote),
          kSecondary);
@@ -2130,8 +2120,8 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
         if (onRow) {
             Fill(row, 8.f, kRaised);
         }
-        Text(ToWide(names[i]), ui_.get(), D2D1::RectF(row.left + 10, row.top, row.right - 140, row.bottom), kPrimary);
-        Text(L"••••••••", uiRight_.get(), D2D1::RectF(row.right - 134, row.top, row.right - 40, row.bottom), kSecondary);
+        Text(ToWide(names[i]), ui_.get(), D2D1::RectF(row.left + 10, row.top, row.right - 100, row.bottom), kPrimary);
+        Text(L"••••••••", uiRight_.get(), D2D1::RectF(row.right - 96, row.top, row.right - 40, row.bottom), kSecondary);
         if (onRow) {  // a bin
             const D2D1_RECT_F bin = SecretDeleteRect(row);
             const bool danger = hover_.target == Target::SecretDelete;
@@ -2161,37 +2151,155 @@ void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {
     target_->DrawRoundedRectangle(D2D1::RoundedRect(rect, 10.f, 10.f), brush_.get(), 1.f);
 }
 
-void ChatWindow::PaintHistory(const Geometry& g) {
-    PaintPanel(g.popup);
-    Fill(g.search, 6.f, kRaised);
-    const D2D1_RECT_F field = D2D1::RectF(g.search.left + 10, g.search.top, g.search.right - 10, g.search.bottom);
+size_t ChatWindow::SidebarRows(const Geometry& g) {
+    const float room = g.sidebar.bottom - g.listTop - 8;
+    return room < kHistoryRow ? 0 : static_cast<size_t>(room / kHistoryRow);
+}
+
+void ChatWindow::PaintSidebar(const Geometry& g) {
+    if (g.sidebar.right <= g.sidebar.left) {
+        return;
+    }
+    Fill(g.sidebar, 0.f, kPanel);
+    Line({g.sidebar.right, g.sidebar.top}, {g.sidebar.right, g.sidebar.bottom}, kLine, 1.f);
+    if (secretsOpen_) {
+        PaintSecrets(g);
+        return;
+    }
+
+    // Search: drawn here, so there is no blinking caret.
+    Fill(g.search, 8.f, kRaised);
+    if (searchFocus_) {
+        brush_->SetColor(Color(kAccent, 0.75f));
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(g.search, 8.f, 8.f), brush_.get(), 1.f);
+    }
+    const D2D1_RECT_F field = D2D1::RectF(g.search.left + 12, g.search.top, g.search.right - 10, g.search.bottom);
     if (searchText_.empty()) {
-        Text(L"Поиск по чатам — просто начни печатать", ui_.get(), field, kSecondary);
+        Text(L"Поиск", ui_.get(), field, kSecondary);
     } else {
         Text(searchText_, ui_.get(), field, kPrimary);
     }
 
+    {  // the way to the secrets
+        const bool active = hover_.target == Target::Secrets;
+        if (active) {
+            Fill(g.secrets, 8.f, kRaised);
+        }
+        const uint32_t color = active ? kPrimary : kSecondary;
+        const D2D1_POINT_2F c{g.secrets.left + 22.f, (g.secrets.top + g.secrets.bottom) / 2};
+        brush_->SetColor(Color(color));
+        target_->DrawEllipse(D2D1::Ellipse({c.x - 3.5f, c.y + 3.5f}, 3.5f, 3.5f), brush_.get(), 1.5f);
+        Line({c.x - 1.f, c.y + 1.f}, {c.x + 6.5f, c.y - 6.5f}, color, 1.5f);
+        Line({c.x + 3.5f, c.y - 3.f}, {c.x + 6.f, c.y - 0.5f}, color, 1.5f);
+        Line({c.x + 5.f, c.y - 4.5f}, {c.x + 7.5f, c.y - 2.f}, color, 1.5f);
+        Text(L"Секреты", ui_.get(),
+             D2D1::RectF(g.secrets.left + 42, g.secrets.top, g.secrets.right - 8, g.secrets.bottom), color);
+    }
+
+    Text(L"Чаты", ui_.get(),
+         D2D1::RectF(g.sidebar.left + 16, g.secrets.bottom + 8, g.sidebar.right - 10, g.secrets.bottom + 8 + 22),
+         kSecondary);
     if (filtered_.empty()) {
-        const std::wstring empty = sessions_.empty() ? L"Чатов пока нет" : L"Ничего не нашлось";
-        Text(empty, ui_.get(), D2D1::RectF(g.search.left + 10, g.listTop, g.search.right, g.listTop + kHistoryRow),
-             kSecondary);
+        const std::wstring empty = sessions_.empty() ? L"Чатов пока нет" : L"Ничего не найдено";
+        Text(empty, ui_.get(),
+             D2D1::RectF(g.sidebar.left + 16, g.listTop, g.sidebar.right - 10, g.listTop + kHistoryRow), kSecondary);
         return;
     }
-    const size_t last = std::min(filtered_.size(), firstRow_ + kHistoryRows);
+    const size_t last = std::min(filtered_.size(), firstRow_ + SidebarRows(g));
     for (size_t row = firstRow_; row < last; ++row) {
         const SessionInfo& session = sessions_[filtered_[row]];
         const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
-        const D2D1_RECT_F r = D2D1::RectF(g.popup.left + 6, top, g.popup.right - 6, top + kHistoryRow);
-        if (row == selected_) {
-            Fill(r, 6.f, kRaised);
+        const D2D1_RECT_F r = D2D1::RectF(g.sidebar.left + 6, top, g.sidebar.right - 6, top + kHistoryRow);
+        const bool hovered = hover_.target == Target::HistoryRow && hover_.row == row;
+        if (hovered || (searchFocus_ && row == selected_)) {
+            Fill(r, 8.f, kRaised);
         }
-        const std::wstring age = Age(session.modified);
-        const float ageWidth = TextWidth(age, uiRight_.get());
         const bool current = session.id == sessionId_;
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
-             D2D1::RectF(r.left + 10, r.top, r.right - ageWidth - 22, r.bottom), current ? kAccent : kPrimary);
-        Text(age, uiRight_.get(), D2D1::RectF(r.right - ageWidth - 12, r.top, r.right - 10, r.bottom), kSecondary);
+             D2D1::RectF(r.left + 10, r.top, r.right - 8, r.bottom), current ? kAccent : kPrimary);
     }
+}
+
+void ChatWindow::SetSidebarOpen(bool open) {
+    if (sidebarOpen_ == open) {
+        return;
+    }
+    if (!open) {
+        if (secretsOpen_) {
+            SetSecretsOpen(false);
+        }
+        searchFocus_ = false;
+        SetFocus(input_);
+    }
+    sidebarOpen_ = open;
+    hover_ = {};
+    PlaceChildren();  // the chat's column moves
+    if (open) {
+        RefreshSessions();
+    }
+    Refresh();
+}
+
+// Ctrl+H or a click on the search: the keys go to it until Esc, Enter or a click elsewhere.
+void ChatWindow::FocusSearch() {
+    ClosePopup();
+    SetSidebarOpen(true);
+    if (secretsOpen_) {
+        SetSecretsOpen(false);
+    }
+    searchFocus_ = true;
+    SetFocus(hwnd_);
+    Refresh();
+}
+
+void ChatWindow::RefreshSessions() {
+    const size_t first = firstRow_;
+    const size_t selected = selected_;
+    sessions_ = ListSessions(workspace_);
+    FilterSessions();
+    const size_t most = filtered_.empty() ? 0 : filtered_.size() - 1;
+    firstRow_ = std::min(first, most);
+    selected_ = std::min(selected, most);
+}
+
+void ChatWindow::OnSearchKey(WPARAM key) {
+    const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (key == VK_ESCAPE) {
+        searchFocus_ = false;
+        if (!searchText_.empty()) {
+            searchText_.clear();
+            FilterSessions();
+        }
+        SetFocus(input_);
+        Refresh();
+    } else if (key == VK_RETURN) {
+        if (selected_ < filtered_.size()) {
+            searchFocus_ = false;
+            OpenSession(selected_);
+            SetFocus(input_);
+        }
+    } else if (key == VK_DOWN || key == VK_UP) {
+        MoveSelection(key == VK_DOWN ? 1 : -1);
+    } else if (key == 'V' && control) {
+        searchText_ += ClipboardText(hwnd_);
+        std::erase_if(searchText_, [](wchar_t c) { return c == L'\r' || c == L'\n'; });
+        FilterSessions();
+    }
+}
+
+void ChatWindow::OnSearchChar(wchar_t c) {
+    if (c == L'\b') {
+        if (!searchText_.empty()) {
+            searchText_.pop_back();
+        }
+    } else if (c == 0x7f) {  // Ctrl+Backspace
+        searchText_.clear();
+    } else if (c >= L' ') {
+        searchText_ += c;
+    } else {
+        return;
+    }
+    FilterSessions();
 }
 
 void ChatWindow::PaintModels(const Geometry& g) {
@@ -2533,11 +2641,6 @@ void ChatWindow::OpenPopup(Popup popup) {
     popup_ = popup;
     hover_ = {};
     switch (popup) {
-    case Popup::History:
-        sessions_ = ListSessions(workspace_);
-        searchText_.clear();
-        FilterSessions();
-        break;
     case Popup::Models:
         moreOpen_ = false;
         break;
@@ -2548,7 +2651,8 @@ void ChatWindow::OpenPopup(Popup popup) {
     case Popup::None:
         break;
     }
-    SetFocus(hwnd_);  // the panel's keys: typing to search, digits, arrows
+    searchFocus_ = false;
+    SetFocus(hwnd_);  // the panel's keys: digits, arrows
     Refresh();
 }
 
@@ -2591,8 +2695,8 @@ void ChatWindow::MoveSelection(int delta) {
     selected_ = static_cast<size_t>(next);
     if (selected_ < firstRow_) {
         firstRow_ = selected_;
-    } else if (selected_ >= firstRow_ + kHistoryRows) {
-        firstRow_ = selected_ + 1 - kHistoryRows;
+    } else if (const size_t rows = std::max<size_t>(1, SidebarRows(Layout())); selected_ >= firstRow_ + rows) {
+        firstRow_ = selected_ + 1 - rows;
     }
     Refresh();
 }
@@ -2899,6 +3003,7 @@ void ChatWindow::OnClaude(const Json& message) {
             if (std::wstring title = SessionTitle(workspace_, sessionId_); !title.empty()) {
                 title_ = std::move(title);
             }
+            RefreshSessions();  // a new chat appears in the list, a title may have changed
         }
     } else if (type == "rate_limit_event") {
         const Json& windows = JsonAt(JsonAt(message, "rate_limit_info"), "unifiedWindows");

@@ -40,6 +40,8 @@ std::wstring SaveChatImage(const std::string& base64, const std::string& mediaTy
 // `height` get the picture's own size. Null if it cannot be read.
 wil::com_ptr<IWICBitmap> LoadImagePreview(IWICImagingFactory* wic, const std::wstring& path, UINT side, UINT& width,
                                           UINT& height);
+// The same from a picture in memory (a resource).
+wil::com_ptr<IWICBitmap> LoadImagePreview(IWICImagingFactory* wic, const void* data, size_t size, UINT side);
 // The picture on the clipboard as a bitmap and as PNG, for any app to paste.
 bool CopyImageToClipboard(IWICImagingFactory* wic, HWND owner, const std::wstring& path);
 

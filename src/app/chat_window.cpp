@@ -1052,6 +1052,7 @@ private:
     size_t viewerItem_ = 0;
     size_t viewerImage_ = 0;
     FeedImage viewer_;
+    FeedImage mascot_;  // sits on the input box, as the one in Claude's app
     Hit hover_;
     bool trackingMouse_ = false;
 
@@ -1145,6 +1146,11 @@ int ChatWindow::Run(int show) {
     RegisterGdiFonts(instance_);
     THROW_IF_FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                      IID_PPV_ARGS(wic_.put())));
+    if (HRSRC found = FindResourceW(instance_, MAKEINTRESOURCEW(IDR_MASCOT), RT_RCDATA); found != nullptr) {
+        if (HGLOBAL loaded = LoadResource(instance_, found); loaded != nullptr) {  // a resource needs no freeing
+            mascot_.preview = LoadImagePreview(wic_.get(), LockResource(loaded), SizeofResource(instance_, found), 128);
+        }
+    }
     D2D1_STROKE_STYLE_PROPERTIES stroke = D2D1::StrokeStyleProperties();
     stroke.startCap = stroke.endCap = D2D1_CAP_STYLE_ROUND;
     stroke.lineJoin = D2D1_LINE_JOIN_ROUND;
@@ -3127,6 +3133,12 @@ void ChatWindow::PaintInput(const Geometry& g) {
     Fill(g.box, 12.f, kCard);
     brush_->SetColor(inputFocused_ ? Color(kAccent, 0.75f) : Color(kLine));
     target_->DrawRoundedRectangle(D2D1::RoundedRect(g.box, 12.f, 12.f), brush_.get(), 1.f);
+    if (ID2D1Bitmap* mascot = Bitmap(mascot_); mascot != nullptr && g.box.right - g.box.left > 200.f) {
+        constexpr float kMascot = 32.f;  // on the box's top edge, near its right end
+        const D2D1_RECT_F at = D2D1::RectF(g.box.right - 24.f - kMascot, g.box.top - kMascot + 3.f, g.box.right - 24.f,
+                                           g.box.top + 3.f);
+        target_->DrawBitmap(mascot, at, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    }
 
     PaintAttachments(g);
     {  // "+": attach files or photos

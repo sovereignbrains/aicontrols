@@ -391,6 +391,25 @@ wil::com_ptr<IWICBitmap> LoadImagePreview(IWICImagingFactory* wic, const std::ws
     }
 }
 
+wil::com_ptr<IWICBitmap> LoadImagePreview(IWICImagingFactory* wic, const void* data, size_t size, UINT side) {
+    try {
+        wil::com_ptr<IWICStream> stream;
+        THROW_IF_FAILED(wic->CreateStream(stream.put()));
+        THROW_IF_FAILED(stream->InitializeFromMemory(static_cast<BYTE*>(const_cast<void*>(data)), static_cast<DWORD>(size)));
+        wil::com_ptr<IWICBitmapDecoder> decoder;
+        THROW_IF_FAILED(wic->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.put()));
+        wil::com_ptr<IWICBitmapFrameDecode> frame;
+        THROW_IF_FAILED(decoder->GetFrame(0, frame.put()));
+        const wil::com_ptr<IWICBitmapSource> fitted =
+            Convert(wic, Fit(wic, frame.get(), side).get(), GUID_WICPixelFormat32bppPBGRA);
+        wil::com_ptr<IWICBitmap> bitmap;
+        THROW_IF_FAILED(wic->CreateBitmapFromSource(fitted.get(), WICBitmapCacheOnLoad, bitmap.put()));
+        return bitmap;
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+}
+
 bool CopyImageToClipboard(IWICImagingFactory* wic, HWND owner, const std::wstring& path) {
     std::vector<uint8_t> dib;
     std::vector<uint8_t> png;

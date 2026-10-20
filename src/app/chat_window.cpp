@@ -206,8 +206,10 @@ constexpr float kCardPad = 12.f;
 constexpr float kCardTitle = 22.f;
 constexpr float kCardButton = 30.f;
 constexpr float kCardButtonWidth = 112.f;
-constexpr float kTipPadX = 10.f;  // a hint's text inside its box
-constexpr float kTipPadY = 5.f;
+constexpr float kTipPadX = 8.f;  // a hint's text inside its box
+constexpr float kTipPadY = 4.f;
+constexpr float kTipGap = 6.f;   // ... and between the box and what it is about
+constexpr uint32_t kTip = 0x2c2c31;
 constexpr float kImageWidth = 360.f;   // a picture in the feed fits this box
 constexpr float kImageHeight = 280.f;
 constexpr float kImageGap = 6.f;
@@ -732,6 +734,7 @@ private:
     static LRESULT CALLBACK TipProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     void ShowTip();
     void PaintTip();
+    D2D1_RECT_F TipAnchor(const Geometry& g) const;  // what the hint is about: it stands over it
 
     // Renaming in place (a terminal tab, a chat in the sidebar): the keys go to the field until Enter or Esc,
     // a click elsewhere keeps what is typed.
@@ -6270,6 +6273,7 @@ void ChatWindow::ShowTip() {
         tipClass.lpfnWndProc = &ChatWindow::TipProc;
         tipClass.hInstance = instance_;
         tipClass.lpszClassName = L"AIControlsTip";
+        tipClass.style = CS_DROPSHADOW;
         RegisterClassExW(&tipClass);
         tip_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"AIControlsTip", L"", WS_POPUP,
                                0, 0, 1, 1, hwnd_, nullptr, instance_, nullptr);
@@ -6279,7 +6283,7 @@ void ChatWindow::ShowTip() {
         SetWindowLongPtrW(tip_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
         const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
         DwmSetWindowAttribute(tip_, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
-        const COLORREF border = ToColorRef(kLine);
+        const COLORREF border = DWMWA_COLOR_NONE;  // the shadow is the edge
         DwmSetWindowAttribute(tip_, DWMWA_BORDER_COLOR, &border, sizeof(border));
     }
     // Laid out once and drawn as laid out; a long hint wraps at most this wide.
@@ -6296,15 +6300,23 @@ void ChatWindow::ShowTip() {
     tipLayout_->SetMaxWidth(textWidth);  // the box hugs the text
     const float width = textWidth + 2 * kTipPadX;
     const float height = std::ceil(metrics.height) + 2 * kTipPadY;
-    const float left = std::clamp(tipAt_.x - width / 2, 8.f, std::max(8.f, g.width - width - 8.f));
-    float top = tipAt_.y + 22.f;  // under the pointer, or above it at the window's bottom
-    if (top + height > g.height - 6.f) {
-        top = tipAt_.y - height - 10.f;
-    }
-    POINT at{ToPx(left), ToPx(top)};
-    ClientToScreen(hwnd_, &at);
+    // Centred over what it is about, or under it where the screen ends above; never off the screen's sides.
+    const D2D1_RECT_F anchor = TipAnchor(g);
+    POINT topLeft{ToPx(anchor.left), ToPx(anchor.top)};
+    POINT bottomRight{ToPx(anchor.right), ToPx(anchor.bottom)};
+    ClientToScreen(hwnd_, &topLeft);
+    ClientToScreen(hwnd_, &bottomRight);
     const int widthPx = ToPx(width);
     const int heightPx = ToPx(height);
+    const int gapPx = ToPx(kTipGap);
+    MONITORINFO monitor{sizeof(monitor)};
+    GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT& screen = monitor.rcWork;
+    POINT at{(topLeft.x + bottomRight.x) / 2 - widthPx / 2, topLeft.y - gapPx - heightPx};
+    if (at.y < screen.top) {
+        at.y = bottomRight.y + gapPx;
+    }
+    at.x = std::clamp(at.x, screen.left + 4, std::max(screen.left + 4, screen.right - 4 - widthPx));
     SetWindowPos(tip_, HWND_TOP, at.x, at.y, widthPx, heightPx, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (tipTarget_) {
         tipTarget_->Resize(D2D1::SizeU(static_cast<UINT32>(widthPx), static_cast<UINT32>(heightPx)));
@@ -6320,13 +6332,93 @@ void ChatWindow::ShowTip() {
     InvalidateRect(tip_, nullptr, FALSE);
 }
 
+D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
+    const size_t row = hover_.row;
+    switch (hover_.target) {
+    case Target::SidebarToggle:
+        return g.sideToggle;
+    case Target::TerminalToggle:
+        return g.terminalBtn;
+    case Target::Update:
+        return g.update;
+    case Target::WinMin:
+        return g.winMin;
+    case Target::WinMax:
+        return g.winMax;
+    case Target::WinClose:
+        return g.winClose;
+    case Target::SidebarSearch:
+        return g.search;
+    case Target::FolderChip:
+        return g.folder;
+    case Target::ModelChip:
+        return g.model;
+    case Target::EffortChip:
+        return g.effort;
+    case Target::UsageChip:
+        return g.usage;
+    case Target::Attach:
+        return g.attach;
+    case Target::Send:
+        return g.send;
+    case Target::Account:
+        return g.account;
+    case Target::TermAdd:
+        return g.termAdd;
+    case Target::TermClose:
+        return g.termClose;
+    case Target::PreviewWide:
+        return g.termWide;
+    case Target::TermTab:
+    case Target::TermTabClose:
+        if (row < g.termTabs.size()) {
+            return g.termTabs[row];
+        }
+        break;
+    case Target::SecretsClose:
+        return g.panelClose;
+    case Target::SecretEye:
+        return g.secretEye;
+    case Target::AttachmentChip:
+    case Target::RemoveAttachment:
+        if (row < attachments_.size()) {
+            return AttachmentRect(g, row);
+        }
+        break;
+    case Target::FeedImage:
+        if (row < feed_.size() && hover_.sub < feed_[row].images.size()) {
+            return ImageRect(g, feed_[row], hover_.sub);
+        }
+        break;
+    case Target::CardPreview:
+    case Target::CardOpen:
+    case Target::CardReveal:
+        if (row < feed_.size()) {
+            D2D1_RECT_F preview{}, open{}, reveal{};
+            ApprovalFileButtons(g, feed_[row], preview, open, reveal);
+            return hover_.target == Target::CardPreview ? preview : (hover_.target == Target::CardOpen ? open : reveal);
+        }
+        break;
+    case Target::HistoryRow:
+        if (row >= firstRow_) {
+            const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
+            return D2D1::RectF(g.sidebar.left + 6, top, g.sidebar.right - 6, top + kHistoryRow);
+        }
+        break;
+    default:
+        break;
+    }
+    // Anything else (a link in the text): a line's height around the pointer.
+    return D2D1::RectF(tipAt_.x - 1.f, tipAt_.y - 10.f, tipAt_.x + 1.f, tipAt_.y + 10.f);
+}
+
 void ChatWindow::PaintTip() {
     if (!tipTarget_ || !tipLayout_) {
         return;
     }
     tipTarget_->SetDpi(Dpi(), Dpi());
     tipTarget_->BeginDraw();
-    tipTarget_->Clear(Color(kRaised));
+    tipTarget_->Clear(Color(kTip));
     wil::com_ptr<ID2D1SolidColorBrush> brush;
     tipTarget_->CreateSolidColorBrush(Color(kPrimary), brush.put());
     if (brush) {

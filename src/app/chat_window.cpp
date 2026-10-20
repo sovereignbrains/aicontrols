@@ -506,6 +506,14 @@ int ChatWindow::Run(int show) {
     tools_.SetCwd(workspace_);
     secrets_.Load();
     settings_ = LoadSettings();
+    {  // the limits as last seen; a window that has reset since is empty again
+        const long long now = static_cast<long long>(std::time(nullptr));
+        const auto restore = [now](int percent, long long resetsAt) {
+            return resetsAt > 0 && resetsAt <= now ? Limit{percent >= 0 ? 0 : -1, 0} : Limit{percent, resetsAt};
+        };
+        session_ = restore(settings_.sessionPercent, settings_.sessionResets);
+        week_ = restore(settings_.weekPercent, settings_.weekResets);
+    }
     UseDarkMenus();
     THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d_.put()));
     THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
@@ -1138,7 +1146,8 @@ Geometry ChatWindow::Layout() const {
     case Popup::Usage: {
         const float popupRight = ClampTo(g.usage.right + 4, 10.f + kUsageWidth, g.width - 10);
         const float height = 14 + 24 + 2 * kUsageRow + 4;
-        g.popup = D2D1::RectF(popupRight - kUsageWidth, g.usage.top - 8 - height, popupRight, g.usage.top - 8);
+        // Above the box, like the other panels: the input's own window would hide whatever lay over it.
+        g.popup = D2D1::RectF(popupRight - kUsageWidth, g.box.top - 6 - height, popupRight, g.box.top - 6);
         break;
     }
     case Popup::None:
@@ -2560,6 +2569,14 @@ void ChatWindow::OnClaude(const Json& message) {
         };
         session_ = limit(JsonAt(windows, "five_hour"));
         week_ = limit(JsonAt(windows, "seven_day"));
+        if (settings_.sessionPercent != session_.percent || settings_.sessionResets != session_.resetsAt ||
+            settings_.weekPercent != week_.percent || settings_.weekResets != week_.resetsAt) {
+            settings_.sessionPercent = session_.percent;
+            settings_.sessionResets = session_.resetsAt;
+            settings_.weekPercent = week_.percent;
+            settings_.weekResets = week_.resetsAt;
+            SaveSettings(settings_);
+        }
     } else if (type == "control_response") {
         const Json& response = JsonAt(message, "response");
         if (JsonStr(response, "request_id") == "aic_init") {

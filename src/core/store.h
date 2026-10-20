@@ -24,6 +24,12 @@ struct TranscriptEntry {
 struct Settings {
     std::string model;   // a value from the CLI's model list; empty: its default
     std::string effort;  // low … max; empty: the model's default
+    // The plan's limits as last reported (the CLI reports them only once a turn has run), so the ring
+    // is not empty at start. Percent -1: never seen; resets are Unix seconds.
+    int sessionPercent = -1;
+    long long sessionResets = 0;
+    int weekPercent = -1;
+    long long weekResets = 0;
 };
 
 // The old SSH Client's workspace while both clients live side by side: Claude's memory and the

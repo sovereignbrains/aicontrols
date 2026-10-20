@@ -266,6 +266,14 @@ Settings LoadSettings() {
     const Json data = Json::parse(in, nullptr, false);
     settings.model = JsonStr(data, "model");
     settings.effort = JsonStr(data, "effort");
+    const auto number = [&](const char* key, long long fallback) {
+        const Json& value = JsonAt(data, key);
+        return value.is_number() ? value.get<long long>() : fallback;
+    };
+    settings.sessionPercent = static_cast<int>(number("sessionPercent", -1));
+    settings.sessionResets = number("sessionResets", 0);
+    settings.weekPercent = static_cast<int>(number("weekPercent", -1));
+    settings.weekResets = number("weekResets", 0);
     return settings;
 }
 
@@ -274,7 +282,14 @@ void SaveSettings(const Settings& settings) {
     std::error_code error;
     fs::create_directories(file.parent_path(), error);
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
-    out << Json{{"model", settings.model}, {"effort", settings.effort}}.dump(2) << "\n";
+    out << Json{{"model", settings.model},
+                {"effort", settings.effort},
+                {"sessionPercent", settings.sessionPercent},
+                {"sessionResets", settings.sessionResets},
+                {"weekPercent", settings.weekPercent},
+                {"weekResets", settings.weekResets}}
+               .dump(2)
+        << "\n";
 }
 
 }  // namespace aic

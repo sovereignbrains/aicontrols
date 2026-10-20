@@ -32,6 +32,7 @@
 #include "app/resource.h"
 #include "core/attachment.h"
 #include "core/claude_process.h"
+#include "core/markdown.h"
 #include "core/secrets.h"
 #include "core/store.h"
 #include "core/tools.h"
@@ -123,6 +124,7 @@ struct FeedItem {
     float textWidth = 0;
     float height = 0;
     float top = 0;  // where it was last painted, for hit tests
+    std::vector<MdSpan> spans;  // Kind::Assistant: how the layout's runs are styled (the text is markdown)
     // Kind::Approval: `text` is what the call does, `title` what kind of call it is.
     std::wstring title;
     std::string requestId;  // the CLI's can_use_tool request, answered once
@@ -366,6 +368,8 @@ private:
     static float ApprovalHeight(const FeedItem& item);
     static void ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& allow, D2D1_RECT_F& deny);
     void PaintApproval(const Geometry& g, const FeedItem& item, float left);
+    void StyleMarkdown(FeedItem& item);
+    void PaintMarkdown(const FeedItem& item, float x, float y, float left, float column);
 
     D2D1_RECT_F AttachmentRect(const Geometry& g, size_t index) const;
     static D2D1_RECT_F RemoveRect(const D2D1_RECT_F& chip);
@@ -1326,10 +1330,21 @@ void ChatWindow::MeasureFeed(float column) {
             format = mono_.get();
         }
         item.layout.reset();
-        if (FAILED(dwrite_->CreateTextLayout(item.text.c_str(), static_cast<UINT32>(item.text.size()), format,
+        std::wstring shown;  // an assistant message without its markup
+        const std::wstring* source = &item.text;
+        if (item.kind == Kind::Assistant) {
+            MdText md = ParseMarkdown(item.text);
+            shown = std::move(md.text);
+            item.spans = std::move(md.spans);
+            source = &shown;
+        }
+        if (FAILED(dwrite_->CreateTextLayout(source->c_str(), static_cast<UINT32>(source->size()), format,
                                              std::max(width, 1.f), 1e6f, item.layout.put()))) {
             item.height = 0;
             continue;
+        }
+        if (item.kind == Kind::Assistant) {
+            StyleMarkdown(item);
         }
         item.layoutWidth = width;
         DWRITE_TEXT_METRICS metrics{};
@@ -1418,6 +1433,9 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             } else if (item.kind == Kind::Error) {
                 color = kDanger;
             }
+            if (item.kind == Kind::Assistant) {
+                PaintMarkdown(item, x, y, left, g.column);
+            }
             brush_->SetColor(Color(color));
             target_->DrawTextLayout({x, y + (item.kind == Kind::User ? kBubblePad : 0.f)}, item.layout.get(),
                                     brush_.get());
@@ -1431,6 +1449,78 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         Fill(D2D1::RectF(g.width - 7.f, top, g.width - 3.f, top + thumb), 2.f, kLine);
     }
     target_->PopAxisAlignedClip();
+}
+
+void ChatWindow::StyleMarkdown(FeedItem& item) {
+    IDWriteTextLayout* layout = item.layout.get();
+    for (const MdSpan& span : item.spans) {
+        const DWRITE_TEXT_RANGE range{static_cast<UINT32>(span.start), static_cast<UINT32>(span.length)};
+        if ((span.flags & kMdBold) != 0) {
+            layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, range);
+        }
+        if ((span.flags & kMdItalic) != 0) {
+            layout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
+        }
+        if ((span.flags & kMdLink) != 0) {
+            layout->SetUnderline(TRUE, range);
+        }
+        if ((span.flags & kMdHeading) != 0) {
+            layout->SetFontSize(15.f * span.scale, range);
+        }
+        if ((span.flags & kMdCode) != 0) {
+            if (fonts_) {
+                layout->SetFontCollection(fonts_.get(), range);
+            }
+            layout->SetFontFamilyName(kMonoFont, range);
+            layout->SetFontSize(13.5f, range);
+        }
+    }
+}
+
+// Colors for links, quotes and code, and the panels under code; the text itself is drawn by the caller.
+void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float left, float column) {
+    constexpr uint32_t kCodeText = 0xdadde4;
+    wil::com_ptr<ID2D1SolidColorBrush> link, quote, code;
+    target_->CreateSolidColorBrush(Color(kAccent), link.put());
+    target_->CreateSolidColorBrush(Color(kSecondary), quote.put());
+    target_->CreateSolidColorBrush(Color(kCodeText), code.put());
+    for (const MdSpan& span : item.spans) {
+        const DWRITE_TEXT_RANGE range{static_cast<UINT32>(span.start), static_cast<UINT32>(span.length)};
+        if ((span.flags & kMdLink) != 0) {
+            item.layout->SetDrawingEffect(link.get(), range);
+        }
+        if ((span.flags & kMdQuote) != 0) {
+            item.layout->SetDrawingEffect(quote.get(), range);
+        }
+        if ((span.flags & kMdCode) == 0) {
+            continue;
+        }
+        item.layout->SetDrawingEffect(code.get(), range);
+        UINT32 count = 0;
+        item.layout->HitTestTextRange(range.startPosition, range.length, 0, 0, nullptr, 0, &count);
+        std::vector<DWRITE_HIT_TEST_METRICS> boxes(count);
+        if (count == 0 || FAILED(item.layout->HitTestTextRange(range.startPosition, range.length, 0, 0, boxes.data(),
+                                                               count, &count))) {
+            continue;
+        }
+        if (span.block) {  // one panel behind all its lines
+            float top = boxes.front().top;
+            float bottom = top;
+            for (const DWRITE_HIT_TEST_METRICS& box : boxes) {
+                top = std::min(top, box.top);
+                bottom = std::max(bottom, box.top + box.height);
+            }
+            const D2D1_RECT_F panel = D2D1::RectF(left - 8.f, y + top - 6.f, left + column + 8.f, y + bottom + 6.f);
+            Fill(panel, 8.f, kCard);
+            brush_->SetColor(Color(kLine));
+            target_->DrawRoundedRectangle(D2D1::RoundedRect(panel, 8.f, 8.f), brush_.get(), 1.f);
+        } else {
+            for (const DWRITE_HIT_TEST_METRICS& box : boxes) {
+                Fill(D2D1::RectF(x + box.left - 2.f, y + box.top, x + box.left + box.width + 2.f, y + box.top + box.height),
+                     4.f, kRaised);
+            }
+        }
+    }
 }
 
 float ChatWindow::ApprovalHeight(const FeedItem& item) {

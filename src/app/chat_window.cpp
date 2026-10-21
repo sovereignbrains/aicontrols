@@ -7318,9 +7318,29 @@ void ChatWindow::OpenSession(size_t filteredIndex) {
         case EntryKind::Assistant:
             Add(Kind::Assistant, entry.text);
             break;
-        case EntryKind::Tool:
-            Add(Kind::Notice, L"инструмент: " + entry.text);
+        case EntryKind::Tool: {
+            const std::string own = OwnToolName(ToUtf8(entry.text));
+            const Json input = Json::parse(entry.toolInput, nullptr, false);
+            if (own.empty() || !input.is_object()) {
+                Add(Kind::Notice, L"инструмент: " + entry.text);
+                break;
+            }
+            // Our own tools come back as the card they were: the call, and what it printed.
+            ToolSummary summary = SummarizeTool(own, input);
+            FeedItem item;
+            item.kind = Kind::Approval;
+            item.title = std::move(summary.title);
+            item.text = std::move(summary.detail);
+            item.tool = own;
+            item.input = input;
+            item.toolUseId = entry.toolId;
+            item.verdict = Verdict::Allowed;
+            item.output = entry.toolOutput;
+            item.outputError = entry.toolFailed;
+            item.done = entry.toolAnswered;
+            feed_.push_back(std::move(item));
             break;
+        }
         }
     }
     sessionId_ = session.id;

@@ -25,6 +25,12 @@ struct TranscriptEntry {
     EntryKind kind = EntryKind::User;
     std::wstring text;  // the tool's name for EntryKind::Tool
     std::vector<TranscriptImage> images;  // EntryKind::User: the pictures sent with it
+    // EntryKind::Tool: the call as it was made (the input as JSON text) and what came back.
+    std::string toolId;
+    std::string toolInput;
+    std::wstring toolOutput;
+    bool toolFailed = false;
+    bool toolAnswered = false;
 };
 
 struct Settings {

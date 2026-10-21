@@ -303,6 +303,31 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
             std::vector<TranscriptImage> images;
             if (content.is_array()) {
                 for (const Json& block : content) {
+                    if (JsonStr(block, "type") == "tool_result") {  // the answer to a call listed above
+                        const std::string id = JsonStr(block, "tool_use_id");
+                        for (auto call = entries.rbegin(); call != entries.rend(); ++call) {
+                            if (call->kind != EntryKind::Tool || call->toolId != id) {
+                                continue;
+                            }
+                            const Json& result = JsonAt(block, "content");
+                            std::wstring output;
+                            if (result.is_string()) {
+                                output = ToWide(result.get<std::string>());
+                            } else if (result.is_array()) {
+                                for (const Json& part : result) {
+                                    if (JsonStr(part, "type") == "text") {
+                                        output += (output.empty() ? L"" : L"\n") + ToWide(JsonStr(part, "text"));
+                                    }
+                                }
+                            }
+                            const size_t end = output.find_last_not_of(L" \t\r\n");
+                            output.resize(end == std::wstring::npos ? 0 : end + 1);
+                            call->toolOutput = std::move(output);
+                            call->toolFailed = IsTrue(JsonAt(block, "is_error"));
+                            call->toolAnswered = true;
+                            break;
+                        }
+                    }
                     const Json& source = JsonAt(block, "source");
                     if (JsonStr(block, "type") == "image" && JsonStr(source, "type") == "base64") {
                         images.push_back({JsonStr(source, "media_type"), JsonStr(source, "data")});
@@ -334,7 +359,10 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
                     }
                     lastAssistant = messageId;
                 } else if (blockType == "tool_use") {
-                    entries.push_back({EntryKind::Tool, ToWide(JsonStr(block, "name"))});
+                    TranscriptEntry call{EntryKind::Tool, ToWide(JsonStr(block, "name"))};
+                    call.toolId = JsonStr(block, "id");
+                    call.toolInput = JsonAt(block, "input").dump();
+                    entries.push_back(std::move(call));
                     lastAssistant.clear();
                 }
             }

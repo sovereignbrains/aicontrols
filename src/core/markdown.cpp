@@ -443,6 +443,9 @@ MdText ParseMarkdown(std::wstring_view source, size_t tableWidth) {
                         rule();
                     }
                 }
+                if (tall) {  // closed below, so the dividers of a many-lined last row do not end as stubs
+                    rule();
+                }
                 out.spans.push_back(MdSpan{start, out.text.size() - start, kMdCode | kMdTable, 1.f, true});
                 out.spans.push_back(MdSpan{start, headerEnd - start, kMdBold, 1.f, false});
                 out.text += L"\n\n";

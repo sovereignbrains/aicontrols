@@ -6456,8 +6456,9 @@ void ChatWindow::PaintImages(const Geometry& g, FeedItem& item) {
             target_->DrawBitmap(bitmap, rect, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         }
         const bool hovered = hover_.target == Target::FeedImage && hover_.row == index && hover_.sub == k;
-        brush_->SetColor(Color(hovered ? kAccent : kLine));
-        target_->DrawRectangle(rect, brush_.get(), 1.f);
+        // A dark screenshot on the dark bubble needs an edge that shows: lighter than the app's lines.
+        brush_->SetColor(hovered ? Color(kAccent) : Color(kSecondary, 0.55f));
+        target_->DrawRectangle(rect, brush_.get(), 1.5f);
     }
 }
 

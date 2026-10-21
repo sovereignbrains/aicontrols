@@ -5257,11 +5257,10 @@ bool ChatWindow::AllowedUnasked(const std::string& tool, const Json& input) cons
 
 void ChatWindow::ShowPermissionMenu() {
     constexpr std::array<const char*, 3> kModes = {"", "edits", "all"};
-    constexpr std::array<const wchar_t*, 3> kLabels = {L"Спрашивать\tвсё, что меняет",
+    constexpr std::array<const wchar_t*, 3> kLabels = {L"Спрашивать\tвсё",
                                                        L"Файлы без вопросов\tкоманды спрашивать",
-                                                       L"Без вопросов\tи команды, и серверы"};
+                                                       L"Без вопросов\tвсё подряд"};
     wil::unique_hmenu menu(CreatePopupMenu());
-    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 100, L"Что делать без подтверждения");
     for (size_t i = 0; i < kModes.size(); ++i) {
         AppendMenuW(menu.get(), MF_STRING | (settings_.permissions == kModes[i] ? MF_CHECKED : 0),
                     static_cast<UINT>(i + 1), kLabels[i]);
@@ -7236,6 +7235,9 @@ void ChatWindow::OpenPopup(Popup popup) {
     }
     searchFocus_ = false;
     termFocus_ = false;
+    if (popup == Popup::Image) {
+        ShowWindow(input_, SW_HIDE);  // a window of its own: the dimmed picture view does not cover it
+    }
     SetFocus(hwnd_);  // the panel's keys: digits, arrows
     PlacePreview();   // a picture over the window covers the page too
     Refresh();
@@ -7251,6 +7253,7 @@ void ChatWindow::ClosePopup() {
     hover_ = {};
     if (was == Popup::Image) {
         viewer_ = {};
+        ShowWindow(input_, SW_SHOW);
         PlacePreview();
     }
     if (was == Popup::Effort && pendingEffort_ != settings_.effort) {

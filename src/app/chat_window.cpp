@@ -705,6 +705,7 @@ private:
                                       DWORD_PTR self);
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT OnInputFilter(const MSGFILTER& filter);
+    void FitCaret(HWND input);
     void OnCommand(WPARAM wParam, LPARAM lParam);
     void OnClick(float x, float y);
     void OnPopupKey(WPARAM key);
@@ -1107,6 +1108,9 @@ private:
     float maxScroll_ = 0;
     bool stick_ = true;  // follow the end of the feed as it grows
 
+    POINT caretSet_{-1, -1};  // where FitCaret last put its caret
+    LONG caretTop_ = -1;      // below the line's top, px (the font's internal leading)
+    LONG caretHeight_ = 0;
     float textHeight_ = kTextMin;  // the input's text area, grows with what is typed
     bool inputFocused_ = false;
     bool hasText_ = false;
@@ -1357,7 +1361,34 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
         SelectObject(dc, old);
         ReleaseDC(hwnd, dc);
     }
+    if (GetFocus() == hwnd) {
+        reinterpret_cast<ChatWindow*>(self)->FitCaret(hwnd);
+    }
     return result;
+}
+
+// RichEdit's caret is the font's whole line: Golos keeps room above its capitals (for Й, Ё), so it started
+// well above the letters and stopped at their baseline, and stood crooked. Whenever RichEdit has put its own,
+// it is replaced by one from the capitals' top to the descenders' bottom, at the same place.
+void ChatWindow::FitCaret(HWND input) {
+    POINT at{};
+    if (!GetCaretPos(&at) || (at.x == caretSet_.x && at.y == caretSet_.y)) {
+        return;  // ours, where we put it
+    }
+    if (caretTop_ < 0) {
+        HDC dc = GetDC(input);
+        const HGDIOBJ old = SelectObject(dc, uiFont_.get());
+        TEXTMETRICW metrics{};
+        GetTextMetricsW(dc, &metrics);
+        SelectObject(dc, old);
+        ReleaseDC(input, dc);
+        caretTop_ = metrics.tmInternalLeading;
+        caretHeight_ = std::max(4L, metrics.tmHeight - metrics.tmInternalLeading + 1);
+    }
+    CreateCaret(input, nullptr, std::max(1, ToPx(1.5f)), caretHeight_);
+    caretSet_ = POINT{at.x, at.y + caretTop_};
+    SetCaretPos(caretSet_.x, caretSet_.y);
+    ShowCaret(input);
 }
 
 LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -2347,8 +2378,9 @@ Geometry ChatWindow::Layout() const {
     // The font keeps room above its capitals: centred by its box, the letters sat 2-3 DIPs low (measured on a
     // screenshot against "+" and the box's middle).
     constexpr float kTextNudge = 2.5f;
+    constexpr float kDescentRoom = 4.f;  // RichEdit insets its line a little: without it "р" and "у" lost their tails
     const float textTop = rowTop + (rowHeight - textHeight_) / 2 - kTextNudge;
-    g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 4, textTop + textHeight_);
+    g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 4, textTop + textHeight_ + kDescentRoom);
 
     const float ringTop = chipsTop + (kChipRow - kRing) / 2;
     g.usage = D2D1::RectF(right - 6 - kRing, ringTop, right - 6, ringTop + kRing);

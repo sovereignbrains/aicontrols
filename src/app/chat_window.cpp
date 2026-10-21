@@ -2345,7 +2345,7 @@ Geometry ChatWindow::Layout() const {
     g.mic = D2D1::RectF(right - 8 - kInputButton, rowBottom - kInputButton, right - 8, rowBottom);
     g.send = D2D1::RectF(g.mic.left - 4 - kInputButton, rowBottom - kInputButton, g.mic.left - 4, rowBottom);
     const float textTop = rowTop + (rowHeight - textHeight_) / 2;
-    g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 4, textTop + textHeight_);
+    g.text = D2D1::RectF(g.attach.right + 10, textTop, g.send.left - 4, textTop + textHeight_);  // air after "+", as in Claude's app
 
     const float ringTop = chipsTop + (kChipRow - kRing) / 2;
     g.usage = D2D1::RectF(right - 6 - kRing, ringTop, right - 6, ringTop + kRing);
@@ -3304,7 +3304,7 @@ void ChatWindow::PaintWindowButtons(const Geometry& g) {
 
 void ChatWindow::PaintInput(const Geometry& g) {
     Fill(g.box, 12.f, kCard);
-    brush_->SetColor(inputFocused_ ? Color(kAccent, 0.75f) : Color(kLine));
+    brush_->SetColor(Color(inputFocused_ ? 0x45454c : kLine));  // focus: a lighter grey edge, not the accent
     target_->DrawRoundedRectangle(D2D1::RoundedRect(g.box, 12.f, 12.f), brush_.get(), 1.f);
     if (ID2D1Bitmap* mascot = Bitmap(mascot_); mascot != nullptr && g.box.right - g.box.left > 200.f) {
         constexpr float kMascot = 32.f;  // on the box's top edge, near its right end; a puff grows it from there

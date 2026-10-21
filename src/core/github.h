@@ -34,6 +34,11 @@ struct MemorySave {
     bool ok = false;
     bool nothing = false;
     std::string output;
+    // Filled by the caller when Haiku wrote first (WriteMemoryFromChat).
+    bool written = true;
+    int created = 0;
+    int appended = 0;
+    std::string writeError;
 };
 MemorySave SaveMemory(const std::wstring& folder, const std::string& token);
 

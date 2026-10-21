@@ -30,6 +30,7 @@ add_library(aic_core STATIC
   src/core/github.cpp
   src/core/highlight.cpp
   src/core/markdown.cpp
+  src/core/memory_writer.cpp
   src/core/pty.cpp
   src/core/secrets.cpp
   src/core/store.cpp

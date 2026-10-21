@@ -35,7 +35,7 @@ CliResult RunCli(const std::wstring& commandLine, const std::wstring& proxy, int
                  const std::atomic<bool>* cancel = nullptr,
                  const std::function<void(const std::string&)>& onOutput = {},
                  const std::vector<std::pair<std::wstring, std::wstring>>& extraEnvironment = {},
-                 const std::wstring& cwd = {});
+                 const std::wstring& cwd = {}, const std::wstring& inputFile = {});
 
 AuthStatus ParseAuthStatus(const std::string& output);
 // `claude auth status`

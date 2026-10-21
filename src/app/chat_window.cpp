@@ -45,6 +45,7 @@
 #include "core/claude_process.h"
 #include "core/github.h"
 #include "core/markdown.h"
+#include "core/memory_writer.h"
 #include "core/pty.h"
 #include "core/secrets.h"
 #include "core/store.h"
@@ -5912,11 +5913,24 @@ void ChatWindow::SaveMemoryNow() {
         memoryThread_.join();
     }
     savingMemory_ = true;
-    Flash(L"Сохраняю память…", 60'000);
+    Flash(sessionId_.empty() ? L"Сохраняю память…" : L"Haiku записывает память из этого чата…", 300'000);
     const HWND hwnd = hwnd_;
+    const std::wstring workspace = workspace_;
     const std::wstring folder = MemoryFolder(workspace_);
-    memoryThread_ = std::thread([hwnd, folder, token] {
+    const std::string session = sessionId_;
+    memoryThread_ = std::thread([hwnd, workspace, folder, session, token] {
+        // First Haiku writes down what this chat taught (one call, no tools); then the folder goes up, also
+        // when Haiku could not (the plan's limit spent): what is there is saved anyway.
+        MemoryWrite written;
+        written.ok = true;
+        if (!session.empty()) {
+            written = WriteMemoryFromChat(workspace, session, nullptr);
+        }
         auto saved = std::make_unique<MemorySave>(SaveMemory(folder, token));
+        saved->written = written.ok;
+        saved->created = written.created;
+        saved->appended = written.appended;
+        saved->writeError = written.error;
         if (PostMessageW(hwnd, kMemorySaved, 0, reinterpret_cast<LPARAM>(saved.get()))) {
             saved.release();
         }
@@ -5926,8 +5940,16 @@ void ChatWindow::SaveMemoryNow() {
 
 void ChatWindow::OnMemorySaved(const MemorySave& saved) {
     savingMemory_ = false;
+    std::wstring wrote;
+    if (!saved.written) {
+        wrote = L"Haiku не записал (" + ToWide(saved.writeError.substr(0, 120)) + L"). ";
+    } else if (saved.created + saved.appended > 0) {
+        wrote = std::format(L"Записано: новых заметок {}, дополнено {}. ", saved.created, saved.appended);
+    } else {
+        wrote = L"Нового для памяти не нашлось. ";
+    }
     if (saved.ok) {
-        Flash(saved.nothing ? L"Память уже в облаке: нового нет" : L"Память сохранена в облако", 3000);
+        Flash(wrote + (saved.nothing ? L"В облаке всё уже было" : L"Отправлено в облако"), 6000);
     } else {
         Add(Kind::Error, L"Память не сохранилась:\n" + LastLines(saved.output, 6));
     }
@@ -6223,7 +6245,8 @@ std::wstring ChatWindow::TooltipText() {
     case Target::TermTabClose:
         return L"Закрыть вкладку";
     case Target::SaveMemoryBtn:
-        return savingMemory_ ? L"Сохраняю память…" : L"Сохранить память Claude в облако (GitHub)";
+        return savingMemory_ ? L"Сохраняю память…"
+                             : L"Записать главное из этого чата в память (Haiku, один дешёвый запрос) и отправить в облако";
     case Target::Update:
         return L"Поставить AIControls " + (update_ ? ToWide(update_->version) : std::wstring()) +
                L" и перезапустить. Этот чат откроется снова";

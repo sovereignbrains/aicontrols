@@ -14,7 +14,8 @@ namespace aic {
 
 CliResult RunCli(const std::wstring& commandLine, const std::wstring& proxy, int timeoutSeconds,
                  const std::atomic<bool>* cancel, const std::function<void(const std::string&)>& onOutput,
-                 const std::vector<std::pair<std::wstring, std::wstring>>& extraEnvironment, const std::wstring& cwd) {
+                 const std::vector<std::pair<std::wstring, std::wstring>>& extraEnvironment, const std::wstring& cwd,
+                 const std::wstring& inputFile) {
     CliResult result;
     std::vector<std::pair<std::wstring, std::wstring>> overrides = extraEnvironment;
     if (!proxy.empty()) {
@@ -29,7 +30,8 @@ CliResult RunCli(const std::wstring& commandLine, const std::wstring& proxy, int
         return result;
     }
     SetHandleInformation(outRead.get(), HANDLE_FLAG_INHERIT, 0);
-    wil::unique_handle nul(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
+    // Standard input: the file when one is given, else nothing.
+    wil::unique_handle nul(CreateFileW(inputFile.empty() ? L"NUL" : inputFile.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (!nul) {
         return result;

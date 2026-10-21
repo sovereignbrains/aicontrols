@@ -49,6 +49,7 @@
 #include "core/pty.h"
 #include "core/secrets.h"
 #include "core/store.h"
+#include "core/usage.h"
 #include "core/tools.h"
 #include "core/vt_screen.h"
 
@@ -93,6 +94,7 @@ struct ClaudeVersions {
 
 constexpr UINT kRepos = WM_APP + 10;      // ReposResult*: the GitHub repositories
 constexpr UINT kCloneDone = WM_APP + 11;  // CloneDone*: `git clone` ended
+constexpr UINT kUsage = WM_APP + 15;        // PlanUsage*: the plan's limits as claude.ai has them
 constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed and pushed
 
 struct ReposResult {
@@ -112,6 +114,8 @@ constexpr UINT_PTR kPreviewTimer = 3;  // the preview looks whether its file (or
 constexpr UINT kPreviewCheck = 700;    // ms
 constexpr UINT_PTR kUpdateTimer = 4;   // a newer AIControls may have been built
 constexpr UINT kUpdateCheck = 30'000;  // ms
+constexpr UINT_PTR kUsageTimer = 7;    // the plan's limits asked again
+constexpr UINT kUsageCheck = 60'000;   // ms
 // The mascot puffs up and back: in rhythm while Claude answers, now and then while idle. The window is drawn
 // again only during a puff.
 constexpr UINT_PTR kPuffTimer = 5;       // a frame of a puff
@@ -208,6 +212,7 @@ constexpr float kCardPad = 12.f;
 constexpr float kCardTitle = 22.f;
 constexpr float kCardButton = 30.f;
 constexpr float kCardButtonWidth = 112.f;
+constexpr float kStatusRow = 24.f;  // under the last message: what Claude is doing
 constexpr float kTipPadX = 8.f;  // a hint's text inside its box
 constexpr float kTipPadY = 4.f;
 constexpr float kTipGap = 6.f;   // ... and between the box and what it is about
@@ -859,6 +864,8 @@ private:
     // The memory folder pushed to its repository (git, the GITHUB secret): no model call, so it works with
     // the plan's limit spent.
     void SaveMemoryNow();
+    void FetchUsage();  // on its own thread; at most one at a time
+    void OnPlanUsage(const PlanUsage& usage);
     void OnMemorySaved(const MemorySave& saved);
 
     void StartPuff();
@@ -905,6 +912,7 @@ private:
     void Check(D2D1_POINT_2F center, uint32_t color);
     void MeasureFeed(float column);
     float FeedHeight() const;
+    std::wstring StatusLine() const;
     void ScrollBy(float delta);
     void CopyItemAt(float y);
     void Flash(std::wstring status, UINT milliseconds = 1500);
@@ -1027,6 +1035,8 @@ private:
     bool webCreating_ = false;
     std::optional<AppUpdate> update_;
     bool savingMemory_ = false;
+    std::thread usageThread_;
+    std::atomic<bool> usageRunning_ = false;
     std::thread memoryThread_;
     bool updatePending_ = false;  // asked while Claude was answering: done when the turn ends
     bool previewWide_ = false;
@@ -1239,6 +1249,8 @@ int ChatWindow::Run(int show) {
     CheckAppUpdate();
     SetTimer(hwnd_, kUpdateTimer, kUpdateCheck, nullptr);
     SetTimer(hwnd_, kPuffIdleTimer, kPuffIdle, nullptr);
+    FetchUsage();  // the ring is right before the first message, not only after it
+    SetTimer(hwnd_, kUsageTimer, kUsageCheck, nullptr);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1401,6 +1413,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         reposLoading_ = false;
         repos_ = std::move(payload->repos);
         reposError_ = ToWide(payload->error);
+        return 0;
+    }
+    case kUsage: {
+        const std::unique_ptr<PlanUsage> payload(reinterpret_cast<PlanUsage*>(lParam));
+        OnPlanUsage(*payload);
         return 0;
     }
     case kMemorySaved: {
@@ -1803,6 +1820,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             Refresh();
         } else if (wParam == kPreviewTimer) {
             CheckPreview();
+        } else if (wParam == kUsageTimer) {
+            FetchUsage();
         } else if (wParam == kUpdateTimer) {
             CheckAppUpdate();
         } else if (wParam == kPuffTimer) {
@@ -1872,6 +1891,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (versionThread_.joinable()) {
             versionThread_.join();
+        }
+        if (usageThread_.joinable()) {
+            usageThread_.join();
         }
         if (memoryThread_.joinable()) {  // a push under way finishes: what was saved is not cut in half
             memoryThread_.join();
@@ -2784,7 +2806,28 @@ float ChatWindow::FeedHeight() const {
     for (const FeedItem& item : feed_) {
         total += item.height + kGap;
     }
-    return total;
+    return total + (StatusLine().empty() ? 0.f : kStatusRow + kGap);
+}
+
+// What Claude is doing, under the last message: waiting for the user's word, running a tool, answering; else a
+// passing note (copied, saved …).
+std::wstring ChatWindow::StatusLine() const {
+    if (busy_) {
+        for (auto it = feed_.rbegin(); it != feed_.rend(); ++it) {
+            if (it->kind != Kind::Approval) {
+                continue;
+            }
+            if (it->verdict == Verdict::Pending) {
+                return L"Ждёт твоего решения: " + it->title;
+            }
+            if (it->verdict == Verdict::Allowed && !it->done) {
+                return L"Выполняется: " + it->title;
+            }
+            break;
+        }
+        return status_.empty() ? L"Claude отвечает" : status_;
+    }
+    return status_;
 }
 
 bool ChatWindow::HasConversation() const {
@@ -2885,6 +2928,20 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             target_->DrawTextLayout({x, textY}, item.layout.get(), brush_.get());
         }
         y += item.height + kGap;
+    }
+    if (const std::wstring line = StatusLine(); !line.empty()) {  // under the last message, dots running while busy
+        std::wstring shown = line;
+        if (busy_) {
+            const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            shown += std::wstring(static_cast<size_t>(ticks / 400 % 4), L'.');
+            const D2D1_POINT_2F dot{left + 5.f, y + kStatusRow / 2};
+            const float pulse = 0.55f + 0.45f * std::sin(static_cast<float>(ticks % 1200) / 1200.f * 2.f * std::numbers::pi_v<float>);
+            brush_->SetColor(Color(kAccent, pulse));
+            target_->FillEllipse(D2D1::Ellipse(dot, 4.f, 4.f), brush_.get());
+        }
+        Text(shown, ui_.get(), D2D1::RectF(left + (busy_ ? 18.f : 0.f), y, left + g.column, y + kStatusRow), kSecondary);
     }
     if (maxScroll_ > 0) {  // a thin scroll thumb on the right edge
         const float track = g.feed.bottom - g.feed.top;
@@ -3089,14 +3146,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Text(updatePending_ ? L"Обновлю после ответа" : UpdateLabel(), button_.get(), g.update, kPrimary);
     }
     Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);
-    std::wstring state = busy_ ? L"отвечает…" : L"";
-    if (!status_.empty()) {
-        state = status_;
-    }
-    if (!state.empty()) {
-        const float titleWidth = std::min(TextWidth(title, header_.get()), titleRight - titleLeft);
-        Text(state, ui_.get(), D2D1::RectF(titleLeft + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
-    }
+
 
     {  // save the memory: an arrow up out of a tray (into the cloud); dimmed while it works
         const bool active = hover_.target == Target::SaveMemoryBtn;
@@ -5900,6 +5950,40 @@ void ChatWindow::OnPreviewPick(const std::wstring& message) {
     Flash(L"Элемент в сообщении: допиши, что с ним сделать");
 }
 
+void ChatWindow::FetchUsage() {
+    if (usageRunning_.exchange(true)) {
+        return;
+    }
+    if (usageThread_.joinable()) {
+        usageThread_.join();
+    }
+    const HWND hwnd = hwnd_;
+    std::atomic<bool>* running = &usageRunning_;
+    usageThread_ = std::thread([hwnd, running] {
+        std::string error;
+        auto usage = std::make_unique<PlanUsage>(FetchPlanUsage(error));
+        running->store(false);
+        if (usage->ok && PostMessageW(hwnd, kUsage, 0, reinterpret_cast<LPARAM>(usage.get()))) {
+            usage.release();
+        }
+    });
+}
+
+void ChatWindow::OnPlanUsage(const PlanUsage& usage) {
+    if (usage.sessionPercent >= 0) {
+        session_ = Limit{usage.sessionPercent, usage.sessionResets};
+    }
+    if (usage.weekPercent >= 0) {
+        week_ = Limit{usage.weekPercent, usage.weekResets};
+    }
+    settings_.sessionPercent = session_.percent;
+    settings_.sessionResets = session_.resetsAt;
+    settings_.weekPercent = week_.percent;
+    settings_.weekResets = week_.resetsAt;
+    SaveSettings(settings_);
+    Refresh();
+}
+
 void ChatWindow::SaveMemoryNow() {
     if (savingMemory_) {
         return;
@@ -5975,6 +6059,8 @@ void ChatWindow::OnPuffFrame() {
             puffing_ = false;
             KillTimer(hwnd_, kPuffTimer);
             SetTimer(hwnd_, kPuffIdleTimer, kPuffIdle, nullptr);
+    FetchUsage();  // the ring is right before the first message, not only after it
+    SetTimer(hwnd_, kUsageTimer, kUsageCheck, nullptr);
         }
     }
     Refresh();
@@ -7217,6 +7303,7 @@ void ChatWindow::OnClaude(const Json& message) {
         if (!stateEvents_) {
             busy_ = false;
         }
+        FetchUsage();  // a turn spent some: the ring follows
         const Json& isError = JsonAt(message, "is_error");
         if ((isError.is_boolean() && isError.get<bool>()) || JsonStr(message, "subtype") != "success") {
             std::string text = JsonStr(message, "result");

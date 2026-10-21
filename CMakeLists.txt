@@ -35,6 +35,7 @@ add_library(aic_core STATIC
   src/core/secrets.cpp
   src/core/store.cpp
   src/core/tools.cpp
+  src/core/usage.cpp
   src/core/vt_screen.cpp)
 target_include_directories(aic_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 windowscodecs winhttp bcrypt)
@@ -49,7 +50,7 @@ target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32 sh
 
 # Tests of the core without the UI: `ctest --test-dir build/dev`.
 enable_testing()
-foreach(name tools markdown highlight vt_screen pty auth claude_install attachment app_update)
+foreach(name tools markdown highlight vt_screen pty auth claude_install attachment app_update usage)
   add_executable(aic_${name}_test tests/${name}_test.cpp)
   target_link_libraries(aic_${name}_test PRIVATE aic_core)
   add_test(NAME ${name} COMMAND aic_${name}_test)

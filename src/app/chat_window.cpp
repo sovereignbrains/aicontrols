@@ -1354,6 +1354,7 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
         HDC dc = GetDC(hwnd);
         RECT area{};
         SendMessageW(hwnd, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&area));
+        area.left += MulDiv(3, static_cast<int>(GetDpiForWindow(hwnd)), 96);  // clear of the caret standing at its start
         const HGDIOBJ old = SelectObject(dc, window->uiFont_.get());
         SetTextColor(dc, ToColorRef(kSecondary));
         SetBkMode(dc, TRANSPARENT);
@@ -1383,7 +1384,7 @@ void ChatWindow::FitCaret(HWND input) {
         SelectObject(dc, old);
         ReleaseDC(input, dc);
         caretTop_ = metrics.tmInternalLeading;
-        caretHeight_ = std::max(4L, metrics.tmHeight - metrics.tmInternalLeading + 1);
+        caretHeight_ = std::max(4L, metrics.tmHeight - metrics.tmInternalLeading - 1);  // down to just above the tails' end: lower, it looked low
     }
     CreateCaret(input, nullptr, std::max(1, ToPx(1.5f)), caretHeight_);
     caretSet_ = POINT{at.x, at.y + caretTop_};

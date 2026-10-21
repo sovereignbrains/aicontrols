@@ -2344,8 +2344,11 @@ Geometry ChatWindow::Layout() const {
     g.attach = D2D1::RectF(left + 8, rowBottom - kInputButton, left + 8 + kInputButton, rowBottom);
     g.mic = D2D1::RectF(right - 8 - kInputButton, rowBottom - kInputButton, right - 8, rowBottom);
     g.send = D2D1::RectF(g.mic.left - 4 - kInputButton, rowBottom - kInputButton, g.mic.left - 4, rowBottom);
-    const float textTop = rowTop + (rowHeight - textHeight_) / 2;
-    g.text = D2D1::RectF(g.attach.right + 10, textTop, g.send.left - 4, textTop + textHeight_);  // air after "+", as in Claude's app
+    // The font keeps room above its capitals: centred by its box, the letters sat 2-3 DIPs low (measured on a
+    // screenshot against "+" and the box's middle).
+    constexpr float kTextNudge = 2.5f;
+    const float textTop = rowTop + (rowHeight - textHeight_) / 2 - kTextNudge;
+    g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 4, textTop + textHeight_);
 
     const float ringTop = chipsTop + (kChipRow - kRing) / 2;
     g.usage = D2D1::RectF(right - 6 - kRing, ringTop, right - 6, ringTop + kRing);

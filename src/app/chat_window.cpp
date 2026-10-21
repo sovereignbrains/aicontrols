@@ -892,7 +892,10 @@ private:
     void StartPuff();
     void OnPuffFrame();
     float PuffScale() const;
-    std::wstring UpdateLabel() const { return update_ ? L"Обновить до " + ToWide(update_->version) : std::wstring(); }  // Ctrl+click in the page: the element goes into the message
+    std::wstring UpdateLabel() const {
+        if (!update_) return {};
+        return updatePending_ ? L"Обновлю после ответа" : L"Обновить до " + ToWide(update_->version);
+    }  // Ctrl+click in the page: the element goes into the message
     // Wide: the sidebar goes and the chat keeps only a strip, the rest is the preview's; again: as it was.
     void SetPreviewWide(bool wide);
     float MinChat() const { return PreviewShown() ? kMinChatPreview : kMinChat; }
@@ -960,6 +963,8 @@ private:
     ID2D1Bitmap* Bitmap(FeedImage& image);
     void PaintImages(const Geometry& g, FeedItem& item);
     void OpenViewer(size_t item, size_t image);
+    void OpenAttachment(size_t index);  // a picture in the viewer, a file with its app
+    void ShowInViewer(std::wstring path);
     void StepViewer(int delta);
     void PaintViewer(const Geometry& g);
     void ShowImageMenu(const std::wstring& path, POINT screen);
@@ -1118,6 +1123,7 @@ private:
     // The picture shown over the window (Popup::Image): which one, and its larger image.
     size_t viewerItem_ = 0;
     size_t viewerImage_ = 0;
+    bool viewerAttachment_ = false;  // one of the attachments over the input, not a picture of the feed
     FeedImage viewer_;
     FeedImage mascot_;  // sits on the input box, as the one in Claude's app
     bool puffing_ = false;
@@ -1632,7 +1638,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT && reinterpret_cast<HWND>(wParam) == hwnd_) {
             const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup &&
-                                   hover_.target != Target::AttachmentChip && hover_.target != Target::TermScreen;
+                                   hover_.target != Target::TermScreen;
             bool text = hover_.target == Target::TermScreen;
             bool link = false;
             if (hover_.target == Target::None && popup_ == Popup::None && HasConversation()) {  // over the feed: text
@@ -2161,6 +2167,9 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::Mic:
         ToggleVoice();
         break;
+    case Target::AttachmentChip:
+        OpenAttachment(hit.row);
+        return;
     case Target::RemoveAttachment:
         attachments_.erase(attachments_.begin() + static_cast<std::ptrdiff_t>(hit.row));
         hover_ = {};
@@ -2357,7 +2366,7 @@ Geometry ChatWindow::Layout() const {
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
     g.memory = D2D1::RectF(g.terminalBtn.left - 4 - kButton, buttonTop, g.terminalBtn.left - 4, buttonTop + kButton);
     if (update_) {
-        const float width = TextWidth(UpdateLabel(), ui_.get()) + 22.f;
+        const float width = TextWidth(UpdateLabel(), button_.get()) + 22.f;  // measured as it is drawn
         g.update = D2D1::RectF(g.memory.left - 8 - width, buttonTop, g.memory.left - 8, buttonTop + kButton);
     }
 
@@ -3239,7 +3248,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     const float titleRight = (update_ ? g.update.left : g.memory.left) - 12;
     if (update_) {
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
-        Text(updatePending_ ? L"Обновлю после ответа" : UpdateLabel(), button_.get(), g.update, kPrimary);
+        Text(UpdateLabel(), button_.get(), g.update, kPrimary);
     }
     Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);
 
@@ -6385,21 +6394,43 @@ void ChatWindow::OpenViewer(size_t item, size_t image) {
     if (item >= feed_.size() || image >= feed_[item].images.size()) {
         return;
     }
+    viewerItem_ = item;
+    viewerImage_ = image;
+    viewerAttachment_ = false;
+    ShowInViewer(feed_[item].images[image].path);
+}
+
+void ChatWindow::OpenAttachment(size_t index) {
+    if (index >= attachments_.size()) {
+        return;
+    }
+    const Attachment& attachment = attachments_[index];
+    if (attachment.type != Attachment::Type::Image) {
+        if (!attachment.path.empty()) {
+            OpenFile(attachment.path);
+        }
+        return;
+    }
+    // A pasted picture has no file yet: it gets the one it would get when sent.
+    const std::wstring path =
+        attachment.path.empty() ? SaveChatImage(attachment.base64, attachment.mediaType) : attachment.path;
+    viewerAttachment_ = true;
+    ShowInViewer(path);
+}
+
+void ChatWindow::ShowInViewer(std::wstring path) {  // a copy: closing the viewer clears viewer_
     if (popup_ != Popup::Image) {
         HideTip();
         OpenPopup(Popup::Image);
     }
-    viewerItem_ = item;
-    viewerImage_ = image;
     viewer_ = {};
-    viewer_.path = feed_[item].images[image].path;
+    viewer_.path = path;
     UINT width = 0;
     UINT height = 0;
     viewer_.preview = LoadImagePreview(wic_.get(), viewer_.path, kViewerSide, width, height);
     viewer_.width = static_cast<float>(width);  // here: the picture's own pixels
     viewer_.height = static_cast<float>(height);
     if (!viewer_.preview) {
-        const std::wstring path = viewer_.path;
         ClosePopup();
         Flash(L"Не открывается картинка: " + path, 4000);
         return;
@@ -6409,6 +6440,9 @@ void ChatWindow::OpenViewer(size_t item, size_t image) {
 
 // The arrows: the picture before or after this one, across all messages.
 void ChatWindow::StepViewer(int delta) {
+    if (viewerAttachment_) {  // the arrows walk the feed's pictures, an attachment is not among them
+        return;
+    }
     std::vector<std::pair<size_t, size_t>> all;
     size_t at = 0;
     for (size_t i = 0; i < feed_.size(); ++i) {
@@ -6442,7 +6476,7 @@ void ChatWindow::PaintViewer(const Geometry& g) {
     }
     size_t total = 0;
     size_t number = 0;
-    for (size_t i = 0; i < feed_.size(); ++i) {
+    for (size_t i = 0; !viewerAttachment_ && i < feed_.size(); ++i) {
         for (size_t k = 0; k < feed_[i].images.size(); ++k) {
             ++total;
             if (i == viewerItem_ && k == viewerImage_) {

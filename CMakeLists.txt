@@ -44,6 +44,7 @@ add_executable(aicontrols WIN32
   src/app/main.cpp
   src/app/chat_window.cpp
   src/app/fonts.cpp
+  src/app/popup_menu.cpp
   src/app/aicontrols.manifest
   src/app/aicontrols.rc)
 target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32 shlwapi unofficial::webview2::webview2)

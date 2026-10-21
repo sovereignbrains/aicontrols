@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "app/fonts.h"
+#include "app/popup_menu.h"
 #include "app/resource.h"
 #include "core/app_update.h"
 #include "core/attachment.h"
@@ -758,7 +759,11 @@ private:
     void OnRenameChar(wchar_t c);
     void PaintRenameField(const D2D1_RECT_F& r);
 
-    // Right-click menus.
+    // Right-click menus, drawn in the app's style (popup_menu.h); TrackPopupMenu's contract.
+    int Menu(HMENU menu, POINT screen, bool above = false) {
+        HideTip();
+        return ShowMenu(hwnd_, menu, screen, above, {d2d_.get(), dwrite_.get(), ui_.get(), Dpi()});
+    }
     void ShowTabMenu(size_t index, POINT screen);
     void ShowSecretMenu(size_t index, POINT screen);
     void ShowAttachmentMenu(size_t index, POINT screen);
@@ -778,6 +783,7 @@ private:
     void OpenRepo(size_t index);
     void OnCloneDone(const CloneDone& done);
     void ShowFolderMenu();
+    std::wstring ComputerLabel() const { return cloning_ ? FolderLabel() : std::wstring(L"Этот компьютер"); }
     std::wstring FolderLabel() const {
         return cloning_ ? L"Клонирую " + cloningName_ + L"…" : folderName_;
     }
@@ -2319,14 +2325,11 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
-    const float computerWidth = TextWidth(L"Этот компьютер", ui_.get()) + 34.f;
-    const bool computerFits = g.model.left - left > computerWidth + 120.f;
-    if (computerFits) {
-        g.computer = D2D1::RectF(left + 4, chipTop, left + 4 + computerWidth, chipBottom);
-    }
-    const float folderLeft = computerFits ? g.computer.right + 4 : left + 4;
-    const float folderWidth = std::min(TextWidth(FolderLabel(), ui_.get()) + 34.f, std::max(0.f, g.model.left - folderLeft - 12.f));
-    g.folder = D2D1::RectF(folderLeft, chipTop, folderLeft + folderWidth, chipBottom);
+    // Where Claude works: this computer; the folder there is chosen in its menu (as environments are in
+    // Claude's app). While a repository is being cloned, that shows here.
+    const float computerWidth =
+        std::min(TextWidth(ComputerLabel(), ui_.get()) + 34.f, std::max(0.f, g.model.left - left - 12.f));
+    g.computer = D2D1::RectF(left + 4, chipTop, left + 4 + computerWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
         const float centerX = left + g.column / 2;
@@ -3290,7 +3293,7 @@ void ChatWindow::PaintInput(const Geometry& g) {
         target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 4.5f, c.y - 4.f, c.x + 4.5f, c.y + 2.f), 1.f, 1.f),
                                       brush_.get(), 1.2f);
         Line({c.x - 6.5f, c.y + 4.5f}, {c.x + 6.5f, c.y + 4.5f}, color, 1.2f);
-        Text(L"Этот компьютер", ui_.get(),
+        Text(ComputerLabel(), ui_.get(),
              D2D1::RectF(g.computer.left + 26, g.computer.top, g.computer.right - 6, g.computer.bottom), color);
     }
     // The model, then its effort in a box of its own, as in Claude's app.
@@ -4547,8 +4550,7 @@ void ChatWindow::ShowAccountMenu() {
                 ClaudeUpdateAvailable() ? update.c_str() : L"Проверить обновления Claude");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из аккаунта");
-    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, screen.x, screen.y, 0, hwnd_,
-                           nullptr)) {
+    switch (Menu(menu.get(), screen, true)) {
     case 2:
         SignOut();
         break;
@@ -5041,17 +5043,19 @@ void ChatWindow::ShowFolderMenu() {
     constexpr UINT kRepo = 1000;
     const std::wstring standard = DefaultWorkspace();
     wil::unique_hmenu menu(CreatePopupMenu());
-    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, (L"Сейчас: " + workspace_).c_str());
-    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, L"Этот компьютер — папка");
     AppendMenuW(menu.get(), MF_STRING | (workspace_ == standard ? MF_CHECKED : 0), kDefault,
-                (std::filesystem::path(standard).filename().wstring() + L"  (по умолчанию)").c_str());
+                (std::filesystem::path(standard).filename().wstring() + L"\tпо умолчанию").c_str());
     std::vector<std::wstring> recent;
     for (const std::wstring& folder : settings_.recentFolders) {
         std::error_code error;
         if (folder != standard && recent.size() < 8 && std::filesystem::is_directory(folder, error)) {
             recent.push_back(folder);
+            // The folder's name, and where it is (its parent) quieter at the right.
+            const std::filesystem::path path(folder);
             AppendMenuW(menu.get(), MF_STRING | (folder == workspace_ ? MF_CHECKED : 0),
-                        kRecent + static_cast<UINT>(recent.size() - 1), folder.c_str());
+                        kRecent + static_cast<UINT>(recent.size() - 1),
+                        (path.filename().wstring() + L"\t" + path.parent_path().filename().wstring()).c_str());
         }
     }
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
@@ -5079,10 +5083,9 @@ void ChatWindow::ShowFolderMenu() {
                 cloning_ ? (L"Клонирую " + cloningName_ + L"…").c_str() : L"Репозитории GitHub");
 
     const Geometry g = Layout();
-    POINT screen{ToPx(g.folder.left), ToPx(g.folder.top)};
+    POINT screen{ToPx(g.computer.left), ToPx(g.computer.top - 4.f)};
     ClientToScreen(hwnd_, &screen);
-    const auto chosen = static_cast<UINT>(TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-                                                         screen.x, screen.y, 0, hwnd_, nullptr));
+    const auto chosen = static_cast<UINT>(Menu(menu.get(), screen, true));
     if (chosen == kDefault) {
         SwitchWorkspace(standard);
     } else if (chosen == kPick) {
@@ -5603,7 +5606,7 @@ void ChatWindow::ShowInputMenu(POINT screen) {
     AppendMenuW(menu.get(), MF_STRING | (GetWindowTextLengthW(input_) > 0 ? 0 : MF_GRAYED), kSelectAll,
                 L"Выделить всё\tCtrl+A");
     const UINT chosen = static_cast<UINT>(
-        TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr));
+        Menu(menu.get(), screen));
     switch (chosen) {
     case kUndo:
         SendMessageW(input_, EM_UNDO, 0, 0);
@@ -5639,7 +5642,7 @@ void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 2, L"Удалить чат");
     InsertMenuW(menu.get(), 1, MF_BYPOSITION | MF_STRING, 3, L"Переименовать");
-    const auto chosen = TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr);
+    const auto chosen = Menu(menu.get(), screen);
     if (chosen == 3) {
         BeginRename(Rename::Chat, filteredIndex);
         return;
@@ -5722,7 +5725,7 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
     if (GetMenuItemCount(menu.get()) == 0) {
         return;
     }
-    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    switch (Menu(menu.get(), screen)) {
     case kSelection:
         CopyFeedSelection();
         break;
@@ -5934,7 +5937,7 @@ void ChatWindow::ShowPreviewMenu(size_t index, POINT screen) {
     AppendMenuW(menu.get(), MF_STRING, kCopyPath, L"Копировать путь");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, kClose, L"Закрыть");
-    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    switch (Menu(menu.get(), screen)) {
     case kReload:
         if (webView_) {
             previewStamp_ = FolderStamp(page);
@@ -6296,7 +6299,7 @@ void ChatWindow::ShowImageMenu(const std::wstring& path, POINT screen) {
     AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, kCopyPath, L"Копировать путь");
-    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    switch (Menu(menu.get(), screen)) {
     case kCopy:
         CopyImage(path);
         break;
@@ -6351,7 +6354,7 @@ std::wstring ChatWindow::TooltipText() {
     case Target::FolderChip:
         return L"Папка чата: " + workspace_;
     case Target::ComputerChip:
-        return L"Claude работает на этом компьютере, в папке справа";
+        return L"Claude работает здесь: " + workspace_;
     case Target::Account:
         return ClaudeUpdateAvailable() ? L"Аккаунт · вышел Claude " + ToWide(claudeLatest_)
                                        : std::wstring(L"Аккаунт, версия Claude, выход");
@@ -6807,7 +6810,7 @@ void ChatWindow::ShowTabMenu(size_t index, POINT screen) {
     AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый терминал");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, kClose, L"Закрыть");
-    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    switch (Menu(menu.get(), screen)) {
     case kRename:
         BeginRename(Rename::Tab, index);
         break;
@@ -6858,7 +6861,7 @@ void ChatWindow::ShowSecretMenu(size_t index, POINT screen) {
     AppendMenuW(menu.get(), MF_STRING, kCopyName, L"Копировать имя");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, kDelete, L"Удалить");
-    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    switch (Menu(menu.get(), screen)) {
     case kEdit:
         EditSecret(names[index]);
         break;
@@ -6883,7 +6886,7 @@ void ChatWindow::ShowAttachmentMenu(size_t index, POINT screen) {
     AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 2, attachments_[index].name.c_str());
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 1, L"Убрать");
-    if (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr) == 1) {
+    if (Menu(menu.get(), screen) == 1) {
         attachments_.erase(attachments_.begin() + static_cast<std::ptrdiff_t>(index));
         hover_ = {};
         Attached();
@@ -6896,7 +6899,7 @@ void ChatWindow::ShowTitleMenu(POINT screen) {
     wil::unique_hmenu menu(CreatePopupMenu());
     AppendMenuW(menu.get(), MF_STRING | (sessionId_.empty() ? MF_GRAYED : 0), kRename, L"Переименовать чат");
     AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат");
-    switch (TrackPopupMenu(menu.get(), TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr)) {
+    switch (Menu(menu.get(), screen)) {
     case kRename: {
         const auto find = [&] {
             return std::ranges::find_if(filtered_, [&](size_t i) { return sessions_[i].id == sessionId_; });

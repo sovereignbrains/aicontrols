@@ -168,6 +168,7 @@ constexpr float kHistoryRow = 34.f;
 constexpr float kNavRow = 34.f;
 constexpr float kMinChat = 420.f;  // the chat never gets narrower than this: side panels give way first
 constexpr float kMinChatPreview = 340.f;  // ... but beside a preview it may be a strip
+constexpr float kCodeSize = 13.5f;  // code and tables in a message; the terminal's cell is measured at 12.5
 
 // Put into every page the preview loads: Ctrl shows the element under the pointer, Ctrl+click tells the window
 // which one it is (a short CSS path and its text), to be named in the message being typed.
@@ -448,6 +449,7 @@ enum class Target {
     RemoveAttachment,  // row: the same
     ModelChip,
     EffortChip,
+    PermissionChip,  // what the tools may do without a card
     UsageChip,
     Secrets,       // the sidebar's entry that opens the secrets
     SecretsClose,  // ... and the way back to the chats
@@ -528,6 +530,7 @@ struct Geometry {
     D2D1_RECT_F usage{};  // the ring that opens the plan limits
     D2D1_RECT_F model{};
     D2D1_RECT_F effort{};  // empty when the model has no effort levels
+    D2D1_RECT_F permission{};
     D2D1_RECT_F send{};
     D2D1_RECT_F popup{};   // the open panel
     // History.
@@ -794,6 +797,9 @@ private:
     void OpenRepo(size_t index);
     void OnCloneDone(const CloneDone& done);
     void ShowFolderMenu();
+    void ShowPermissionMenu();
+    std::wstring PermissionName() const;
+    bool AllowedUnasked(const std::string& tool, const Json& input) const;
     std::wstring ComputerLabel() const { return cloning_ ? FolderLabel() : std::wstring(L"Этот компьютер"); }
     std::wstring FolderLabel() const {
         return cloning_ ? L"Клонирую " + cloningName_ + L"…" : folderName_;
@@ -2114,6 +2120,9 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::EffortChip:
         OpenPopup(Popup::Effort);
         break;
+    case Target::PermissionChip:
+        ShowPermissionMenu();
+        break;
     case Target::UsageChip:
         OpenPopup(Popup::Usage);
         break;
@@ -2404,10 +2413,12 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
+    const float permissionWidth = TextWidth(PermissionName(), ui_.get()) + 18;
+    g.permission = D2D1::RectF(g.model.left - 2 - permissionWidth, chipTop, g.model.left - 2, chipBottom);
     // Where Claude works: this computer; the folder there is chosen in its menu (as environments are in
     // Claude's app). While a repository is being cloned, that shows here.
     const float computerWidth =
-        std::min(TextWidth(ComputerLabel(), ui_.get()) + 34.f, std::max(0.f, g.model.left - left - 12.f));
+        std::min(TextWidth(ComputerLabel(), ui_.get()) + 34.f, std::max(0.f, g.permission.left - left - 12.f));
     g.computer = D2D1::RectF(left + 4, chipTop, left + 4 + computerWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
@@ -2710,6 +2721,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.effort, x, y)) {
         return {Target::EffortChip};
     }
+    if (Inside(g.permission, x, y)) {
+        return {Target::PermissionChip};
+    }
     if (Inside(g.usage, x, y)) {
         return {Target::UsageChip};
     }
@@ -2834,7 +2848,10 @@ void ChatWindow::MeasureFeed(float column) {
         std::wstring shown;  // an assistant message without its markup
         const std::wstring* source = &item.text;
         if (item.kind == Kind::Assistant) {
-            MdText md = ParseMarkdown(item.text);
+            // Tables wrap inside their cells to the column; one character short, so rounding never wraps a line.
+            const float advance = cellW_ * kCodeSize / 12.5f;
+            const size_t tableChars = static_cast<size_t>(std::max(width / advance - 1.f, 1.f));
+            MdText md = ParseMarkdown(item.text, tableChars);
             shown = std::move(md.text);
             item.spans = std::move(md.spans);
             source = &shown;
@@ -3078,7 +3095,7 @@ void ChatWindow::StyleMarkdown(FeedItem& item) {
                 layout->SetFontCollection(fonts_.get(), range);
             }
             layout->SetFontFamilyName(kMonoFont, range);
-            layout->SetFontSize(13.5f, range);
+            layout->SetFontSize(kCodeSize, range);
         }
     }
 }
@@ -3407,6 +3424,15 @@ void ChatWindow::PaintInput(const Geometry& g) {
     }
     Text(ModelName(), ui_.get(), D2D1::RectF(g.model.left + 9, g.model.top, g.model.right, g.model.bottom),
          modelActive ? kPrimary : kSecondary);
+    {  // nothing asked is worth seeing at a glance: in the accent
+        const bool active = hover_.target == Target::PermissionChip;
+        if (active) {
+            Fill(g.permission, 6.f, kRaised);
+        }
+        Text(PermissionName(), ui_.get(),
+             D2D1::RectF(g.permission.left + 9, g.permission.top, g.permission.right, g.permission.bottom),
+             settings_.permissions == "all" ? kAccent : (active ? kPrimary : kSecondary));
+    }
     if (g.effort.right > g.effort.left) {
         const bool effortActive = hover_.target == Target::EffortChip || popup_ == Popup::Effort;
         if (effortActive) {
@@ -5213,6 +5239,51 @@ void ChatWindow::ShowFolderMenu() {
     SetFocus(input_);
 }
 
+std::wstring ChatWindow::PermissionName() const {
+    if (settings_.permissions == "all") {
+        return L"Без вопросов";
+    }
+    return settings_.permissions == "edits" ? L"Файлы без вопросов" : L"Спрашивать";
+}
+
+// A call that changes something, which the chosen mode lets through without its card.
+bool ChatWindow::AllowedUnasked(const std::string& tool, const Json& input) const {
+    if (settings_.permissions == "all") {
+        return true;
+    }
+    return settings_.permissions == "edits" && (tool == "write_file" || tool == "edit_file") &&
+           JsonStr(input, "on").empty();
+}
+
+void ChatWindow::ShowPermissionMenu() {
+    constexpr std::array<const char*, 3> kModes = {"", "edits", "all"};
+    constexpr std::array<const wchar_t*, 3> kLabels = {L"Спрашивать\tвсё, что меняет",
+                                                       L"Файлы без вопросов\tкоманды спрашивать",
+                                                       L"Без вопросов\tи команды, и серверы"};
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 100, L"Что делать без подтверждения");
+    for (size_t i = 0; i < kModes.size(); ++i) {
+        AppendMenuW(menu.get(), MF_STRING | (settings_.permissions == kModes[i] ? MF_CHECKED : 0),
+                    static_cast<UINT>(i + 1), kLabels[i]);
+    }
+    const Geometry g = Layout();
+    POINT screen{ToPx(g.permission.left), ToPx(g.permission.top - 4.f)};
+    ClientToScreen(hwnd_, &screen);
+    const auto chosen = static_cast<size_t>(Menu(menu.get(), screen, true));
+    if (chosen >= 1 && chosen <= kModes.size()) {
+        settings_.permissions = kModes[chosen - 1];
+        SaveSettings(settings_);
+        for (size_t i = 0; i < feed_.size(); ++i) {  // the cards waiting now that the new mode lets through
+            const FeedItem& item = feed_[i];
+            if (item.kind == Kind::Approval && item.verdict == Verdict::Pending && AllowedUnasked(item.tool, item.input)) {
+                Decide(i, true);
+            }
+        }
+        Refresh();
+    }
+    SetFocus(input_);
+}
+
 void ChatWindow::PaintPanel(const D2D1_RECT_F& rect) {
     Fill(D2D1::RectF(rect.left + 2, rect.top + 4, rect.right + 2, rect.bottom + 6), 10.f, 0x000000, 0.35f);
     Fill(rect, 10.f, kCard);
@@ -6819,6 +6890,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.model;
     case Target::EffortChip:
         return g.effort;
+    case Target::PermissionChip:
+        return g.permission;
     case Target::UsageChip:
         return g.usage;
     case Target::Attach:
@@ -7626,7 +7699,7 @@ void ChatWindow::OnClaude(const Json& message) {
 }
 
 // The model wants to call a tool. Reading runs at once (a note in the feed); anything that changes
-// something waits on a card for the user's word.
+// something waits on a card for the user's word, unless the permission mode lets it through.
 void ChatWindow::AskApproval(const std::string& requestId, const Json& request) {
     const std::string name = OwnToolName(JsonStr(request, "tool_name"));
     const Json& input = JsonAt(request, "input");
@@ -7648,6 +7721,10 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     item.toolUseId = JsonStr(request, "tool_use_id");
     item.tool = name;
     item.input = input;
+    if (AllowedUnasked(name, input)) {  // the card still shows the call and its output, already allowed
+        item.verdict = Verdict::Allowed;
+        claude_.Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
+    }
     feed_.push_back(std::move(item));
     stick_ = true;
 }

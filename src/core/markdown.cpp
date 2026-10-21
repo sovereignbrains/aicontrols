@@ -225,6 +225,44 @@ std::wstring Plain(std::wstring_view markdown) {
     return cell.text;
 }
 
+// Narrows the widest columns until the row, with its " │ " separators, fits `limit` characters (0: any width).
+// A column is not narrowed below a few characters: past that the feed wraps the lines instead.
+void FitWidths(std::vector<size_t>& widths, size_t limit) {
+    constexpr size_t kNarrowest = 6;
+    if (limit == 0 || widths.empty()) {
+        return;
+    }
+    const size_t separators = 3 * (widths.size() - 1);
+    size_t total = separators;
+    for (const size_t width : widths) {
+        total += width;
+    }
+    while (total > limit) {
+        const auto widest = std::max_element(widths.begin(), widths.end());
+        if (*widest <= kNarrowest) {
+            return;
+        }
+        --*widest;
+        --total;
+    }
+}
+
+// A cell's lines at `width`: broken at spaces, a word longer than the column cut where it ends.
+std::vector<std::wstring> WrapCell(const std::wstring& cell, size_t width) {
+    std::vector<std::wstring> lines;
+    std::wstring_view rest = cell;
+    while (rest.size() > width) {
+        size_t cut = rest.substr(0, width + 1).find_last_of(L' ');
+        if (cut == std::wstring_view::npos || cut == 0) {
+            cut = width;
+        }
+        lines.emplace_back(Trim(rest.substr(0, cut)));
+        rest = Trim(rest.substr(cut));
+    }
+    lines.emplace_back(rest);
+    return lines;
+}
+
 void AppendPadded(std::wstring& out, const std::wstring& cell, size_t width, Align align, bool last) {
     const size_t gap = width > cell.size() ? width - cell.size() : 0;
     const size_t before = align == Align::Right ? gap : (align == Align::Center ? gap / 2 : 0);
@@ -261,7 +299,7 @@ bool IsLocalPath(std::wstring_view text) {
     return text.size() >= 3 && text.starts_with(L"\\\\") && IsWordChar(text[2]);
 }
 
-MdText ParseMarkdown(std::wstring_view source) {
+MdText ParseMarkdown(std::wstring_view source, size_t tableWidth) {
     MdText out;
     bool inCode = false;
     size_t codeStart = 0;
@@ -361,24 +399,48 @@ MdText ParseMarkdown(std::wstring_view source) {
                         widths[c] = std::max(widths[c], row[c].size());
                     }
                 }
+                FitWidths(widths, tableWidth);
+                // Each row as its cells' lines; once a row takes several, rules part all the rows.
+                std::vector<std::vector<std::vector<std::wstring>>> wrapped(rows.size());
+                bool tall = false;
+                for (size_t r = 0; r < rows.size(); ++r) {
+                    for (size_t c = 0; c < columns; ++c) {
+                        wrapped[r].push_back(WrapCell(rows[r][c], widths[c]));
+                        tall = tall || wrapped[r].back().size() > 1;
+                    }
+                }
+                const auto rule = [&] {
+                    out.text += L'\n';
+                    for (size_t c = 0; c < columns; ++c) {
+                        out.text += c == 0 ? L"" : L"─┼─";
+                        out.text.append(widths[c], L'─');
+                    }
+                };
                 Separate(out);
                 const size_t start = out.text.size();
                 size_t headerEnd = start;
                 for (size_t r = 0; r < rows.size(); ++r) {
-                    if (r > 0) {
-                        out.text += L'\n';
+                    if (r > 1 && tall) {
+                        rule();
                     }
-                    for (size_t c = 0; c < columns; ++c) {
-                        out.text += c == 0 ? L"" : L" │ ";
-                        AppendPadded(out.text, rows[r][c], widths[c], (*aligns)[c], c + 1 == columns);
+                    size_t height = 1;
+                    for (const std::vector<std::wstring>& cell : wrapped[r]) {
+                        height = std::max(height, cell.size());
+                    }
+                    for (size_t at = 0; at < height; ++at) {
+                        if (r > 0 || at > 0) {
+                            out.text += L'\n';
+                        }
+                        for (size_t c = 0; c < columns; ++c) {
+                            out.text += c == 0 ? L"" : L" │ ";
+                            const std::vector<std::wstring>& cell = wrapped[r][c];
+                            AppendPadded(out.text, at < cell.size() ? cell[at] : std::wstring(), widths[c],
+                                         (*aligns)[c], c + 1 == columns);
+                        }
                     }
                     if (r == 0) {
                         headerEnd = out.text.size();
-                        out.text += L'\n';
-                        for (size_t c = 0; c < columns; ++c) {
-                            out.text += c == 0 ? L"" : L"─┼─";
-                            out.text.append(widths[c], L'─');
-                        }
+                        rule();
                     }
                 }
                 out.spans.push_back(MdSpan{start, out.text.size() - start, kMdCode | kMdTable, 1.f, true});

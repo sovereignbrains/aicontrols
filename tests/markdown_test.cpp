@@ -140,6 +140,15 @@ int main() {
         Expect(Find(md, aic::kMdBold) != nullptr, "table header is bold");
     }
     {
+        const auto md = ParseMarkdown(L"| Key | Value |\n|---|---|\n| a | one two three four |\n| b | x |\nend", 16);
+        Expect(md.text == L"Key │ Value\n────┼───────────\na   │ one two\n    │ three four\n────┼───────────\nb   │ x\n\nend",
+               "a wide table wraps inside its cells, rules part the rows", Narrow(md.text));
+    }
+    {
+        const auto md = ParseMarkdown(L"| k |\n|---|\n| abcdefghijklmnop |\nend", 8);
+        Expect(md.text == L"k\n────────\nabcdefgh\nijklmnop\n\nend", "a long word is cut at the column", Narrow(md.text));
+    }
+    {
         const auto md = ParseMarkdown(L"a | b\nno table here");
         Expect(md.text == L"a | b\nno table here" && Find(md, aic::kMdTable) == nullptr, "pipes alone are no table");
     }

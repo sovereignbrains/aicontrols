@@ -356,6 +356,7 @@ Settings LoadSettings() {
     const Json data = Json::parse(in, nullptr, false);
     settings.model = JsonStr(data, "model");
     settings.effort = JsonStr(data, "effort");
+    settings.permissions = JsonStr(data, "permissions");
     const auto number = [&](const char* key, long long fallback) {
         const Json& value = JsonAt(data, key);
         return value.is_number() ? value.get<long long>() : fallback;
@@ -393,6 +394,7 @@ void SaveSettings(const Settings& settings) {
     }
     out << Json{{"model", settings.model},
                 {"effort", settings.effort},
+                {"permissions", settings.permissions},
                 {"sessionPercent", settings.sessionPercent},
                 {"sessionResets", settings.sessionResets},
                 {"weekPercent", settings.weekPercent},

@@ -41,6 +41,7 @@ struct MdText {
 
 // A forgiving subset: # headings, **bold**, *italic*, `code`, ``` fences (colored by their language), - lists,
 // > quotes, [links](url) and bare http(s):// addresses, | tables |, --- rules. Markup that is not closed (a message still streaming) stays as typed.
-MdText ParseMarkdown(std::wstring_view source);
+// `tableWidth`: how many characters of the code font a line holds; wider tables wrap inside their cells (0: no limit).
+MdText ParseMarkdown(std::wstring_view source, size_t tableWidth = 0);
 
 }  // namespace aic

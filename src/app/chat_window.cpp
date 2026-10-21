@@ -413,6 +413,7 @@ enum class Target {
     Update,  // the header's "update to ..." (only while there is one)
     SidebarSearch,
     FolderChip,     // the chat's folder, under the input: a menu to change it
+    ComputerChip,   // ... and left of it, where Claude works: this computer
     SplitSidebar,   // the edge between the sidebar and the chat: drag to resize
     SplitTerminal,  // ... and between the chat and the terminal
     WinMin,    // the window's own buttons, drawn in the header (the system caption is gone)
@@ -503,7 +504,8 @@ struct Geometry {
     float secretsTop = 0;  // the first secret's row
     D2D1_RECT_F newItem{};  // the sidebar's "new chat" row
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
-    D2D1_RECT_F folder{};   // under the input, at the left: the folder the chat works in
+    D2D1_RECT_F computer{}; // under the input, at the left: where Claude works (this computer)
+    D2D1_RECT_F folder{};   // ... and in which folder there
     D2D1_RECT_F signIn{};   // the sign-in screen's buttons (in the middle of an empty chat)
     D2D1_RECT_F signAlt{};
     float listBottom = 0;
@@ -982,6 +984,7 @@ private:
     void Refresh() { InvalidateRect(hwnd_, nullptr, FALSE); }
     bool HasConversation() const;
     bool hasContent() const { return hasText_ || !attachments_.empty(); }
+    bool SendShown() const { return hasContent() || busy_; }
 
     HINSTANCE instance_;
     HWND hwnd_ = nullptr;
@@ -2045,6 +2048,7 @@ void ChatWindow::OnClick(float x, float y) {
         OpenPopup(Popup::Usage);
         break;
     case Target::FolderChip:
+    case Target::ComputerChip:  // the only place for now; servers will join it
         ShowFolderMenu();
         keepFocus = true;
         break;
@@ -2315,8 +2319,14 @@ Geometry ChatWindow::Layout() const {
     }
     const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
-    const float folderWidth = std::min(TextWidth(FolderLabel(), ui_.get()) + 34.f, std::max(0.f, g.model.left - left - 16.f));
-    g.folder = D2D1::RectF(left + 4, chipTop, left + 4 + folderWidth, chipBottom);
+    const float computerWidth = TextWidth(L"Этот компьютер", ui_.get()) + 34.f;
+    const bool computerFits = g.model.left - left > computerWidth + 120.f;
+    if (computerFits) {
+        g.computer = D2D1::RectF(left + 4, chipTop, left + 4 + computerWidth, chipBottom);
+    }
+    const float folderLeft = computerFits ? g.computer.right + 4 : left + 4;
+    const float folderWidth = std::min(TextWidth(FolderLabel(), ui_.get()) + 34.f, std::max(0.f, g.model.left - folderLeft - 12.f));
+    g.folder = D2D1::RectF(folderLeft, chipTop, folderLeft + folderWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
         const float centerX = left + g.column / 2;
@@ -2609,13 +2619,16 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.folder, x, y)) {
         return {Target::FolderChip};
     }
+    if (Inside(g.computer, x, y)) {
+        return {Target::ComputerChip};
+    }
     if (Inside(g.effort, x, y)) {
         return {Target::EffortChip};
     }
     if (Inside(g.usage, x, y)) {
         return {Target::UsageChip};
     }
-    if (Inside(g.send, x, y)) {
+    if (SendShown() && Inside(g.send, x, y)) {
         return {Target::Send};
     }
     return {};
@@ -3266,6 +3279,20 @@ void ChatWindow::PaintInput(const Geometry& g) {
         Line({c.x, c.y - 6.f}, {c.x, c.y + 6.f}, color, 1.6f);
     }
 
+    if (g.computer.right > g.computer.left) {  // a laptop: where Claude works
+        const bool active = hover_.target == Target::ComputerChip;
+        if (active) {
+            Fill(g.computer, 6.f, kRaised);
+        }
+        const uint32_t color = active ? kPrimary : kSecondary;
+        const D2D1_POINT_2F c{g.computer.left + 12.f, (g.computer.top + g.computer.bottom) / 2};
+        brush_->SetColor(Color(color));
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 4.5f, c.y - 4.f, c.x + 4.5f, c.y + 2.f), 1.f, 1.f),
+                                      brush_.get(), 1.2f);
+        Line({c.x - 6.5f, c.y + 4.5f}, {c.x + 6.5f, c.y + 4.5f}, color, 1.2f);
+        Text(L"Этот компьютер", ui_.get(),
+             D2D1::RectF(g.computer.left + 26, g.computer.top, g.computer.right - 6, g.computer.bottom), color);
+    }
     // The model, then its effort in a box of its own, as in Claude's app.
     if (g.folder.right > g.folder.left) {  // the folder the chat works in: a menu to change it
         const bool active = hover_.target == Target::FolderChip;
@@ -3311,12 +3338,14 @@ void ChatWindow::PaintInput(const Geometry& g) {
         }
     }
 
-    const bool live = hasContent() || busy_;
+    if (!SendShown()) {  // as in Claude's app: nothing to send, no button
+        return;
+    }
     const D2D1_POINT_2F c{(g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2};
     const float radius = (g.send.right - g.send.left) / 2;
-    brush_->SetColor(Color(live ? kAccent : kRaised, live && hover_.target == Target::Send ? 0.85f : 1.f));
+    brush_->SetColor(Color(kAccent, hover_.target == Target::Send ? 0.85f : 1.f));
     target_->FillEllipse(D2D1::Ellipse(c, radius, radius), brush_.get());
-    const uint32_t mark = live ? kPrimary : kSecondary;
+    const uint32_t mark = kPrimary;
     if (busy_ && !hasContent()) {  // stop
         Fill(D2D1::RectF(c.x - 4.5f, c.y - 4.5f, c.x + 4.5f, c.y + 4.5f), 1.5f, mark);
     } else {  // an arrow up
@@ -6321,6 +6350,8 @@ std::wstring ChatWindow::TooltipText() {
         return L"Поиск по чатам (Ctrl+H)";
     case Target::FolderChip:
         return L"Папка чата: " + workspace_;
+    case Target::ComputerChip:
+        return L"Claude работает на этом компьютере, в папке справа";
     case Target::Account:
         return ClaudeUpdateAvailable() ? L"Аккаунт · вышел Claude " + ToWide(claudeLatest_)
                                        : std::wstring(L"Аккаунт, версия Claude, выход");
@@ -6573,6 +6604,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.search;
     case Target::FolderChip:
         return g.folder;
+    case Target::ComputerChip:
+        return g.computer;
     case Target::ModelChip:
         return g.model;
     case Target::EffortChip:

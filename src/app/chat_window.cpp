@@ -1576,7 +1576,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             trackingMouse_ = TrackMouseEvent(&track) != FALSE;
         }
         const D2D1_POINT_2F at = CursorDip(lParam);
+        const bool overSplit = hover_.target == Target::SplitSidebar || hover_.target == Target::SplitTerminal;
         mouse_ = at;
+        if (overSplit) {
+            Refresh();  // the lit stretch of the edge follows the pointer
+        }
         if (draggingEffort_) {
             SetEffortAt(at.x);
             return 0;
@@ -2973,7 +2977,11 @@ void ChatWindow::Paint() {
     for (const Target split : {Target::SplitSidebar, Target::SplitTerminal}) {  // the edge lights up to be dragged
         if (hover_.target == split || dragging_ == split) {
             const float x = split == Target::SplitSidebar ? g.areaLeft : g.area;
-            Fill(D2D1::RectF(x - 1.f, kHeader, x + 1.f, g.height), 0.f, kAccent);
+            // Only a stretch around the pointer, not the whole height: it says "here" without a line across the window.
+            constexpr float kHalf = 40.f;
+            const float top = std::clamp(mouse_.y - kHalf, kHeader, g.height);
+            const float bottom = std::clamp(mouse_.y + kHalf, kHeader, g.height);
+            Fill(D2D1::RectF(x - 1.f, top, x + 1.f, bottom), 1.f, kAccent);
         }
     }
     switch (popup_) {
@@ -6366,6 +6374,7 @@ void ChatWindow::CheckAppUpdate() {
 }
 
 void ChatWindow::StartUpdate() {
+    CheckAppUpdate();  // the one found at the last look may be old: a newer installer may have come since
     if (!update_) {
         return;
     }
@@ -6567,7 +6576,7 @@ void ChatWindow::PaintViewer(const Geometry& g) {
 void ChatWindow::ShowImageMenu(const std::wstring& path, POINT screen) {
     constexpr UINT kCopy = 1, kOpen = 2, kReveal = 3, kCopyPath = 4;
     wil::unique_hmenu menu(CreatePopupMenu());
-    AppendMenuW(menu.get(), MF_STRING, kCopy, L"Копировать картинку\tCtrl+C");
+    AppendMenuW(menu.get(), MF_STRING, kCopy, L"Копировать картинку");
     AppendMenuW(menu.get(), MF_STRING, kOpen, L"Открыть в программе");
     AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);

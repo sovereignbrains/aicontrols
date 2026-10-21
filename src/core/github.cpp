@@ -4,6 +4,7 @@
 
 #include <winhttp.h>
 
+#include <chrono>
 #include <filesystem>
 #include <format>
 
@@ -123,31 +124,66 @@ std::wstring RepoFolder(const GithubRepo& repo) {
     return (std::filesystem::path(profile) / L"projects" / ToWide(repo.name)).wstring();
 }
 
-bool CloneGithubRepo(const GithubRepo& repo, const std::wstring& folder, const std::string& token,
-                     const std::atomic<bool>* cancel, std::string& output) {
-    std::error_code ignored;
-    std::filesystem::create_directories(std::filesystem::path(folder).parent_path(), ignored);
+std::vector<std::pair<std::wstring, std::wstring>> GithubGitEnvironment(const std::string& token) {
     // git reads extra config from GIT_CONFIG_COUNT/KEY_n/VALUE_n: here an Authorization header for github.com.
     std::string basic;
-    {
-        const std::string pair = "x-access-token:" + token;
-        constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (size_t i = 0; i < pair.size(); i += 3) {
-            const auto byte = [&](size_t k) { return k < pair.size() ? static_cast<unsigned char>(pair[k]) : 0u; };
-            const unsigned chunk = byte(i) << 16 | byte(i + 1) << 8 | byte(i + 2);
-            basic += alphabet[(chunk >> 18) & 63];
-            basic += alphabet[(chunk >> 12) & 63];
-            basic += i + 1 < pair.size() ? alphabet[(chunk >> 6) & 63] : '=';
-            basic += i + 2 < pair.size() ? alphabet[chunk & 63] : '=';
-        }
+    const std::string pair = "x-access-token:" + token;
+    constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < pair.size(); i += 3) {
+        const auto byte = [&](size_t k) { return k < pair.size() ? static_cast<unsigned char>(pair[k]) : 0u; };
+        const unsigned chunk = byte(i) << 16 | byte(i + 1) << 8 | byte(i + 2);
+        basic += alphabet[(chunk >> 18) & 63];
+        basic += alphabet[(chunk >> 12) & 63];
+        basic += i + 1 < pair.size() ? alphabet[(chunk >> 6) & 63] : '=';
+        basic += i + 2 < pair.size() ? alphabet[chunk & 63] : '=';
     }
-    const std::vector<std::pair<std::wstring, std::wstring>> environment = {
+    return {
         {L"GIT_CONFIG_COUNT", L"1"},
         {L"GIT_CONFIG_KEY_0", L"http.https://github.com/.extraheader"},
         {L"GIT_CONFIG_VALUE_0", L"AUTHORIZATION: basic " + ToWide(basic)},
         {L"GIT_TERMINAL_PROMPT", L"0"},  // never wait for a password
         {L"GCM_INTERACTIVE", L"never"},
     };
+}
+
+MemorySave SaveMemory(const std::wstring& folder, const std::string& token) {
+    MemorySave result;
+    std::error_code error;
+    if (!std::filesystem::exists(std::filesystem::path(folder) / L".git", error)) {
+        result.output = "the memory folder is not a git repository: " + ToUtf8(folder);
+        return result;
+    }
+    const auto environment = GithubGitEnvironment(token);
+    const std::wstring git = L"git -C \"" + folder + L"\" ";
+    const auto run = [&](const std::wstring& args, int timeout) {
+        CliResult step = RunCli(git + args, L"", timeout, nullptr, {}, environment);
+        result.output += step.output;
+        return step;
+    };
+    run(L"add -A", 60);
+    // Named here, not in the clone's config: a fresh clone has none.
+    const CliResult commit = run(std::format(L"-c user.name=claude-memory -c user.email=claude-memory@localhost commit -q "
+                                             L"-m \"Memory: {:%Y-%m-%d %H:%M}\"",
+                                             std::chrono::zoned_time(std::chrono::current_zone(),
+                                                                     std::chrono::floor<std::chrono::minutes>(
+                                                                         std::chrono::system_clock::now()))),
+                                 60);
+    const bool committed = commit.started && commit.exitCode == 0;
+    CliResult push = run(L"push -q -u origin HEAD", 120);
+    if (push.exitCode != 0 && push.output.find("rejected") != std::string::npos) {  // changed elsewhere first
+        if (run(L"pull -q --rebase origin HEAD", 120).exitCode == 0) {
+            push = run(L"push -q -u origin HEAD", 120);
+        }
+    }
+    result.ok = push.started && !push.timedOut && push.exitCode == 0;
+    result.nothing = result.ok && !committed;
+    return result;
+}
+bool CloneGithubRepo(const GithubRepo& repo, const std::wstring& folder, const std::string& token,
+                     const std::atomic<bool>* cancel, std::string& output) {
+    std::error_code ignored;
+    std::filesystem::create_directories(std::filesystem::path(folder).parent_path(), ignored);
+    const auto environment = GithubGitEnvironment(token);
     const CliResult run = RunCli(L"git clone \"" + ToWide(repo.cloneUrl) + L"\" \"" + folder + L"\"", L"", 900, cancel, {},
                                  environment);
     output = run.output;

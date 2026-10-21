@@ -92,6 +92,7 @@ struct ClaudeVersions {
 
 constexpr UINT kRepos = WM_APP + 10;      // ReposResult*: the GitHub repositories
 constexpr UINT kCloneDone = WM_APP + 11;  // CloneDone*: `git clone` ended
+constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed and pushed
 
 struct ReposResult {
     std::vector<GithubRepo> repos;
@@ -402,6 +403,7 @@ Limit Current(const Limit& limit) {
 enum class Target {
     None,
     SidebarToggle,
+    SaveMemoryBtn,  // the header's "save the memory" (to its GitHub repository)
     Update,  // the header's "update to ..." (only while there is one)
     SidebarSearch,
     FolderChip,     // the chat's folder, under the input: a menu to change it
@@ -478,6 +480,7 @@ struct Geometry {
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
     D2D1_RECT_F termAdd{};               // "+": another shell
     D2D1_RECT_F terminalBtn{};  // the header's button that shows or hides the terminal
+    D2D1_RECT_F memory{};       // ... save the memory, left of the terminal's button
     D2D1_RECT_F update{};       // ... and left of it, "update to ..." while a newer build is there
     D2D1_RECT_F winMin{};       // minimize, maximize, close: the header is the window's title bar
     D2D1_RECT_F winMax{};
@@ -852,6 +855,11 @@ private:
     void CheckAppUpdate();
     void StartUpdate();
 
+    // The memory folder pushed to its repository (git, the GITHUB secret): no model call, so it works with
+    // the plan's limit spent.
+    void SaveMemoryNow();
+    void OnMemorySaved(const MemorySave& saved);
+
     void StartPuff();
     void OnPuffFrame();
     float PuffScale() const;
@@ -1017,6 +1025,8 @@ private:
     wil::com_ptr<ICoreWebView2> webView_;
     bool webCreating_ = false;
     std::optional<AppUpdate> update_;
+    bool savingMemory_ = false;
+    std::thread memoryThread_;
     bool updatePending_ = false;  // asked while Claude was answering: done when the turn ends
     bool previewWide_ = false;
     float wideSavedTerminal_ = kTerminal;  // the widths to go back to
@@ -1390,6 +1400,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         reposLoading_ = false;
         repos_ = std::move(payload->repos);
         reposError_ = ToWide(payload->error);
+        return 0;
+    }
+    case kMemorySaved: {
+        const std::unique_ptr<MemorySave> payload(reinterpret_cast<MemorySave*>(lParam));
+        OnMemorySaved(*payload);
         return 0;
     }
     case kCloneDone: {
@@ -1857,6 +1872,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (versionThread_.joinable()) {
             versionThread_.join();
         }
+        if (memoryThread_.joinable()) {  // a push under way finishes: what was saved is not cut in half
+            memoryThread_.join();
+        }
         cloneCancel_ = true;
         if (cloneThread_.joinable()) {
             cloneThread_.join();
@@ -1964,6 +1982,9 @@ void ChatWindow::OnClick(float x, float y) {
         break;
     case Target::Update:
         StartUpdate();
+        break;
+    case Target::SaveMemoryBtn:
+        SaveMemoryNow();
         break;
     case Target::TermTab:
         SelectTerminalTab(hit.row);
@@ -2236,9 +2257,10 @@ Geometry ChatWindow::Layout() const {
     g.winMin = D2D1::RectF(g.winMax.left - kWinButton, 0, g.winMax.left, kHeader);
     g.terminalBtn = D2D1::RectF(g.winMin.left - 10 - kButton, buttonTop, g.winMin.left - 10, buttonTop + kButton);
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
+    g.memory = D2D1::RectF(g.terminalBtn.left - 4 - kButton, buttonTop, g.terminalBtn.left - 4, buttonTop + kButton);
     if (update_) {
         const float width = TextWidth(UpdateLabel(), ui_.get()) + 22.f;
-        g.update = D2D1::RectF(g.terminalBtn.left - 8 - width, buttonTop, g.terminalBtn.left - 8, buttonTop + kButton);
+        g.update = D2D1::RectF(g.memory.left - 8 - width, buttonTop, g.memory.left - 8, buttonTop + kButton);
     }
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
@@ -2491,6 +2513,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.terminalBtn, x, y)) {
         return {Target::TerminalToggle};
+    }
+    if (Inside(g.memory, x, y)) {
+        return {Target::SaveMemoryBtn};
     }
     if (Inside(g.update, x, y)) {
         return {Target::Update};
@@ -3057,7 +3082,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     // The title starts where the chat does (as in Claude's app), or after the toggle when the sidebar is hidden.
     const float titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
-    const float titleRight = (update_ ? g.update.left : g.terminalBtn.left) - 12;
+    const float titleRight = (update_ ? g.update.left : g.memory.left) - 12;
     if (update_) {
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(updatePending_ ? L"Обновлю после ответа" : UpdateLabel(), button_.get(), g.update, kPrimary);
@@ -3072,6 +3097,20 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Text(state, ui_.get(), D2D1::RectF(titleLeft + titleWidth + 12, 0, titleRight, kHeader), kSecondary);
     }
 
+    {  // save the memory: an arrow up out of a tray (into the cloud); dimmed while it works
+        const bool active = hover_.target == Target::SaveMemoryBtn;
+        if (active || savingMemory_) {
+            Fill(g.memory, 6.f, kRaised);
+        }
+        const D2D1_POINT_2F c{(g.memory.left + g.memory.right) / 2, (g.memory.top + g.memory.bottom) / 2};
+        const uint32_t color = savingMemory_ ? kAccent : (active ? kPrimary : kSecondary);
+        Line({c.x, c.y + 2.f}, {c.x, c.y - 6.f}, color, 1.5f);
+        Line({c.x - 3.5f, c.y - 2.5f}, {c.x, c.y - 6.f}, color, 1.5f);
+        Line({c.x + 3.5f, c.y - 2.5f}, {c.x, c.y - 6.f}, color, 1.5f);
+        Line({c.x - 6.f, c.y + 1.f}, {c.x - 6.f, c.y + 5.5f}, color, 1.5f);
+        Line({c.x - 6.f, c.y + 5.5f}, {c.x + 6.f, c.y + 5.5f}, color, 1.5f);
+        Line({c.x + 6.f, c.y + 5.5f}, {c.x + 6.f, c.y + 1.f}, color, 1.5f);
+    }
     for (const Target button : {Target::SidebarToggle, Target::TerminalToggle}) {
         const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle : g.terminalBtn;
         const bool active = hover_.target == button || (button == Target::SidebarToggle && sidebarOpen_) ||
@@ -5860,6 +5899,41 @@ void ChatWindow::OnPreviewPick(const std::wstring& message) {
     Flash(L"Элемент в сообщении: допиши, что с ним сделать");
 }
 
+void ChatWindow::SaveMemoryNow() {
+    if (savingMemory_) {
+        return;
+    }
+    const std::string token = secrets_.Get("GITHUB").value_or("");
+    if (token.empty()) {
+        Flash(L"Нет секрета GITHUB: без него память не отправить", 4000);
+        return;
+    }
+    if (memoryThread_.joinable()) {
+        memoryThread_.join();
+    }
+    savingMemory_ = true;
+    Flash(L"Сохраняю память…", 60'000);
+    const HWND hwnd = hwnd_;
+    const std::wstring folder = MemoryFolder(workspace_);
+    memoryThread_ = std::thread([hwnd, folder, token] {
+        auto saved = std::make_unique<MemorySave>(SaveMemory(folder, token));
+        if (PostMessageW(hwnd, kMemorySaved, 0, reinterpret_cast<LPARAM>(saved.get()))) {
+            saved.release();
+        }
+    });
+    Refresh();
+}
+
+void ChatWindow::OnMemorySaved(const MemorySave& saved) {
+    savingMemory_ = false;
+    if (saved.ok) {
+        Flash(saved.nothing ? L"Память уже в облаке: нового нет" : L"Память сохранена в облако", 3000);
+    } else {
+        Add(Kind::Error, L"Память не сохранилась:\n" + LastLines(saved.output, 6));
+    }
+    Refresh();
+}
+
 void ChatWindow::StartPuff() {
     if (puffing_ || !mascot_.preview) {
         return;
@@ -6148,6 +6222,8 @@ std::wstring ChatWindow::TooltipText() {
         return L"Скрыть терминал";
     case Target::TermTabClose:
         return L"Закрыть вкладку";
+    case Target::SaveMemoryBtn:
+        return savingMemory_ ? L"Сохраняю память…" : L"Сохранить память Claude в облако (GitHub)";
     case Target::Update:
         return L"Поставить AIControls " + (update_ ? ToWide(update_->version) : std::wstring()) +
                L" и перезапустить. Этот чат откроется снова";
@@ -6376,6 +6452,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.terminalBtn;
     case Target::Update:
         return g.update;
+    case Target::SaveMemoryBtn:
+        return g.memory;
     case Target::WinMin:
         return g.winMin;
     case Target::WinMax:

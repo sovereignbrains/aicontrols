@@ -50,6 +50,9 @@ struct Settings {
 // chat history are keyed by this folder. Falls back to the profile folder.
 std::wstring DefaultWorkspace();
 
+// Claude's memory for a workspace: ~\.claude\projects\<workspace>\memory.
+std::wstring MemoryFolder(const std::wstring& workspace);
+
 std::vector<SessionInfo> ListSessions(const std::wstring& workspace);  // newest first
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);
 // Moves a chat to the Recycle Bin: its transcript and the folder the CLI keeps beside it. False if it could not.

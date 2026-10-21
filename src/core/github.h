@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aic {
@@ -23,6 +24,18 @@ std::vector<GithubRepo> ParseGithubRepos(const std::string& json);
 
 // Where a repository is cloned: %USERPROFILE%\projects\<name>.
 std::wstring RepoFolder(const GithubRepo& repo);
+
+// What git needs in its environment to reach github.com with the token: an Authorization header, never a prompt.
+std::vector<std::pair<std::wstring, std::wstring>> GithubGitEnvironment(const std::string& token);
+
+// Claude's memory folder is a clone of a private repository: everything in it committed and pushed (pulled
+// and pushed again when it changed elsewhere first). `nothing`: there was nothing new to save.
+struct MemorySave {
+    bool ok = false;
+    bool nothing = false;
+    std::string output;
+};
+MemorySave SaveMemory(const std::wstring& folder, const std::string& token);
 
 // `git clone` of the repository into `folder`, the token passed to git as an HTTP header through the
 // environment (never on a command line, never saved in the clone's config). True when the clone is there.

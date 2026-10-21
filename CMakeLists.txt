@@ -58,7 +58,8 @@ endforeach()
 #   aic_e2e_probe     claude.exe calling our tools (spends a request)
 #   aic_github_probe  the repositories the GITHUB secret reaches, and a clone
 #   aic_store_probe   the titles of the real chats; --delete <id>
-foreach(name e2e github store)
+#   aic_memory_probe  the memory folder committed and pushed (GITHUB in the environment)
+foreach(name e2e github store memory)
   add_executable(aic_${name}_probe tests/probes/${name}_probe.cpp)
   target_link_libraries(aic_${name}_probe PRIVATE aic_core)
 endforeach()

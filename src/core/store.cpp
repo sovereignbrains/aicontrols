@@ -200,6 +200,10 @@ std::wstring DefaultWorkspace() {
     return KnownFolder(FOLDERID_Profile);
 }
 
+std::wstring MemoryFolder(const std::wstring& workspace) {
+    return (ProjectDir(workspace) / L"memory").wstring();
+}
+
 std::vector<SessionInfo> ListSessions(const std::wstring& workspace) {
     std::vector<SessionInfo> sessions;
     std::error_code error;

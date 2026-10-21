@@ -51,6 +51,7 @@
 #include "core/secrets.h"
 #include "core/store.h"
 #include "core/usage.h"
+#include "core/voice.h"
 #include "core/tools.h"
 #include "core/vt_screen.h"
 
@@ -95,11 +96,17 @@ struct ClaudeVersions {
 
 constexpr UINT kRepos = WM_APP + 10;      // ReposResult*: the GitHub repositories
 constexpr UINT kCloneDone = WM_APP + 11;  // CloneDone*: `git clone` ended
+constexpr UINT kVoiceText = WM_APP + 16;    // VoiceResult*: what was said, as text
 constexpr UINT kUsage = WM_APP + 15;        // PlanUsage*: the plan's limits as claude.ai has them
 constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed and pushed
 
 struct ReposResult {
     std::vector<GithubRepo> repos;
+    std::string error;
+};
+
+struct VoiceResult {
+    std::string text;
     std::string error;
 };
 
@@ -115,6 +122,7 @@ constexpr UINT_PTR kPreviewTimer = 3;  // the preview looks whether its file (or
 constexpr UINT kPreviewCheck = 700;    // ms
 constexpr UINT_PTR kUpdateTimer = 4;   // a newer AIControls may have been built
 constexpr UINT kUpdateCheck = 30'000;  // ms
+constexpr UINT_PTR kVoiceTimer = 8;    // while recording: the seconds and the pulse move
 constexpr UINT_PTR kUsageTimer = 7;    // the plan's limits asked again
 constexpr UINT kUsageCheck = 60'000;   // ms
 // The mascot puffs up and back: in rhythm while Claude answers, now and then while idle. The window is drawn
@@ -147,7 +155,7 @@ constexpr float kSecretRow = 38.f;
 constexpr float kFieldHeight = 34.f;
 constexpr float kSecretsNote = 40.f;
 constexpr float kUsageRow = 58.f;
-constexpr float kTextMin = 22.f;
+constexpr float kTextMin = 16.f;  // the input hugs its line: the row centres it (taller, it sat high)
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 26.f;
 constexpr float kTerminal = 480.f;  // the right column: PowerShell (as wide by default)
@@ -435,6 +443,7 @@ enum class Target {
     PreviewWide,   // the preview over the window, or back
     NewChat,
     Attach,
+    Mic,  // voice input: record, then the words go into the input
     AttachmentChip,    // row: an index into the attachments; shows its remove button
     RemoveAttachment,  // row: the same
     ModelChip,
@@ -515,6 +524,7 @@ struct Geometry {
     D2D1_RECT_F attachments{};  // the row of attached files above the text
     D2D1_RECT_F text{};
     D2D1_RECT_F attach{};
+    D2D1_RECT_F mic{};  // at the input's right end; send left of it
     D2D1_RECT_F usage{};  // the ring that opens the plan limits
     D2D1_RECT_F model{};
     D2D1_RECT_F effort{};  // empty when the model has no effort levels
@@ -873,6 +883,8 @@ private:
     // the plan's limit spent.
     void SaveMemoryNow();
     void FetchUsage();  // on its own thread; at most one at a time
+    void ToggleVoice();  // start recording, or stop and have it written out (Groq Whisper, the GROC secret)
+    void OnVoiceText(const VoiceResult& result);
     void OnPlanUsage(const PlanUsage& usage);
     void OnMemorySaved(const MemorySave& saved);
 
@@ -1045,6 +1057,9 @@ private:
     std::optional<AppUpdate> update_;
     bool savingMemory_ = false;
     std::thread usageThread_;
+    Recorder recorder_;
+    bool transcribing_ = false;
+    std::thread voiceThread_;
     std::atomic<bool> usageRunning_ = false;
     std::thread memoryThread_;
     bool updatePending_ = false;  // asked while Claude was answering: done when the turn ends
@@ -1422,6 +1437,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         reposLoading_ = false;
         repos_ = std::move(payload->repos);
         reposError_ = ToWide(payload->error);
+        return 0;
+    }
+    case kVoiceText: {
+        const std::unique_ptr<VoiceResult> payload(reinterpret_cast<VoiceResult*>(lParam));
+        OnVoiceText(*payload);
         return 0;
     }
     case kUsage: {
@@ -1829,6 +1849,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             Refresh();
         } else if (wParam == kPreviewTimer) {
             CheckPreview();
+        } else if (wParam == kVoiceTimer) {
+            Refresh();
         } else if (wParam == kUsageTimer) {
             FetchUsage();
         } else if (wParam == kUpdateTimer) {
@@ -1903,6 +1925,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (usageThread_.joinable()) {
             usageThread_.join();
+        }
+        recorder_.Stop();
+        if (voiceThread_.joinable()) {
+            voiceThread_.join();
         }
         if (memoryThread_.joinable()) {  // a push under way finishes: what was saved is not cut in half
             memoryThread_.join();
@@ -2100,6 +2126,9 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::Attach:
         PickFiles();
         break;
+    case Target::Mic:
+        ToggleVoice();
+        break;
     case Target::RemoveAttachment:
         attachments_.erase(attachments_.begin() + static_cast<std::ptrdiff_t>(hit.row));
         hover_ = {};
@@ -2247,6 +2276,10 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             PickFiles();
             return 1;
         }
+        if (filter.wParam == 'M' && control) {  // voice: start, and again to stop
+            ToggleVoice();
+            return 1;
+        }
         if ((filter.wParam == 'V' && control) || (filter.wParam == VK_INSERT && shift)) {
             PasteClipboard();
             return 1;
@@ -2309,7 +2342,8 @@ Geometry ChatWindow::Layout() const {
     const float rowTop = boxTop + kBoxPadY + attachmentsHeight;
     const float rowBottom = rowTop + rowHeight;
     g.attach = D2D1::RectF(left + 8, rowBottom - kInputButton, left + 8 + kInputButton, rowBottom);
-    g.send = D2D1::RectF(right - 8 - kInputButton, rowBottom - kInputButton, right - 8, rowBottom);
+    g.mic = D2D1::RectF(right - 8 - kInputButton, rowBottom - kInputButton, right - 8, rowBottom);
+    g.send = D2D1::RectF(g.mic.left - 4 - kInputButton, rowBottom - kInputButton, g.mic.left - 4, rowBottom);
     const float textTop = rowTop + (rowHeight - textHeight_) / 2;
     g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 4, textTop + textHeight_);
 
@@ -2607,6 +2641,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.attach, x, y)) {
         return {Target::Attach};
     }
+    if (Inside(g.mic, x, y)) {
+        return {Target::Mic};
+    }
     for (size_t i = 0; i < attachments_.size(); ++i) {
         const D2D1_RECT_F chip = AttachmentRect(g, i);
         if (Inside(RemoveRect(chip), x, y)) {
@@ -2828,6 +2865,13 @@ float ChatWindow::FeedHeight() const {
 // What Claude is doing, under the last message: waiting for the user's word, running a tool, answering; else a
 // passing note (copied, saved …).
 std::wstring ChatWindow::StatusLine() const {
+    if (recorder_.Recording()) {
+        const int seconds = static_cast<int>(recorder_.Seconds());
+        return std::format(L"Слушаю {}:{:02} — нажми микрофон, чтобы закончить", seconds / 60, seconds % 60);
+    }
+    if (transcribing_) {
+        return L"Распознаю речь";
+    }
     if (busy_) {
         for (auto it = feed_.rbegin(); it != feed_.rend(); ++it) {
             if (it->kind != Kind::Approval) {
@@ -2947,7 +2991,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
     }
     if (const std::wstring line = StatusLine(); !line.empty()) {  // under the last message, dots running while busy
         std::wstring shown = line;
-        if (busy_) {
+        if (busy_ || recorder_.Recording() || transcribing_) {
             const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
                                    .count();
@@ -2957,7 +3001,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             brush_->SetColor(Color(kAccent, pulse));
             target_->FillEllipse(D2D1::Ellipse(dot, 4.f, 4.f), brush_.get());
         }
-        Text(shown, ui_.get(), D2D1::RectF(left + (busy_ ? 18.f : 0.f), y, left + g.column, y + kStatusRow), kSecondary);
+        Text(shown, ui_.get(), D2D1::RectF(left + (busy_ || recorder_.Recording() || transcribing_ ? 18.f : 0.f), y, left + g.column, y + kStatusRow), kSecondary);
     }
     if (maxScroll_ > 0) {  // a thin scroll thumb on the right edge
         const float track = g.feed.bottom - g.feed.top;
@@ -3341,6 +3385,28 @@ void ChatWindow::PaintInput(const Geometry& g) {
         }
     }
 
+    {  // the microphone: a capsule on a stand; red while it listens, blue while it is written out
+        const bool active = hover_.target == Target::Mic;
+        const bool recording = recorder_.Recording();
+        const D2D1_POINT_2F c{(g.mic.left + g.mic.right) / 2, (g.mic.top + g.mic.bottom) / 2};
+        if (recording) {
+            brush_->SetColor(Color(kDanger, active ? 0.85f : 1.f));
+            target_->FillEllipse(D2D1::Ellipse(c, (g.mic.right - g.mic.left) / 2, (g.mic.right - g.mic.left) / 2),
+                                 brush_.get());
+        } else if (active) {
+            Fill(g.mic, 6.f, kRaised);
+        }
+        const uint32_t color = recording ? kPrimary : (transcribing_ ? kAccent : (active ? kPrimary : kSecondary));
+        brush_->SetColor(Color(color));
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 2.5f, c.y - 6.5f, c.x + 2.5f, c.y + 1.5f), 2.5f, 2.5f),
+                                      brush_.get(), 1.4f);
+        Line({c.x - 5.f, c.y - 1.f}, {c.x - 5.f, c.y}, color, 1.4f);
+        Line({c.x + 5.f, c.y - 1.f}, {c.x + 5.f, c.y}, color, 1.4f);
+        Line({c.x - 5.f, c.y}, {c.x - 3.f, c.y + 3.5f}, color, 1.4f);
+        Line({c.x + 5.f, c.y}, {c.x + 3.f, c.y + 3.5f}, color, 1.4f);
+        Line({c.x - 3.f, c.y + 3.5f}, {c.x + 3.f, c.y + 3.5f}, color, 1.4f);
+        Line({c.x, c.y + 3.5f}, {c.x, c.y + 6.5f}, color, 1.4f);
+    }
     if (!SendShown()) {  // as in Claude's app: nothing to send, no button
         return;
     }
@@ -5982,6 +6048,72 @@ void ChatWindow::OnPreviewPick(const std::wstring& message) {
     Flash(L"Элемент в сообщении: допиши, что с ним сделать");
 }
 
+void ChatWindow::ToggleVoice() {
+    if (transcribing_) {
+        return;
+    }
+    if (!recorder_.Recording()) {
+        if (secrets_.Get("GROC").value_or("").empty()) {
+            Flash(L"Нужен секрет GROC (ключ Groq): речь распознаёт Whisper на Groq", 5000);
+            return;
+        }
+        std::string error;
+        if (!recorder_.Start(error)) {
+            Flash(L"Микрофон не включился: " + ToWide(error), 5000);
+            return;
+        }
+        SetTimer(hwnd_, kVoiceTimer, 250, nullptr);
+        stick_ = true;
+        Refresh();
+        return;
+    }
+    std::vector<uint8_t> wav = recorder_.Stop();
+    KillTimer(hwnd_, kVoiceTimer);
+    if (wav.empty()) {
+        Flash(L"Ничего не слышно: проверь микрофон", 3000);
+        return;
+    }
+    transcribing_ = true;
+    if (voiceThread_.joinable()) {
+        voiceThread_.join();
+    }
+    const HWND hwnd = hwnd_;
+    const std::string key = secrets_.Get("GROC").value_or("");
+    voiceThread_ = std::thread([hwnd, key, wav = std::move(wav)] {
+        auto result = std::make_unique<VoiceResult>();
+        result->text = Transcribe(wav, key, result->error);
+        if (PostMessageW(hwnd, kVoiceText, 0, reinterpret_cast<LPARAM>(result.get()))) {
+            result.release();
+        }
+    });
+    SetTimer(hwnd_, kVoiceTimer, 250, nullptr);  // the dots run while it is written out
+    Refresh();
+}
+
+void ChatWindow::OnVoiceText(const VoiceResult& result) {
+    transcribing_ = false;
+    KillTimer(hwnd_, kVoiceTimer);
+    if (result.text.empty()) {
+        Flash(result.error.empty() ? L"Ничего не разобрал" : L"Не распознал: " + ToWide(result.error), 5000);
+        return;
+    }
+    // Into the input where the caret is, a space before it when it follows a word.
+    std::wstring text = ToWide(result.text);
+    CHARRANGE selection{};
+    SendMessageW(input_, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    if (selection.cpMin > 0) {
+        wchar_t before[2]{};
+        TEXTRANGEW range{{selection.cpMin - 1, selection.cpMin}, before};
+        SendMessageW(input_, EM_GETTEXTRANGE, 0, reinterpret_cast<LPARAM>(&range));
+        if (before[0] != 0 && !std::iswspace(before[0])) {
+            text = L" " + text;
+        }
+    }
+    SetFocus(input_);
+    SendMessageW(input_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+    Refresh();
+}
+
 void ChatWindow::FetchUsage() {
     if (usageRunning_.exchange(true)) {
         return;
@@ -6383,6 +6515,10 @@ std::wstring ChatWindow::TooltipText() {
         return hover_.row < attachments_.size() ? attachments_[hover_.row].name : std::wstring();
     case Target::RemoveAttachment:
         return L"Убрать";
+    case Target::Mic:
+        return transcribing_ ? L"Распознаю…"
+                             : (recorder_.Recording() ? L"Закончить и вставить текст (Ctrl+M)"
+                                                      : L"Голосовой ввод: говори, потом нажми ещё раз (Ctrl+M)");
     case Target::FeedImage:
         return L"Открыть здесь. Правая кнопка: копировать, открыть в программе, показать в папке";
     case Target::CardPreview:
@@ -6617,6 +6753,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.usage;
     case Target::Attach:
         return g.attach;
+    case Target::Mic:
+        return g.mic;
     case Target::Send:
         return g.send;
     case Target::Account:

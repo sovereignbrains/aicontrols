@@ -255,7 +255,7 @@ addEventListener('keydown', e => {
 });
 // В превью AIControls кнопки окна управляют самим превью: × закрывает, □ — на всё окно и обратно, — сворачивает
 // клиент; клиент тогда убирает свои крестик, «+» и ⤢ над страницей.
-const host = window.chrome && window.chrome.webview;
+const host = window.aicontrols && window.chrome && window.chrome.webview;  // клиент 0.1.48 метки не ставит и принял бы это за Ctrl+клик
 if (host) {
   host.postMessage(JSON.stringify({aic: 'controls'}));
   document.querySelectorAll('[data-aic]').forEach(b => b.onclick = () => host.postMessage(JSON.stringify({aic: b.dataset.aic})));

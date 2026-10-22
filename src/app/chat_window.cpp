@@ -6817,6 +6817,8 @@ void ChatWindow::EnsureWebView() {
                                    }
                                    if (webView_) {
                                        webView_->AddScriptToExecuteOnDocumentCreated(kPickScript, nullptr);
+                                       // A page may drive its own buttons only here: 0.1.48 took {aic: ...} for a pick.
+                                       webView_->AddScriptToExecuteOnDocumentCreated(L"window.aicontrols = 1;", nullptr);
                                        EventRegistrationToken token{};
                                        webView_->add_WebMessageReceived(
                                            Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
@@ -6966,6 +6968,9 @@ void ChatWindow::OnPreviewMessage(const std::wstring& message) {
             ShowWindow(hwnd_, SW_MINIMIZE);
         }
         return;
+    }
+    if (JsonStr(pick, "selector").empty()) {
+        return;  // not a pick: no empty "[mockup.html: ]" in the message
     }
     // "[mockup.html: div.card > button.edit «Изменить»] ": enough for the model to find it in the file.
     std::wstring reference = L"[" + std::filesystem::path(tab->preview).filename().wstring() + L": " +

@@ -941,10 +941,14 @@ private:
         std::vector<SessionInfo> sessions;  // newest first
     };
     static constexpr size_t kHead = SIZE_MAX;
+    static constexpr size_t kDraft = SIZE_MAX - 1;
     struct SideRow {  // one row of the list: a project's head, or one of its chats
         size_t project = 0;
-        size_t session = kHead;  // an index into its sessions; kHead: the project's own row
+        // An index into its sessions; kHead: the project's own row; kDraft: the open chat, not saved yet (a new
+        // one): it shows which project it is in.
+        size_t session = kHead;
     };
+    void RebuildRows();  // the rows again (the open chat changed), where the list was scrolled
     void PaintSidebar(const Geometry& g);
     static size_t SidebarRows(const Geometry& g);
     D2D1_RECT_F SideRowRect(const Geometry& g, size_t row) const;  // empty when it is scrolled out of view
@@ -2780,6 +2784,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (y >= g.listTop && y < g.listBottom) {
             const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
             if (row < rows_.size() && row < firstRow_ + SidebarRows(g)) {
+                if (rows_[row].session == kDraft) {
+                    return {};  // the chat that is open already
+                }
                 if (rows_[row].session != kHead) {
                     return {Target::HistoryRow, row};
                 }
@@ -3456,7 +3463,12 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
     }
-    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);
+    {  // the chat's project before its title: "aicontrols / Новый чат"
+        const std::wstring project = folderName_ + L"  /  ";
+        const float projectRight = std::min(titleLeft + TextWidth(project, header_.get()), titleRight);
+        Text(project, header_.get(), D2D1::RectF(titleLeft, 0, projectRight, kHeader), kSecondary);
+        Text(title, header_.get(), D2D1::RectF(projectRight, 0, titleRight, kHeader), kTitle);
+    }
 
 
     {  // save the memory: an arrow up out of a tray (into the cloud); dimmed while it works
@@ -5524,6 +5536,9 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Line({c.x, c.y - 5.5f}, {c.x, c.y + 5.5f}, color, 1.5f);
         Text(L"Новый чат", ui_.get(),
              D2D1::RectF(g.newItem.left + 42, g.newItem.top, g.newItem.right - 8, g.newItem.bottom), color);
+        // ... in which project: the open chat's
+        Text(folderName_, uiRight_.get(), D2D1::RectF(g.newItem.left + 130, g.newItem.top, g.newItem.right - 10, g.newItem.bottom),
+             kSecondary);
     }
 
     {  // the account, at the bottom: who is signed in and the plan, or the way to sign in
@@ -5635,8 +5650,13 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             }
             continue;
         }
-        const SessionInfo& session = project.sessions[rows_[row].session];
         const D2D1_RECT_F chat = D2D1::RectF(r.left + kProjectIndent, r.top, r.right, r.bottom);
+        if (rows_[row].session == kDraft) {  // the new chat that is open: lit, in its project
+            Fill(chat, 8.f, kRaised);
+            Text(L"Новый чат", ui_.get(), D2D1::RectF(chat.left + 10, chat.top, chat.right - 8, chat.bottom), kAccent);
+            continue;
+        }
+        const SessionInfo& session = project.sessions[rows_[row].session];
         if (renaming_ == Rename::Chat && session.id == renameChat_ && project.folder == renameFolder_) {
             PaintRenameField(chat);
             continue;
@@ -5669,8 +5689,8 @@ const ChatWindow::Project* ChatWindow::RowProject(size_t row) const {
 }
 
 const SessionInfo* ChatWindow::RowSession(size_t row) const {
-    if (row >= rows_.size() || rows_[row].session == kHead) {
-        return nullptr;
+    if (row >= rows_.size() || rows_[row].session >= projects_[rows_[row].project].sessions.size()) {
+        return nullptr;  // a head, or the new chat
     }
     return &projects_[rows_[row].project].sessions[rows_[row].session];
 }
@@ -7855,6 +7875,11 @@ void ChatWindow::FilterSessions() {
             continue;
         }
         rows_.push_back({p, kHead});
+        // The open chat, new: first under its project, folded or not - it says where the chat is.
+        if (query.empty() && project.folder == workspace_ &&
+            std::ranges::find(project.sessions, sessionId_, &SessionInfo::id) == project.sessions.end()) {
+            rows_.push_back({p, kDraft});
+        }
         if (query.empty() && ProjectFolded(project.folder)) {
             continue;
         }
@@ -7863,16 +7888,25 @@ void ChatWindow::FilterSessions() {
         }
     }
     firstRow_ = 0;
-    // The keys go through the chats: the first one is picked.
-    const auto chat = std::ranges::find_if(rows_, [](const SideRow& row) { return row.session != kHead; });
-    selected_ = chat == rows_.end() ? 0 : static_cast<size_t>(chat - rows_.begin());
+    selected_ = 0;  // the keys go through the chats: the first one is picked
+    while (selected_ < rows_.size() && RowSession(selected_) == nullptr) {
+        ++selected_;
+    }
     Refresh();
+}
+
+void ChatWindow::RebuildRows() {
+    const size_t first = firstRow_;
+    const size_t selected = selected_;
+    FilterSessions();
+    firstRow_ = first;  // kept within the list when painted
+    selected_ = std::min(selected, rows_.empty() ? 0 : rows_.size() - 1);
 }
 
 void ChatWindow::MoveSelection(int delta) {
     auto next = static_cast<long long>(selected_);
     for (long long at = next + delta; at >= 0 && at < static_cast<long long>(rows_.size()); at += delta) {
-        if (rows_[static_cast<size_t>(at)].session != kHead) {  // the heads are passed over
+        if (RowSession(static_cast<size_t>(at)) != nullptr) {  // the heads and the new chat are passed over
             next = at;
             break;
         }
@@ -7949,6 +7983,7 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     sessionId_ = session.id;
     title_ = session.title;
     StartClaude();
+    RebuildRows();  // no new chat under the project any more
 }
 
 // The CLI lists aliases (opus, sonnet…) and pinned versions (claude-opus-4-8…): the aliases are the
@@ -8131,6 +8166,7 @@ void ChatWindow::NewChat() {
     ClosePopup();
     ResetChat();
     StartClaude();
+    RebuildRows();  // the new chat shows under its project
 }
 
 void ChatWindow::Submit() {

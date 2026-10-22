@@ -2553,14 +2553,17 @@ Geometry ChatWindow::Layout() const {
     g.winMin = D2D1::RectF(g.winMax.left - kWinButton, 0, g.winMax.left, kHeader);
     g.terminalBtn = D2D1::RectF(g.winMin.left - 10 - kButton, buttonTop, g.winMin.left - 10, buttonTop + kButton);
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
-    if (update_) {
+    // The update is the client's, not the terminal's: it sits over the secrets in the sidebar, and in the header only
+    // while the sidebar is hidden.
+    const bool updateInHeader = update_ && sidebarWidth <= 0;
+    if (updateInHeader) {
         const float width = TextWidth(UpdateLabel(), button_.get()) + 22.f;  // measured as it is drawn
         g.update = D2D1::RectF(g.terminalBtn.left - 8 - width, buttonTop, g.terminalBtn.left - 8, buttonTop + kButton);
     }
     // The title, "project / chat", starts where the chat does (as in Claude's app), or after the toggle when the
     // sidebar is hidden; "save the memory" right after it, as it is about this chat and its project.
     g.titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
-    const float titleMost = (update_ ? g.update.left : g.terminalBtn.left) - 12 - kButton - 6;
+    const float titleMost = (updateInHeader ? g.update.left : g.terminalBtn.left) - 12 - kButton - 6;
     const float titleWidth = TextWidth(folderName_ + L"  /  ", header_.get()) +
                              TextWidth(title_.empty() ? L"Новый чат" : title_, header_.get()) + 2.f;
     g.titleRight = std::max(g.titleLeft, std::min(g.titleLeft + titleWidth, titleMost));
@@ -2625,11 +2628,16 @@ Geometry ChatWindow::Layout() const {
         g.search = D2D1::RectF(10, kHeader + 10, sidebarWidth - 10, kHeader + 10 + kFieldHeight);
         g.newItem = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
         // At the bottom, the settings' end: the secrets over the account.
-        g.account = D2D1::RectF(6, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
-        g.secrets = D2D1::RectF(6, g.account.top - 2 - kNavRow, sidebarWidth - 6, g.account.top - 2);
+        // The account's row with the secrets' padlock at its right end, as Claude's app keeps its small button there.
+        g.secrets = D2D1::RectF(sidebarWidth - 6 - 34, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
+        g.account = D2D1::RectF(6, g.secrets.top, g.secrets.left - 2, g.secrets.bottom);
         g.addProject = D2D1::RectF(sidebarWidth - 10 - 24, g.newItem.bottom + 7, sidebarWidth - 10, g.newItem.bottom + 31);
         g.listTop = g.newItem.bottom + 8 + 26;  // under the "projects" label
-        g.listBottom = g.secrets.top - 10;
+        g.listBottom = g.account.top - 10;
+        if (update_) {
+            g.update = D2D1::RectF(10, g.account.top - 10 - 34, sidebarWidth - 10, g.account.top - 10);
+            g.listBottom = g.update.top - 8;
+        }
     }
     if (termWidth > 0) {
         g.term = D2D1::RectF(g.area, kHeader, g.width, g.height);
@@ -3481,7 +3489,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     const float titleLeft = g.titleLeft;
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
     const float titleRight = g.titleRight;
-    if (update_) {
+    if (update_ && g.sidebar.right <= g.sidebar.left) {  // the header's, only while the sidebar is hidden
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
     }
@@ -5571,8 +5579,13 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
              D2D1::RectF(g.newItem.left + 42, g.newItem.top, g.newItem.right - 8, g.newItem.bottom), color);
     }
 
+    if (update_) {  // the client's update, over the secrets
+        Fill(g.update, 8.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
+        Text(UpdateLabel(), button_.get(), g.update, kPrimary);
+    }
+
     {  // the account, at the bottom: who is signed in and the plan, or the way to sign in
-        Line({g.sidebar.left, g.secrets.top - 4.f}, {g.sidebar.right, g.secrets.top - 4.f}, kLine, 1.f);
+        Line({g.sidebar.left, g.account.top - 4.f}, {g.sidebar.right, g.account.top - 4.f}, kLine, 1.f);
         const bool hovered = hover_.target == Target::Account;
         if (hovered) {
             Fill(g.account, 8.f, kRaised);
@@ -5614,7 +5627,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             Fill(g.secrets, 8.f, kRaised);
         }
         const uint32_t color = active ? kPrimary : kSecondary;
-        const D2D1_POINT_2F c{g.secrets.left + 22.f, (g.secrets.top + g.secrets.bottom) / 2};
+        const D2D1_POINT_2F c{(g.secrets.left + g.secrets.right) / 2, (g.secrets.top + g.secrets.bottom) / 2};
         // A padlock (closed and kept, as the values are): its shackle an arch over a body with a keyhole.
         brush_->SetColor(Color(color));
         wil::com_ptr<ID2D1PathGeometry> shackle;
@@ -5633,8 +5646,6 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y - 1.f, c.x + 6.f, c.y + 7.f), 2.f, 2.f),
                                       brush_.get(), 1.5f);
         Line({c.x, c.y + 2.f}, {c.x, c.y + 4.f}, color, 1.5f);
-        Text(L"Секреты", ui_.get(),
-             D2D1::RectF(g.secrets.left + 42, g.secrets.top, g.secrets.right - 8, g.secrets.bottom), color);
     }
 
     {  // the projects' label, and "+" for another one
@@ -7399,6 +7410,8 @@ std::wstring ChatWindow::TooltipText() {
         return L"Усилие: насколько глубоко Claude думает";
     case Target::UsageChip:
         return L"Лимиты использования";
+    case Target::Secrets:
+        return L"Секреты";
     case Target::SecretsClose:
         return L"Назад к чатам";
     case Target::SecretEye:
@@ -7650,6 +7663,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
             return g.termTabs[row];
         }
         break;
+    case Target::Secrets:
+        return g.secrets;
     case Target::SecretsClose:
         return g.panelClose;
     case Target::SecretEye:

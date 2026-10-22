@@ -106,9 +106,9 @@ body.terminal .term{display:flex}
  <div class="sp"></div>
  <div class="upd" id="updTop" style="display:none">Обновить клиент</div>
  <div class="hb" id="termBtn" title="Терминал (T)"><svg viewBox="0 0 16 16"><path d="M2 4l4.5 4L2 12M9 13h6"/></svg></div>
- <div class="win"><svg viewBox="0 0 16 16"><path d="M4 8h8"/></svg></div>
- <div class="win"><svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1"/></svg></div>
- <div class="win close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></div>
+ <div class="win" data-aic="minimize" title="Свернуть клиент"><svg viewBox="0 0 16 16"><path d="M4 8h8"/></svg></div>
+ <div class="win" data-aic="wide" title="Превью на всё окно / обратно"><svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1"/></svg></div>
+ <div class="win close" data-aic="close" title="Закрыть превью"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></div>
 </header>
 <div class="app">
  <aside id="side"></aside>
@@ -216,6 +216,13 @@ addEventListener('keydown', e => {
   if (e.key === 't' || e.key === 'е') { STATE.terminal = !STATE.terminal; apply(); }
   if (e.key === 'u' || e.key === 'г') { STATE.update = !STATE.update; apply(); }
 });
+// В превью AIControls кнопки окна управляют самим превью: × закрывает, □ — на всё окно и обратно, — сворачивает
+// клиент; клиент тогда убирает свои крестик, «+» и ⤢ над страницей.
+const host = window.chrome && window.chrome.webview;
+if (host) {
+  host.postMessage(JSON.stringify({aic: 'controls'}));
+  document.querySelectorAll('[data-aic]').forEach(b => b.onclick = () => host.postMessage(JSON.stringify({aic: b.dataset.aic})));
+}
 renderTitle(); renderFeed(); apply();
 $('#feed').scrollTop = 1e9;
 </script>

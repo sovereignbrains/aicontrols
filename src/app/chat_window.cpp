@@ -911,6 +911,8 @@ private:
     // The preview: an HTML file in a tab beside the shells (WebView2), loaded again whenever it or a file beside
     // it changes. Opens by itself when a tool writes such a file here.
     bool PreviewShown() const { return terminalOpen_ && Tab() != nullptr && !Tab()->preview.empty(); }
+    // A page with buttons of its own (the mockup): the row above it keeps only its tab's name.
+    bool PreviewOwnsControls() const { return PreviewShown() && previewControls_; }
     TermTab* PreviewTab() const;
     void OpenPreview(const std::wstring& path);
     void EnsureWebView();
@@ -918,7 +920,7 @@ private:
     void PlacePreview();
     void CheckPreview();
     void ShowPreviewMenu(size_t index, POINT screen);
-    void OnPreviewPick(const std::wstring& message);
+    void OnPreviewMessage(const std::wstring& message);
 
     // A newer AIControls built here: a button in the header installs it, restarts and opens this chat again.
     void CheckAppUpdate();
@@ -1158,6 +1160,7 @@ private:
     float wideSavedTerminal_ = kTerminal;  // the widths to go back to
     bool wideSavedSidebar_ = true;
     std::wstring webShown_;  // the file the preview has loaded
+    bool previewControls_ = false;  // ... draws its own close, widen and minimize and drives them ({"aic":"controls"})
     std::filesystem::file_time_type previewStamp_{};  // ... and the newest change in its folder then
     wil::com_ptr<IDWriteTextFormat> termFont_;
     wil::com_ptr<IDWriteTextFormat> termBold_;
@@ -2678,8 +2681,10 @@ Geometry ChatWindow::Layout() const {
             g.termTabs.push_back(D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + width, g.term.top + 36));
             tabLeft += width + 4;
         }
-        g.termAdd = D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + 28, g.term.top + 36);
-        if (PreviewShown() || previewWide_) {
+        if (!PreviewOwnsControls()) {
+            g.termAdd = D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + 28, g.term.top + 36);
+        }
+        if ((PreviewShown() || previewWide_) && !PreviewOwnsControls()) {
             g.termWide = D2D1::RectF(g.term.right - 12 - 28, g.term.top + 8, g.term.right - 12, g.term.top + 36);
         }
     }
@@ -2864,7 +2869,7 @@ Hit ChatWindow::HitTest(float x, float y) const {
             return {Target::PreviewWide};
         }
         for (size_t i = 0; i < g.termTabs.size(); ++i) {
-            if (Inside(TabCloseRect(g.termTabs[i]), x, y)) {
+            if (Inside(TabCloseRect(g.termTabs[i]), x, y) && !(PreviewOwnsControls() && i == activeTab_)) {
                 return {Target::TermTabClose, i};
             }
             if (Inside(g.termTabs[i], x, y)) {
@@ -4616,7 +4621,7 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         }
         Text(TabLabel(*tabs_[i]), ui_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 22, r.bottom),
              active ? kPrimary : kSecondary);
-        if (active || hovered) {
+        if ((active || hovered) && !(PreviewOwnsControls() && active)) {  // such a page closes itself
             const D2D1_RECT_F x = TabCloseRect(r);
             const D2D1_POINT_2F c{(x.left + x.right) / 2, (x.top + x.bottom) / 2};
             const uint32_t color = hover_.target == Target::TermTabClose && hover_.row == i ? kPrimary : kSecondary;
@@ -4624,7 +4629,7 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
             Line({c.x - 3.5f, c.y + 3.5f}, {c.x + 3.5f, c.y - 3.5f}, color, 1.3f);
         }
     }
-    {  // "+"
+    if (g.termAdd.right > g.termAdd.left) {  // "+"
         const bool active = hover_.target == Target::TermAdd;
         if (active) {
             Fill(g.termAdd, 6.f, kRaised);
@@ -6818,7 +6823,7 @@ void ChatWindow::EnsureWebView() {
                                                [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) {
                                                    wil::unique_cotaskmem_string message;
                                                    if (SUCCEEDED(args->TryGetWebMessageAsString(&message)) && message) {
-                                                       OnPreviewPick(message.get());
+                                                       OnPreviewMessage(message.get());
                                                    }
                                                    return S_OK;
                                                })
@@ -6855,6 +6860,7 @@ void ChatWindow::NavigatePreview() {
     url.resize(length);
     webView_->Navigate(url.c_str());
     webShown_ = tab->preview;
+    previewControls_ = false;  // until the new page says otherwise
     previewStamp_ = FolderStamp(tab->preview);
 }
 
@@ -6891,13 +6897,14 @@ void ChatWindow::CheckPreview() {
 
 void ChatWindow::ShowPreviewMenu(size_t index, POINT screen) {
     const std::wstring page = tabs_[index]->preview;
-    constexpr UINT kReload = 1, kBrowser = 2, kReveal = 3, kCopyPath = 4, kClose = 5;
+    constexpr UINT kReload = 1, kBrowser = 2, kReveal = 3, kCopyPath = 4, kClose = 5, kNew = 6;
     wil::unique_hmenu menu(CreatePopupMenu());
     AppendMenuW(menu.get(), MF_STRING, kReload, L"Обновить");
     AppendMenuW(menu.get(), MF_STRING, kBrowser, L"Открыть в браузере");
     AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
     AppendMenuW(menu.get(), MF_STRING, kCopyPath, L"Копировать путь");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый терминал");  // the row may have no "+" beside such a page
     AppendMenuW(menu.get(), MF_STRING, kClose, L"Закрыть");
     switch (Menu(menu.get(), screen)) {
     case kReload:
@@ -6917,6 +6924,11 @@ void ChatWindow::ShowPreviewMenu(size_t index, POINT screen) {
             Flash(L"Путь скопирован");
         }
         break;
+    case kNew:
+        AddTerminalTab();
+        SyncTerminalSize();
+        SelectTerminalTab(activeTab_);
+        break;
     case kClose:
         CloseTerminalTab(index);
         break;
@@ -6925,10 +6937,34 @@ void ChatWindow::ShowPreviewMenu(size_t index, POINT screen) {
     }
 }
 
-void ChatWindow::OnPreviewPick(const std::wstring& message) {
+// The page's messages: an element Ctrl+clicked in it, or one of its own buttons ({"aic": "controls" | "close" |
+// "wide" | "minimize"}).
+void ChatWindow::OnPreviewMessage(const std::wstring& message) {
     const Json pick = Json::parse(ToUtf8(message), nullptr, false);
     const TermTab* tab = PreviewTab();
     if (pick.is_discarded() || tab == nullptr) {
+        return;
+    }
+    if (const std::string command = JsonStr(pick, "aic"); !command.empty()) {
+        if (command == "controls") {
+            previewControls_ = true;
+            hover_ = {};
+            Refresh();
+        } else if (command == "close") {
+            for (size_t i = 0; i < tabs_.size(); ++i) {
+                if (tabs_[i].get() == tab) {
+                    CloseTerminalTab(i);
+                    break;
+                }
+            }
+            if (terminalOpen_) {
+                SelectTerminalTab(activeTab_);
+            }
+        } else if (command == "wide") {
+            SetPreviewWide(!previewWide_);
+        } else if (command == "minimize") {
+            ShowWindow(hwnd_, SW_MINIMIZE);
+        }
         return;
     }
     // "[mockup.html: div.card > button.edit «Изменить»] ": enough for the model to find it in the file.

@@ -83,6 +83,7 @@ int wmain(int argc, wchar_t** argv) {
                 std::cout << "[rate_limit_event] " << message.dump() << "\n";
             } else if (type == "result") {
                 exitCode = aic::JsonStr(message, "subtype") == "success" ? 0 : 1;
+                std::cout << "[usage] " << aic::JsonAt(message, "usage").dump() << "\n";
                 std::lock_guard lock(mutex);
                 finished = true;
                 done.notify_all();

@@ -39,6 +39,9 @@ struct Settings {
     // What runs without a card: "" asks before anything that changes something, "edits" writes files on this
     // computer unasked (commands and servers still ask), "all" asks nothing.
     std::string permissions;
+    // The claude.ai connectors (Notion, Drive, Calendar…) and other MCP servers in every chat: their tools'
+    // descriptions ride in every request (~140k tokens against ~7k without them, measured 22.10.2026), so off.
+    bool connectors = false;
     // The plan's limits as last reported (the CLI reports them only once a turn has run), so the ring
     // is not empty at start. Percent -1: never seen; resets are Unix seconds.
     int sessionPercent = -1;

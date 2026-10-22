@@ -27,6 +27,9 @@ struct ClaudeOptions {
     std::string appendSystemPrompt;  // added to the CLI's own system prompt; empty: nothing
     std::string settings;  // JSON for --settings, over the user's own settings; empty: none
     bool includePartial = true;  // stream_event deltas while a message is written
+    // The claude.ai connectors and the user's other MCP servers; off, only ours: their tools' descriptions
+    // would ride in every request.
+    bool connectors = false;
 };
 
 // claude.exe in stream-json mode (see PLAN.md, "Протокол"): one process per chat, serving

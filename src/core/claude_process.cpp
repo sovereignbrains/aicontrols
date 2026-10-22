@@ -131,6 +131,9 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     if (options.includePartial) {
         cmd += L" --include-partial-messages";
     }
+    if (!options.connectors) {
+        cmd += L" --strict-mcp-config";  // only ours; the claude.ai ones go with the variable below
+    }
     if (!options.appendSystemPrompt.empty()) {
         cmd += L" --append-system-prompt " + QuoteArg(ToWide(options.appendSystemPrompt));
     }
@@ -150,6 +153,9 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     // session_state_changed (running / requires_action / idle): the only reliable "is it still working",
     // since a message sent mid-turn is folded into the running turn and gets no result of its own.
     std::vector<std::pair<std::wstring, std::wstring>> overrides = {{L"CLAUDE_CODE_SDK_READS_SESSION_STATE", L"1"}};
+    if (!options.connectors) {
+        overrides.emplace_back(L"ENABLE_CLAUDEAI_MCP_SERVERS", L"false");
+    }
     if (!options.proxy.empty()) {
         overrides.insert(overrides.end(), {{L"HTTPS_PROXY", options.proxy},
                                            {L"HTTP_PROXY", options.proxy},

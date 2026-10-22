@@ -8261,6 +8261,7 @@ bool ChatWindow::StartClaude() {
     options.proxy = PickProxy();
     options.model = settings_.model;
     options.effort = settings_.effort;
+    options.connectors = settings_.connectors;
     options.resume = sessionId_;  // a chat from the history, a restart, a crash: the same conversation
     route_ = options.proxy.empty() ? L"напрямую" : L"через " + options.proxy.substr(options.proxy.rfind(L'/') + 1);
 

@@ -2615,11 +2615,12 @@ Geometry ChatWindow::Layout() const {
         g.sidebar = D2D1::RectF(0, kHeader, sidebarWidth, g.height);
         g.search = D2D1::RectF(10, kHeader + 10, sidebarWidth - 10, kHeader + 10 + kFieldHeight);
         g.newItem = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
-        g.secrets = D2D1::RectF(6, g.newItem.bottom + 2, sidebarWidth - 6, g.newItem.bottom + 2 + kNavRow);
+        // At the bottom, the settings' end: the secrets over the account.
         g.account = D2D1::RectF(6, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
-        g.addProject = D2D1::RectF(sidebarWidth - 10 - 24, g.secrets.bottom + 7, sidebarWidth - 10, g.secrets.bottom + 31);
-        g.listTop = g.secrets.bottom + 8 + 26;  // under the "projects" label
-        g.listBottom = g.account.top - 6;
+        g.secrets = D2D1::RectF(6, g.account.top - 2 - kNavRow, sidebarWidth - 6, g.account.top - 2);
+        g.addProject = D2D1::RectF(sidebarWidth - 10 - 24, g.newItem.bottom + 7, sidebarWidth - 10, g.newItem.bottom + 31);
+        g.listTop = g.newItem.bottom + 8 + 26;  // under the "projects" label
+        g.listBottom = g.secrets.top - 10;
     }
     if (termWidth > 0) {
         g.term = D2D1::RectF(g.area, kHeader, g.width, g.height);
@@ -2800,10 +2801,11 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 if (rows_[row].session != kHead) {
                     return {Target::HistoryRow, row};
                 }
-                // The general one has no "+" of its own: the top "new chat" is its.
-                const bool general = projects_[rows_[row].project].folder == DefaultWorkspace();
-                return !general && Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
-                                                                                     : Hit{Target::ProjectRow, row};
+                if (projects_[rows_[row].project].folder == DefaultWorkspace()) {
+                    return {};  // the general chats' label: no fold, no "+" (the top "new chat" is theirs)
+                }
+                return Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
+                                                                          : Hit{Target::ProjectRow, row};
             }
         }
         return {};
@@ -5550,7 +5552,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
     }
 
     {  // the account, at the bottom: who is signed in and the plan, or the way to sign in
-        Line({g.sidebar.left, g.account.top - 4.f}, {g.sidebar.right, g.account.top - 4.f}, kLine, 1.f);
+        Line({g.sidebar.left, g.secrets.top - 4.f}, {g.sidebar.right, g.secrets.top - 4.f}, kLine, 1.f);
         const bool hovered = hover_.target == Target::Account;
         if (hovered) {
             Fill(g.account, 8.f, kRaised);
@@ -5604,7 +5606,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
 
     {  // the projects' label, and "+" for another one
         Text(L"Проекты", ui_.get(),
-             D2D1::RectF(g.sidebar.left + 16, g.secrets.bottom + 8, g.addProject.left - 4, g.secrets.bottom + 8 + 22),
+             D2D1::RectF(g.sidebar.left + 16, g.newItem.bottom + 8, g.addProject.left - 4, g.newItem.bottom + 8 + 22),
              kSecondary);
         const bool active = hover_.target == Target::AddProject;
         if (active) {
@@ -5628,6 +5630,11 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         const bool hovered = (hover_.target == Target::HistoryRow || hover_.target == Target::ProjectRow ||
                               hover_.target == Target::ProjectNew) &&
                              hover_.row == row;
+        if (rows_[row].session == kHead && project.folder == DefaultWorkspace()) {
+            // The general chats, under the projects: a section of their own, labelled as "projects" is.
+            Text(L"Общие чаты", ui_.get(), D2D1::RectF(g.sidebar.left + 16, r.top + 8, r.right - 10, r.bottom), kSecondary);
+            continue;
+        }
         if (rows_[row].session == kHead) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
             // chat in it under the pointer, else how many chats it has.
@@ -5658,7 +5665,9 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             }
             continue;
         }
-        const D2D1_RECT_F chat = D2D1::RectF(r.left + kProjectIndent, r.top, r.right, r.bottom);
+        // A project's chats stand in under its head; the general ones are a section of their own.
+        const float indent = project.folder == DefaultWorkspace() ? 0.f : kProjectIndent;
+        const D2D1_RECT_F chat = D2D1::RectF(r.left + indent, r.top, r.right, r.bottom);
         if (rows_[row].session == kDraft) {  // the new chat that is open: lit, in its project
             Fill(chat, 8.f, kRaised);
             Text(L"Новый чат", ui_.get(), D2D1::RectF(chat.left + 10, chat.top, chat.right - 8, chat.bottom), kAccent);
@@ -6051,16 +6060,20 @@ void ChatWindow::FocusSearch() {
 void ChatWindow::RefreshSessions() {
     const size_t first = firstRow_;
     const size_t selected = selected_;
-    std::vector<std::wstring> folders{DefaultWorkspace()};
+    // The projects first, then the general chats (as in Claude's app: the projects, then the recent chats).
+    const std::wstring general = DefaultWorkspace();
+    std::vector<std::wstring> folders;
     for (const std::wstring& folder : settings_.projects) {
         std::error_code error;
-        if (std::ranges::find(folders, folder) == folders.end() && std::filesystem::is_directory(folder, error)) {
+        if (folder != general && std::ranges::find(folders, folder) == folders.end() &&
+            std::filesystem::is_directory(folder, error)) {
             folders.push_back(folder);
         }
     }
-    if (std::ranges::find(folders, workspace_) == folders.end()) {
+    if (workspace_ != general && std::ranges::find(folders, workspace_) == folders.end()) {
         folders.push_back(workspace_);
     }
+    folders.push_back(general);
     projects_.clear();
     for (const std::wstring& folder : folders) {
         projects_.push_back({folder, ProjectName(folder), ListSessions(folder)});
@@ -7933,8 +7946,8 @@ void ChatWindow::FilterSessions() {
         if (!query.empty() && !named && chats.empty()) {
             continue;
         }
-        rows_.push_back({p, kHead});
-        if (query.empty() && ProjectFolded(project.folder)) {
+        rows_.push_back({p, kHead});  // the general chats': their section's label, never folded
+        if (query.empty() && project.folder != DefaultWorkspace() && ProjectFolded(project.folder)) {
             continue;
         }
         // The open chat, new: first under its project (a new chat unfolds it), it says where the chat is.

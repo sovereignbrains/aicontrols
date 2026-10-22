@@ -372,10 +372,17 @@ std::wstring LowerExtension(const std::wstring& path) {
     return extension;
 }
 
-// A page the preview shows (and opens by itself when a tool writes one).
-bool IsPreviewable(const std::wstring& path) {
+// A page: it opens in the preview by itself when a tool writes one, and "open" sends it to the browser.
+bool IsPage(const std::wstring& path) {
     const std::wstring extension = LowerExtension(path);
     return extension == L".html" || extension == L".htm" || extension == L".svg";
+}
+
+// What the preview shows: a page, a picture (a screenshot a probe took) or a PDF; the WebView draws them itself.
+bool IsPreviewable(const std::wstring& path) {
+    const std::wstring extension = LowerExtension(path);
+    return IsPage(path) || extension == L".png" || extension == L".jpg" || extension == L".jpeg" ||
+           extension == L".gif" || extension == L".webp" || extension == L".bmp" || extension == L".pdf";
 }
 
 // The newest change to a page and the web files beside it (its CSS, scripts, pictures; not subfolders).
@@ -6679,7 +6686,7 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
         if (IsPreviewable(link->url)) {
             AppendMenuW(menu.get(), MF_STRING, kPreview, L"Превью");
         }
-        AppendMenuW(menu.get(), MF_STRING, kOpenLink, IsPreviewable(link->url) ? L"Открыть в браузере" : L"Открыть");
+        AppendMenuW(menu.get(), MF_STRING, kOpenLink, IsPage(link->url) ? L"Открыть в браузере" : L"Открыть");
         AppendMenuW(menu.get(), MF_STRING, kReveal, L"Показать в папке");
         AppendMenuW(menu.get(), MF_STRING, kCopyLink, L"Копировать путь");
     } else if (link != nullptr && !link->url.empty()) {
@@ -8720,7 +8727,7 @@ void ChatWindow::OnToolResult(const Json& block) {
         item.outputError = JsonAt(block, "is_error").is_boolean() && JsonAt(block, "is_error").get<bool>();
         item.done = true;
         item.layout.reset();
-        if (HasFileActions(item) && IsPreviewable(WrittenFile(item, workspace_))) {
+        if (HasFileActions(item) && IsPage(WrittenFile(item, workspace_))) {
             OpenPreview(WrittenFile(item, workspace_));  // a page just written: shown at once, as it changes
         }
         return;
@@ -8844,6 +8851,7 @@ void ChatWindow::FillGallery() {
          Json{{"path", "C:\\Users\\user\\notes.txt"}, {"old_string", "было\nстарое"}, {"new_string", "стало\nновое\nи ещё"}},
          Verdict::Pending, false, L"", false);
     card("read_file", Json{{"path", ToUtf8(longPath)}}, Verdict::Allowed, true, L"содержимое файла\nвторая строка", false);
+    Add(Kind::Assistant, L"Скриншот: `C:\\Users\\user\\gallery1.png` и PDF `C:\\Users\\user\\a.pdf`, страница `C:\\Users\\user\\a.html`.");
     Add(Kind::Assistant, L"Финальный короткий ответ.");
     stick_ = true;
     Refresh();

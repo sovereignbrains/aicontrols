@@ -98,6 +98,26 @@ body.terminal .term{display:flex}
 .term .tabs{height:40px;display:flex;align-items:center;padding:0 8px;gap:6px;color:var(--title);font-size:13px}
 .term .tab{background:var(--raised);padding:5px 12px;border-radius:8px}
 .term .scr{flex:1;padding:8px 12px;font:12.5px/18px var(--mono);color:#d4d4d8}
+
+/* фон чата: варианты на выбор (B или кнопки справа вверху); всё это D2D умеет — заливки, градиенты, плитка, картинка */
+main{background:var(--window)}
+main::before{content:"";position:absolute;inset:0;pointer-events:none;z-index:0}
+main>*{position:relative;z-index:1}
+body.bg1 main{background:#0e0e0f}
+body.bg2 main{background:linear-gradient(180deg,#17171a 0%,#0e0e0f 55%)}
+body.bg3 main{background:radial-gradient(ellipse 80% 55% at 50% -8%,rgba(76,146,255,.16),transparent 70%),#0d0e11}
+body.bg4 main{background:radial-gradient(ellipse 60% 50% at 0% 100%,rgba(76,146,255,.12),transparent 70%),radial-gradient(ellipse 55% 45% at 100% 0%,rgba(150,96,255,.12),transparent 70%),#0d0d10}
+body.bg5 main{background:radial-gradient(rgba(255,255,255,.07) 1px,transparent 1.2px) 0 0/22px 22px,#0e0e0f}
+body.bg6 main{background:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px) 0 0/40px 40px,linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px) 0 0/40px 40px,#0e0e0f}
+body.bg7 main{background:radial-gradient(ellipse 70% 50% at 50% 110%,rgba(255,170,80,.10),transparent 70%),#110f0e}
+body.bg8 main{background:#0e0e0f}
+body.bg8 main::before{opacity:.09;background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+body.bg9 main{background:#0e0e0f}
+body.bg9 main::before{background:url("../assets/mascot.png") center 40%/300px no-repeat;opacity:.05;filter:grayscale(.3)}
+.bgpick{position:absolute;top:calc(var(--header) + 8px);right:12px;z-index:4;display:flex;gap:6px;align-items:center;background:rgba(24,24,26,.85);border:1px solid var(--line);border-radius:999px;padding:4px 10px 4px 6px;font-size:12px;color:var(--secondary)}
+.bgpick i{width:18px;height:18px;border-radius:50%;border:1px solid var(--line);cursor:pointer;display:block}
+.bgpick i.on{outline:2px solid var(--accent);outline-offset:1px}
+.bgpick span{margin-left:4px;min-width:120px}
 </style></head><body>
 <header>
  <div class="hb" id="sideToggle" title="Боковая панель (S)"><svg viewBox="0 0 16 16"><rect x="0" y="1.5" width="16" height="13" rx="2.5"/><path d="M5 1.5v13"/></svg></div>
@@ -113,6 +133,7 @@ body.terminal .term{display:flex}
 <div class="app">
  <aside id="side"></aside>
  <main>
+  <div class="bgpick" id="bgpick"></div>
   <div class="feed" id="feed"><div class="col" id="col"></div></div>
   <div class="dock">
    <img class="mascot" src="../assets/mascot.png" alt="">
@@ -130,6 +151,7 @@ body.terminal .term{display:flex}
 /* ---- Всё, что можно менять точечно: состояние окна и содержимое ленты ---- */
 const STATE = {
   sidebar: true, terminal: false, update: false,  // обновление есть не всегда: U включает
+  bg: 1,  // фон чата: номер из BGS (B — следующий)
   project: 'aicontrols', chat: 'го баги отображения в чате фиксить/дорабатывать, ты выводишь фейк хуйню…',
   permission: 'Авто', model: 'Auto · Sonnet 5.5', effort: 'Auto',
 };
@@ -195,7 +217,18 @@ function renderFeed(){
     }
   }).join('');
 }
+const BGS = ['Сейчас: сплошной', 'Графит сверху', 'Синее свечение', 'Аврора', 'Точки', 'Сетка', 'Тёплый снизу', 'Зерно', 'Маскот'];
+function renderBg(){
+  for (let i = 1; i <= BGS.length; i++) document.body.classList.toggle('bg' + i, STATE.bg === i);
+  $('#bgpick').innerHTML = BGS.map((n, i) => `<i class="${STATE.bg === i + 1 ? 'on' : ''}" data-bg="${i + 1}" title="${i + 1}. ${n}" style="background:${BG_SWATCH[i]}"></i>`).join('')
+    + `<span>${STATE.bg}. ${BGS[STATE.bg - 1]}</span>`;
+}
+const BG_SWATCH = ['#0e0e0f', 'linear-gradient(#202024,#0e0e0f)', 'radial-gradient(circle at 50% 0,#2b4f8a,#0d0e11 70%)',
+  'linear-gradient(135deg,#3a2a66,#0d0d10 50%,#1d3a66)', 'radial-gradient(#666 1px,#0e0e0f 1.5px) 0 0/6px 6px',
+  'linear-gradient(#333 1px,transparent 1px) 0 0/6px 6px,#0e0e0f', 'radial-gradient(circle at 50% 100%,#6a4520,#110f0e 70%)',
+  '#1a1a1c', 'url(../assets/mascot.png) center/14px no-repeat,#0e0e0f'];
 function apply(){
+  renderBg();
   document.body.classList.toggle('nosidebar', !STATE.sidebar);
   document.body.classList.toggle('terminal', STATE.terminal);
   $('#termBtn').classList.toggle('on', STATE.terminal);
@@ -204,10 +237,13 @@ function apply(){
   renderSide();
   $('#perm').textContent = STATE.permission; $('#model').textContent = STATE.model; $('#effort').textContent = STATE.effort;
   const q = new URLSearchParams(); q.set('sidebar', +STATE.sidebar); q.set('terminal', +STATE.terminal); q.set('update', +STATE.update);
+  q.set('bg', STATE.bg);
   history.replaceState(null, '', '?' + q);
 }
 const q = new URLSearchParams(location.search);
 for (const k of ['sidebar','terminal','update']) if (q.has(k)) STATE[k] = q.get(k) === '1';
+if (+q.get('bg') >= 1 && +q.get('bg') <= BGS.length) STATE.bg = +q.get('bg');
+$('#bgpick').onclick = e => { if (e.target.dataset.bg) { STATE.bg = +e.target.dataset.bg; apply(); } };
 $('#sideToggle').onclick = () => { STATE.sidebar = !STATE.sidebar; apply(); };
 $('#termBtn').onclick = () => { STATE.terminal = !STATE.terminal; apply(); };
 addEventListener('keydown', e => {
@@ -215,6 +251,7 @@ addEventListener('keydown', e => {
   if (e.key === 's' || e.key === 'ы') { STATE.sidebar = !STATE.sidebar; apply(); }
   if (e.key === 't' || e.key === 'е') { STATE.terminal = !STATE.terminal; apply(); }
   if (e.key === 'u' || e.key === 'г') { STATE.update = !STATE.update; apply(); }
+  if (e.key === 'b' || e.key === 'и') { STATE.bg = STATE.bg % BGS.length + 1; apply(); }
 });
 // В превью AIControls кнопки окна управляют самим превью: × закрывает, □ — на всё окно и обратно, — сворачивает
 // клиент; клиент тогда убирает свои крестик, «+» и ⤢ над страницей.

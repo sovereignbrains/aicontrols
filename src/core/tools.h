@@ -30,6 +30,9 @@ std::string OwnToolName(const std::string& fullName);
 // Reading and listing run without asking; commands and writes wait for the user.
 // Anything aimed at a server (`on`) waits too.
 bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object());
+// The "Auto" permission mode: file edits here and commands that look harmless go without asking; deleting,
+// installing, the network, secrets, the system and anything aimed at a server still wait for the user.
+bool AutoAllows(const std::string& name, const Json& input);
 ToolSummary SummarizeTool(const std::string& name, const Json& input);
 
 // The five tools: run_command, read_file, write_file, edit_file, list_directory.

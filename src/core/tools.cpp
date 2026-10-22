@@ -523,6 +523,62 @@ bool ToolNeedsApproval(const std::string& name, const Json& input) {
 
 namespace {
 
+bool IsWordChar(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
+bool HasWord(const std::string& text, const std::string& word) {
+    for (size_t at = text.find(word); at != std::string::npos; at = text.find(word, at + 1)) {
+        const bool before = at == 0 || !IsWordChar(text[at - 1]);
+        const bool after = at + word.size() >= text.size() || !IsWordChar(text[at + word.size()]);
+        if (before && after) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A command that deletes, installs, reaches the network, another machine or the system: Auto asks about it.
+bool RiskyCommand(std::string command) {
+    std::ranges::transform(command, command.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static constexpr std::array kWords = {
+        "rm", "rmdir", "rd", "del", "erase", "ri", "remove-item", "format", "diskpart", "shutdown", "restart-computer",
+        "stop-process", "kill", "taskkill", "curl", "wget", "iwr", "irm", "invoke-webrequest", "invoke-restmethod",
+        "iex", "invoke-expression", "ssh", "scp", "sftp", "reg", "sc", "net", "schtasks", "setx", "winget", "choco",
+        "msiexec", "set-executionpolicy", "set-itemproperty", "new-itemproperty", "remove-itemproperty",
+        "start-process", "runas", "cipher", "icacls", "takeown", "bcdedit", "sudo", "--force", "-force", "-recurse",
+        "/s", "/f"};
+    static constexpr std::array kPhrases = {"git push", "git reset", "git clean", "git rebase", "git checkout --",
+                                            "git branch -d", "git stash drop", "npm publish", "npm install", "npm i ",
+                                            "pip install", "pip uninstall", "cargo install", "vcpkg install"};
+    for (const char* word : kWords) {
+        if (HasWord(command, word)) {
+            return true;
+        }
+    }
+    return std::ranges::any_of(kPhrases, [&](const char* phrase) { return command.find(phrase) != std::string::npos; });
+}
+
+}  // namespace
+
+bool AutoAllows(const std::string& name, const Json& input) {
+    if (!StringArg(input, "on").empty()) {
+        return false;
+    }
+    if (name == "write_file" || name == "edit_file") {
+        return true;
+    }
+    if (name != "run_command") {
+        return false;
+    }
+    const Json& secrets = JsonAt(input, "env_secrets");
+    const std::string command = StringArg(input, "command");
+    return !(secrets.is_array() && !secrets.empty()) && command.find("{{secret:") == std::string::npos &&
+           !RiskyCommand(command);
+}
+
+namespace {
+
 ToolSummary SummarizeHere(const std::string& name, const Json& input) {
     const std::wstring path = ToWide(StringArg(input, "path"));
     if (name == "run_command") {

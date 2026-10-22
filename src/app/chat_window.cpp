@@ -5492,6 +5492,12 @@ std::wstring ChatWindow::PermissionName() const {
     if (settings_.permissions == "all") {
         return L"Без вопросов";
     }
+    if (settings_.permissions == "auto") {
+        return L"Авто";
+    }
+    if (settings_.permissions == "plan") {
+        return L"План";
+    }
     return settings_.permissions == "edits" ? L"Файлы без вопросов" : L"Спрашивать";
 }
 
@@ -5500,15 +5506,21 @@ bool ChatWindow::AllowedUnasked(const std::string& tool, const Json& input) cons
     if (settings_.permissions == "all") {
         return true;
     }
+    if (settings_.permissions == "auto") {
+        return AutoAllows(tool, input);
+    }
     return settings_.permissions == "edits" && (tool == "write_file" || tool == "edit_file") &&
            JsonStr(input, "on").empty();
 }
 
 void ChatWindow::ShowPermissionMenu() {
-    constexpr std::array<const char*, 3> kModes = {"", "edits", "all"};
-    constexpr std::array<const wchar_t*, 3> kLabels = {L"Спрашивать\tперед любым изменением",
-                                                       L"Файлы без вопросов\tправки сами, команды спрашивает",
-                                                       L"Без вопросов\tвсё сразу, без подтверждений"};
+    constexpr std::array<const char*, 5> kModes = {"", "edits", "auto", "plan", "all"};
+    constexpr std::array<const wchar_t*, 5> kLabels = {
+        L"Спрашивать\tперед любым изменением",
+        L"Файлы без вопросов\tправки сами, команды спрашивает",
+        L"Авто\tбезобидное сам, удаление, сеть и серверы спрашивает",
+        L"План\tничего не меняет, только читает и предлагает план",
+        L"Без вопросов\tвсё сразу, без подтверждений"};
     wil::unique_hmenu menu(CreatePopupMenu());
     for (size_t i = 0; i < kModes.size(); ++i) {
         AppendMenuW(menu.get(), MF_STRING | (settings_.permissions == kModes[i] ? MF_CHECKED : 0),
@@ -8613,6 +8625,14 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
         return;
     }
     ToolSummary summary = SummarizeTool(name, input);
+    if (settings_.permissions == "plan" && name != "read_file" && name != "list_directory") {
+        Add(Kind::Notice, L"План: не выполнено — " + summary.title + L": " + summary.detail);
+        claude_.Respond(requestId, Json{{"behavior", "deny"},
+                                        {"message", "Plan mode is on: nothing may be changed or run. Read what you "
+                                                    "need, then give the user a plan; they will switch the mode to "
+                                                    "carry it out."}});
+        return;
+    }
     if (!ToolNeedsApproval(name, input)) {
         Add(Kind::Notice, summary.title + L": " + summary.detail);
         claude_.Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});

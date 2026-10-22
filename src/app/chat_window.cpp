@@ -2790,8 +2790,10 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 if (rows_[row].session != kHead) {
                     return {Target::HistoryRow, row};
                 }
-                return Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
-                                                                          : Hit{Target::ProjectRow, row};
+                // The general one has no "+" of its own: the top "new chat" is its.
+                const bool general = projects_[rows_[row].project].folder == DefaultWorkspace();
+                return !general && Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
+                                                                                     : Hit{Target::ProjectRow, row};
             }
         }
         return {};
@@ -5634,7 +5636,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             const D2D1_RECT_F plus = ProjectNewRect(r);
             Text(project.name, uiBold_.get(), D2D1::RectF(r.left + 28, r.top, plus.left - 4, r.bottom),
                  project.folder == workspace_ ? kPrimary : kSecondary);
-            if (hovered) {
+            if (hovered && project.folder != DefaultWorkspace()) {  // the general one's "+" is the top "new chat"
                 const bool on = hover_.target == Target::ProjectNew;
                 if (on) {
                     Fill(plus, 6.f, kLine);
@@ -5743,13 +5745,16 @@ void ChatWindow::ShowProjectMenu(size_t row, POINT screen) {
         return;
     }
     const std::wstring folder = project->folder;
+    const bool general = folder == DefaultWorkspace();
     constexpr UINT kNew = 1, kFold = 2, kOpen = 3, kRemove = 4;
     wil::unique_hmenu menu(CreatePopupMenu());
-    AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат в проекте");
+    if (!general) {  // the general one's is the top "new chat"
+        AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат в проекте");
+    }
     AppendMenuW(menu.get(), MF_STRING | (searchText_.empty() ? 0 : MF_GRAYED), kFold,
                 ProjectFolded(folder) ? L"Развернуть" : L"Свернуть");
     AppendMenuW(menu.get(), MF_STRING, kOpen, L"Открыть папку");
-    if (folder != DefaultWorkspace()) {
+    if (!general) {
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, kRemove, L"Убрать из списка");
     }
@@ -7286,7 +7291,7 @@ std::wstring ChatWindow::TooltipText() {
     case Target::AddProject:
         return L"Добавить проект: папку на этом компьютере или репозиторий GitHub";
     case Target::NewChat:
-        return L"Новый чат в «Общем» (Ctrl+N). Чат в проекте — «+» в строке проекта";
+        return L"Новый чат (Ctrl+N)";
     case Target::None: {  // a link: where it goes
         std::wstring url = LinkAt(Layout(), mouse_.x, mouse_.y);
         if (url.size() > 140) {

@@ -87,6 +87,22 @@ int main() {
     Expect(!r.isError && Has(r.text, "sub/") && Has(r.text, "crlf.txt"), "list_directory", r.text);
     r = run("read_file", {{"path", "nope.txt"}});
     Expect(r.isError, "read_file of a missing file");
+    {  // a long file comes in windows of lines, each saying where to read on
+        std::ofstream longFile(dir / "long.txt", std::ios::binary);
+        for (int i = 1; i <= 2500; ++i) {
+            longFile << "line " << i << "\n";
+        }
+    }
+    r = run("read_file", {{"path", "long.txt"}});
+    Expect(!r.isError && r.text.starts_with("line 1\n") && Has(r.text, "line 2000\n") && !Has(r.text, "line 2001\n") &&
+               Has(r.text, "lines 1–2000 of 2500 shown; read on with offset=2001"),
+           "read_file: the first 2000 lines", r.text.substr(r.text.size() > 120 ? r.text.size() - 120 : 0));
+    r = run("read_file", {{"path", "long.txt"}, {"offset", 2499}});
+    Expect(!r.isError && r.text == "line 2499\nline 2500\n", "read_file: offset to the end", r.text);
+    r = run("read_file", {{"path", "long.txt"}, {"offset", 10}, {"limit", 2}});
+    Expect(r.text == "line 10\nline 11\n… [lines 10–11 of 2500 shown; read on with offset=12]", "read_file: limit", r.text);
+    r = run("read_file", {{"path", "long.txt"}, {"offset", 9999}});
+    Expect(r.isError && Has(r.text, "2500 lines"), "read_file: offset past the end", r.text);
 
     // Commands.
     r = run("run_command", {{"command", "Write-Output 'привет'"}});

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -22,9 +23,13 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr size_t kReadLimit = 400'000;      // bytes of a file handed to the model
-constexpr size_t kOutputKeepHead = 20'000;  // a long command output keeps its start ...
-constexpr size_t kOutputKeepTail = 80'000;  // ... and, more of it, its end
+// What a call hands the model stays in the chat and is read again by every later turn: kept small, the
+// rest reachable (a file read on with offset; 22.10.2026, the limits).
+constexpr size_t kReadLimit = 400'000;      // bytes fetched from a server at most
+constexpr size_t kReadLines = 2'000;        // lines of a file per read ...
+constexpr size_t kReadBytes = 60'000;       // ... and bytes
+constexpr size_t kOutputKeepHead = 6'000;   // a long command output keeps its start ...
+constexpr size_t kOutputKeepTail = 24'000;  // ... and, more of it, its end
 constexpr size_t kOutputHardCap = 16u << 20;
 constexpr size_t kListLimit = 500;
 constexpr int kDefaultTimeout = 120;
@@ -145,6 +150,48 @@ std::string Shorten(std::string text) {
     const size_t cut = text.size() - kOutputKeepHead - kOutputKeepTail;
     return text.substr(0, kOutputKeepHead) + std::format("\n… [{} bytes cut from the middle] …\n", cut) +
            text.substr(text.size() - kOutputKeepTail);
+}
+
+// offset (the first line, from 1) and limit (lines) of a read; 0: not given.
+size_t LineArg(const Json& input, const char* key) {
+    const Json& value = JsonAt(input, key);
+    return value.is_number_integer() && value.get<long long>() > 0 ? static_cast<size_t>(value.get<long long>()) : 0;
+}
+
+// Lines of a file from `first` (1-based; `text` starts there), at most `limit` of them and kReadBytes; a note
+// says where to read on when something is left. `total`: the file's lines, 0 when unknown.
+std::string LineWindow(std::string_view text, size_t first, size_t limit, size_t total) {
+    limit = limit == 0 ? kReadLines : limit;
+    size_t end = 0;
+    size_t lines = 0;
+    while (end < text.size() && lines < limit) {
+        const size_t newline = text.find('\n', end);
+        const size_t next = newline == std::string_view::npos ? text.size() : newline + 1;
+        if (next > kReadBytes) {
+            if (lines == 0) {  // one line longer than the whole budget: its start
+                end = kReadBytes;
+                lines = 1;
+            }
+            break;
+        }
+        end = next;
+        ++lines;
+    }
+    std::string out(text.substr(0, end));
+    if (end < text.size()) {
+        const size_t last = first + lines - 1;
+        if (!out.ends_with('\n')) {
+            out += '\n';
+        }
+        out += total > 0 ? std::format("… [lines {}–{} of {} shown; read on with offset={}]", first, last, total, last + 1)
+                         : std::format("… [lines {}–{} shown; read on with offset={}]", first, last, last + 1);
+    }
+    return out;
+}
+
+size_t LineCount(std::string_view text) {
+    const size_t count = static_cast<size_t>(std::ranges::count(text, '\n'));
+    return text.empty() || text.ends_with('\n') ? count : count + 1;
 }
 
 std::string Truncated(const std::string& text, size_t limit) {
@@ -574,8 +621,15 @@ Json Tools::Definitions() const {
                         {"description", "Names of stored secrets to pass as environment variables"}}}},
                      Json::array({"command"}))}},
         Json{{"name", "read_file"},
-             {"description", "Read a text file on this computer (up to 400 KB)."},
-             {"inputSchema", Schema({{"on", on}, {"path", str}}, Json::array({"path"}))}},
+             {"description",
+              "Read a text file on this computer: up to 2000 lines or 60 KB at a time; read on with offset. "
+              "For a big file, read the part you need (offset/limit), not all of it."},
+             {"inputSchema",
+              Schema({{"on", on},
+                      {"path", str},
+                      {"offset", {{"type", "integer"}, {"minimum", 1}, {"description", "First line to read, from 1"}}},
+                      {"limit", {{"type", "integer"}, {"minimum", 1}, {"description", "How many lines (default 2000)"}}}},
+                     Json::array({"path"}))}},
         Json{{"name", "write_file"},
              {"description", "Create or overwrite a text file (UTF-8). Missing folders are created."},
              {"inputSchema",
@@ -705,17 +759,29 @@ ToolResult Tools::ExecuteOn(const std::string& on, const std::string& name, cons
         if (path.empty()) {
             return Error("path is required");
         }
-        const ProcessResult run = RunSsh(*target,
-                                         "f=" + ShPath(path) +
-                                             "\nif [ -d \"$f\" ]; then echo \"Is a folder; use list_directory: $f\"; exit 2; fi\n"
-                                             "head -c " + std::to_string(kReadLimit + 1) + " -- \"$f\"\n",
-                                         {}, 60, cancel);
-        std::string text = run.output;
-        if (text.size() > kReadLimit) {
-            text.resize(kReadLimit);
-            text += std::format("\n... [the file is longer; the first {} bytes shown]", kReadLimit);
+        // The file's line count first, then the window from offset: the rest never crosses the wire.
+        const size_t first = std::max<size_t>(LineArg(input, "offset"), 1);
+        const size_t limit = LineArg(input, "limit");
+        const ProcessResult run = RunSsh(
+            *target,
+            "f=" + ShPath(path) +
+                "\nif [ -d \"$f\" ]; then echo \"Is a folder; use list_directory: $f\"; exit 2; fi\n"
+                "[ -r \"$f\" ] || { echo \"Cannot read: $f\"; exit 1; }\n"
+                "awk 'END { print NR }' \"$f\"\n"
+                "tail -n +" + std::to_string(first) + " -- \"$f\" | head -n " +
+                std::to_string((limit == 0 ? kReadLines : limit) + 1) + " | head -c " + std::to_string(kReadLimit) + "\n",
+            {}, 60, cancel);
+        if (run.end != End::Exited || run.code != 0) {
+            return report(run, run.output);
         }
-        return report(run, std::move(text));
+        const size_t newline = run.output.find('\n');
+        size_t total = 0;
+        if (newline != std::string::npos) {
+            std::from_chars(run.output.data(), run.output.data() + newline, total);
+        }
+        const std::string_view body =
+            newline == std::string::npos ? std::string_view() : std::string_view(run.output).substr(newline + 1);
+        return report(run, LineWindow(body, first, limit, total));
     }
     if (name == "write_file") {
         if (path.empty() || !JsonAt(input, "content").is_string()) {
@@ -773,12 +839,17 @@ ToolResult Tools::ReadFile(const Json& input) const {
     } else if (bytes.starts_with("\xEF\xBB\xBF")) {
         bytes.erase(0, 3);
     }
-    if (bytes.size() > kReadLimit) {
-        const size_t total = bytes.size();
-        bytes.resize(kReadLimit);
-        bytes += std::format("\n… [file is {} bytes; the first {} shown]", total, kReadLimit);
+    const size_t first = std::max<size_t>(LineArg(input, "offset"), 1);
+    size_t start = 0;
+    for (size_t line = 1; line < first && start < bytes.size(); ++line) {
+        const size_t newline = bytes.find('\n', start);
+        start = newline == std::string::npos ? bytes.size() : newline + 1;
     }
-    return ToolResult{std::move(bytes), false};
+    const size_t total = LineCount(bytes);
+    if (start >= bytes.size() && first > 1) {
+        return Error(std::format("The file has {} lines; offset {} is past its end", total, first));
+    }
+    return ToolResult{LineWindow(std::string_view(bytes).substr(start), first, LineArg(input, "limit"), total), false};
 }
 
 ToolResult Tools::WriteFile(const Json& input) const {

@@ -103,17 +103,23 @@ body.terminal .term{display:flex}
 main{background:var(--window)}
 main::before{content:"";position:absolute;inset:0;pointer-events:none;z-index:0}
 main>*{position:relative;z-index:1}
+/* зерно поверх любого градиента: без него на тёмном видны ступеньки; в клиенте — плитка 128×128 с шумом */
+body[class*=bg] main::before{opacity:.05;background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='128' height='128'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 1 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+body.bg1 main::before{display:none}
 body.bg1 main{background:#0e0e0f}
-body.bg2 main{background:linear-gradient(180deg,#17171a 0%,#0e0e0f 55%)}
-body.bg3 main{background:radial-gradient(ellipse 80% 55% at 50% -8%,rgba(76,146,255,.16),transparent 70%),#0d0e11}
-body.bg4 main{background:radial-gradient(ellipse 60% 50% at 0% 100%,rgba(76,146,255,.12),transparent 70%),radial-gradient(ellipse 55% 45% at 100% 0%,rgba(150,96,255,.12),transparent 70%),#0d0d10}
-body.bg5 main{background:radial-gradient(rgba(255,255,255,.07) 1px,transparent 1.2px) 0 0/22px 22px,#0e0e0f}
-body.bg6 main{background:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px) 0 0/40px 40px,linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px) 0 0/40px 40px,#0e0e0f}
-body.bg7 main{background:radial-gradient(ellipse 70% 50% at 50% 110%,rgba(255,170,80,.10),transparent 70%),#110f0e}
-body.bg8 main{background:#0e0e0f}
-body.bg8 main::before{opacity:.09;background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
-body.bg9 main{background:#0e0e0f}
-body.bg9 main::before{background:url("../assets/mascot.png") center 40%/300px no-repeat;opacity:.05;filter:grayscale(.3)}
+/* 2. Глубина: середина чуть приподнята, к краям уходит в темноту — взгляд в колонку */
+body.bg2 main{background:radial-gradient(ellipse 75% 85% at 50% 45%,#151517 0%,#0f0f10 55%,#0a0a0b 100%)}
+/* 3. Свет сверху: нейтральный, не синий, широкий и слабый, как лампа над столом */
+body.bg3 main{background:radial-gradient(ellipse 90% 60% at 50% -15%,rgba(255,255,255,.075),transparent 65%),#0d0d0e}
+/* 4. Сумерки: холодный чёрный, от глубокого синего сверху к нейтральному внизу */
+body.bg4 main{background:linear-gradient(180deg,#10131a 0%,#0d0e12 45%,#0c0c0d 100%)}
+/* 5. Туман: три размытых пятна (синий, фиолетовый, бирюзовый) на пределе заметности */
+body.bg5 main{background:
+  radial-gradient(ellipse 50% 40% at 15% 20%,rgba(76,146,255,.07),transparent 70%),
+  radial-gradient(ellipse 45% 40% at 85% 35%,rgba(140,100,255,.06),transparent 70%),
+  radial-gradient(ellipse 60% 45% at 55% 95%,rgba(60,200,190,.045),transparent 70%),#0d0d0f}
+/* 6. Горизонт: тонкая светлая полоса у поля ввода, выше — темнота */
+body.bg6 main{background:radial-gradient(ellipse 65% 28% at 50% 100%,rgba(76,146,255,.10),transparent 75%),linear-gradient(180deg,#0b0b0c,#0f0f11)}
 .bgpick{position:absolute;top:calc(var(--header) + 8px);right:12px;z-index:4;display:flex;gap:6px;align-items:center;background:rgba(24,24,26,.85);border:1px solid var(--line);border-radius:999px;padding:4px 10px 4px 6px;font-size:12px;color:var(--secondary)}
 .bgpick i{width:18px;height:18px;border-radius:50%;border:1px solid var(--line);cursor:pointer;display:block}
 .bgpick i.on{outline:2px solid var(--accent);outline-offset:1px}
@@ -217,16 +223,15 @@ function renderFeed(){
     }
   }).join('');
 }
-const BGS = ['Сейчас: сплошной', 'Графит сверху', 'Синее свечение', 'Аврора', 'Точки', 'Сетка', 'Тёплый снизу', 'Зерно', 'Маскот'];
+const BGS = ['Сейчас: сплошной', 'Глубина', 'Свет сверху', 'Сумерки', 'Туман', 'Горизонт'];
 function renderBg(){
   for (let i = 1; i <= BGS.length; i++) document.body.classList.toggle('bg' + i, STATE.bg === i);
   $('#bgpick').innerHTML = BGS.map((n, i) => `<i class="${STATE.bg === i + 1 ? 'on' : ''}" data-bg="${i + 1}" title="${i + 1}. ${n}" style="background:${BG_SWATCH[i]}"></i>`).join('')
     + `<span>${STATE.bg}. ${BGS[STATE.bg - 1]}</span>`;
 }
-const BG_SWATCH = ['#0e0e0f', 'linear-gradient(#202024,#0e0e0f)', 'radial-gradient(circle at 50% 0,#2b4f8a,#0d0e11 70%)',
-  'linear-gradient(135deg,#3a2a66,#0d0d10 50%,#1d3a66)', 'radial-gradient(#666 1px,#0e0e0f 1.5px) 0 0/6px 6px',
-  'linear-gradient(#333 1px,transparent 1px) 0 0/6px 6px,#0e0e0f', 'radial-gradient(circle at 50% 100%,#6a4520,#110f0e 70%)',
-  '#1a1a1c', 'url(../assets/mascot.png) center/14px no-repeat,#0e0e0f'];
+const BG_SWATCH = ['#0e0e0f', 'radial-gradient(#26262a,#0a0a0b 80%)', 'radial-gradient(circle at 50% 0,#3a3a3e,#0d0d0e 70%)',
+  'linear-gradient(#1c2333,#0c0c0d)', 'radial-gradient(circle at 25% 30%,#24365a,transparent 60%),radial-gradient(circle at 75% 60%,#33285a,#0d0d0f 70%)',
+  'radial-gradient(circle at 50% 100%,#1f3a66,#0b0b0c 70%)'];
 function apply(){
   renderBg();
   document.body.classList.toggle('nosidebar', !STATE.sidebar);

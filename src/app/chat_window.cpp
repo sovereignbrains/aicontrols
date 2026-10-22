@@ -3173,7 +3173,17 @@ std::wstring ChatWindow::StatusLine() const {
                 return L"Ждёт твоего решения: " + it->title;
             }
             if (it->verdict == Verdict::Allowed && !it->done) {
-                return L"Выполняется: " + it->title;
+                // What runs, not just its kind: the call's first line (a "[folder]" line is skipped), cut short.
+                std::wstring what = it->text;
+                if (what.starts_with(L'[') && what.find(L'\n') != std::wstring::npos) {
+                    what.erase(0, what.find(L'\n') + 1);
+                }
+                what = what.substr(0, what.find(L'\n'));
+                constexpr size_t kLongest = 70;
+                if (what.size() > kLongest) {
+                    what = what.substr(0, kLongest) + L"…";
+                }
+                return L"Выполняется: " + (what.empty() ? it->title : what);
             }
             break;
         }
@@ -8522,7 +8532,12 @@ void ChatWindow::OnClaude(const Json& message) {
             if (text.empty()) {
                 text = JsonStr(message, "subtype");
             }
-            Add(Kind::Error, ToWide(text));
+            // The CLI says "You've hit your session limit" twice: as a reply and as the turn's result.
+            const std::wstring wide = ToWide(text);
+            const bool said = !feed_.empty() && feed_.back().kind == Kind::Assistant && feed_.back().text == wide;
+            if (!said) {
+                Add(Kind::Error, wide);
+            }
         }
         if (!sessionId_.empty()) {
             if (std::wstring title = SessionTitle(workspace_, sessionId_); !title.empty()) {

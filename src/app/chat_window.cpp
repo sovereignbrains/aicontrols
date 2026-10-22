@@ -5595,11 +5595,24 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         }
         const uint32_t color = active ? kPrimary : kSecondary;
         const D2D1_POINT_2F c{g.secrets.left + 22.f, (g.secrets.top + g.secrets.bottom) / 2};
+        // A padlock (closed and kept, as the values are): its shackle an arch over a body with a keyhole.
         brush_->SetColor(Color(color));
-        target_->DrawEllipse(D2D1::Ellipse({c.x - 3.5f, c.y + 3.5f}, 3.5f, 3.5f), brush_.get(), 1.5f);
-        Line({c.x - 1.f, c.y + 1.f}, {c.x + 6.5f, c.y - 6.5f}, color, 1.5f);
-        Line({c.x + 3.5f, c.y - 3.f}, {c.x + 6.f, c.y - 0.5f}, color, 1.5f);
-        Line({c.x + 5.f, c.y - 4.5f}, {c.x + 7.5f, c.y - 2.f}, color, 1.5f);
+        wil::com_ptr<ID2D1PathGeometry> shackle;
+        wil::com_ptr<ID2D1GeometrySink> sink;
+        if (SUCCEEDED(d2d_->CreatePathGeometry(shackle.put())) && SUCCEEDED(shackle->Open(sink.put()))) {
+            sink->BeginFigure({c.x - 3.5f, c.y - 1.f}, D2D1_FIGURE_BEGIN_HOLLOW);
+            sink->AddLine({c.x - 3.5f, c.y - 3.5f});
+            sink->AddArc(D2D1::ArcSegment({c.x + 3.5f, c.y - 3.5f}, D2D1::SizeF(3.5f, 3.5f), 0.f,
+                                          D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+            sink->AddLine({c.x + 3.5f, c.y - 1.f});
+            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            if (SUCCEEDED(sink->Close())) {
+                target_->DrawGeometry(shackle.get(), brush_.get(), 1.5f, round_.get());
+            }
+        }
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y - 1.f, c.x + 6.f, c.y + 7.f), 2.f, 2.f),
+                                      brush_.get(), 1.5f);
+        Line({c.x, c.y + 2.f}, {c.x, c.y + 4.f}, color, 1.5f);
         Text(L"Секреты", ui_.get(),
              D2D1::RectF(g.secrets.left + 42, g.secrets.top, g.secrets.right - 8, g.secrets.bottom), color);
     }

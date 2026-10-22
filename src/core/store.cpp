@@ -256,6 +256,29 @@ bool DeleteSession(const std::wstring& workspace, const std::string& id) {
     return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted && !fs::exists(file, error);
 }
 
+bool MoveSession(const std::wstring& from, const std::wstring& to, const std::string& id) {
+    if (id.empty() || id.find_first_of("/\\.:") != std::string::npos || ProjectDir(from) == ProjectDir(to)) {
+        return false;
+    }
+    const fs::path file = SessionFile(from, id);
+    const fs::path target = SessionFile(to, id);
+    std::error_code error;
+    if (!fs::exists(file, error) || fs::exists(target, error)) {
+        return false;
+    }
+    fs::create_directories(ProjectDir(to), error);
+    fs::rename(file, target, error);
+    if (error) {
+        return false;
+    }
+    // The folder the CLI keeps beside it (tool results and the like); the chat goes on without it if it stays.
+    const fs::path folder = ProjectDir(from) / ToWide(id);
+    if (fs::is_directory(folder, error) && !fs::exists(ProjectDir(to) / ToWide(id), error)) {
+        fs::rename(folder, ProjectDir(to) / ToWide(id), error);
+    }
+    return true;
+}
+
 bool RenameSession(const std::wstring& workspace, const std::string& id, const std::wstring& title) {
     if (id.empty() || id.find_first_of("/\\.:") != std::string::npos || title.empty()) {
         return false;

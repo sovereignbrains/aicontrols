@@ -72,6 +72,9 @@ std::vector<SessionInfo> ListSessions(const std::wstring& workspace);  // newest
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);
 // Moves a chat to the Recycle Bin: its transcript and the folder the CLI keeps beside it. False if it could not.
 bool DeleteSession(const std::wstring& workspace, const std::string& id);
+// Moves a chat to another project: its transcript and its folder go to that workspace's history, where the CLI
+// resumes it (checked 22.10.2026: the whole conversation comes back). False if it could not; nothing is lost then.
+bool MoveSession(const std::wstring& from, const std::wstring& to, const std::string& id);
 // Gives a chat its own title the way the CLI's /rename does: a custom-title entry appended to its file
 // (the newest one wins, over the generated title too).
 bool RenameSession(const std::wstring& workspace, const std::string& id, const std::wstring& title);

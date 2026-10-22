@@ -523,8 +523,10 @@ struct Geometry {
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
     D2D1_RECT_F termAdd{};               // "+": another shell
     D2D1_RECT_F terminalBtn{};  // the header's button that shows or hides the terminal
-    D2D1_RECT_F memory{};       // ... save the memory, left of the terminal's button
     D2D1_RECT_F update{};       // ... and left of it, "update to ..." while a newer build is there
+    float titleLeft = 0;        // the chat's title, "project / chat"
+    float titleRight = 0;
+    D2D1_RECT_F memory{};       // save the memory: right after the title
     D2D1_RECT_F winMin{};       // minimize, maximize, close: the header is the window's title bar
     D2D1_RECT_F winMax{};
     D2D1_RECT_F winClose{};
@@ -1050,6 +1052,7 @@ private:
     void ShowInputMenu(POINT screen);
     void ShowCopyMenu(POINT screen, D2D1_POINT_2F at);
     void ShowChatMenu(size_t row, POINT screen);
+    void MoveChat(std::wstring from, SessionInfo session, std::wstring to);  // copies: the lists are made again
     void Attached();
 
     void OpenPopup(Popup popup);
@@ -2546,11 +2549,18 @@ Geometry ChatWindow::Layout() const {
     g.winMin = D2D1::RectF(g.winMax.left - kWinButton, 0, g.winMax.left, kHeader);
     g.terminalBtn = D2D1::RectF(g.winMin.left - 10 - kButton, buttonTop, g.winMin.left - 10, buttonTop + kButton);
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
-    g.memory = D2D1::RectF(g.terminalBtn.left - 4 - kButton, buttonTop, g.terminalBtn.left - 4, buttonTop + kButton);
     if (update_) {
         const float width = TextWidth(UpdateLabel(), button_.get()) + 22.f;  // measured as it is drawn
-        g.update = D2D1::RectF(g.memory.left - 8 - width, buttonTop, g.memory.left - 8, buttonTop + kButton);
+        g.update = D2D1::RectF(g.terminalBtn.left - 8 - width, buttonTop, g.terminalBtn.left - 8, buttonTop + kButton);
     }
+    // The title, "project / chat", starts where the chat does (as in Claude's app), or after the toggle when the
+    // sidebar is hidden; "save the memory" right after it, as it is about this chat and its project.
+    g.titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
+    const float titleMost = (update_ ? g.update.left : g.terminalBtn.left) - 12 - kButton - 6;
+    const float titleWidth = TextWidth(folderName_ + L"  /  ", header_.get()) +
+                             TextWidth(title_.empty() ? L"Новый чат" : title_, header_.get()) + 2.f;
+    g.titleRight = std::max(g.titleLeft, std::min(g.titleLeft + titleWidth, titleMost));
+    g.memory = D2D1::RectF(g.titleRight + 6, buttonTop, g.titleRight + 6 + kButton, buttonTop + kButton);
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
     // usage ring sit in a row under it, at the right.
@@ -3457,10 +3467,9 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Line({edge, 0}, {edge, kHeader}, kLine, 1.f);
     }
 
-    // The title starts where the chat does (as in Claude's app), or after the toggle when the sidebar is hidden.
-    const float titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
+    const float titleLeft = g.titleLeft;
     const std::wstring title = title_.empty() ? L"Новый чат" : title_;
-    const float titleRight = (update_ ? g.update.left : g.memory.left) - 12;
+    const float titleRight = g.titleRight;
     if (update_) {
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
@@ -6409,13 +6418,30 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
     const SessionInfo session = *found;
     const std::wstring folder = projects_[rows_[row].project].folder;
     wil::unique_hmenu menu(CreatePopupMenu());
+    constexpr UINT kMoveTo = 100;  // + an index into projects_
     AppendMenuW(menu.get(), MF_STRING, 1, L"Открыть");
+    AppendMenuW(menu.get(), MF_STRING, 3, L"Переименовать");
+    {  // to another project: the chat goes on there
+        wil::unique_hmenu projects(CreatePopupMenu());
+        for (size_t i = 0; i < projects_.size(); ++i) {
+            if (projects_[i].folder != folder) {
+                AppendMenuW(projects.get(), MF_STRING, kMoveTo + static_cast<UINT>(i), projects_[i].name.c_str());
+            }
+        }
+        if (GetMenuItemCount(projects.get()) == 0) {
+            AppendMenuW(projects.get(), MF_STRING | MF_GRAYED, 0, L"Других проектов нет");
+        }
+        AppendMenuW(menu.get(), MF_POPUP, reinterpret_cast<UINT_PTR>(projects.release()), L"Перенести в проект");
+    }
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 2, L"Удалить чат");
-    InsertMenuW(menu.get(), 1, MF_BYPOSITION | MF_STRING, 3, L"Переименовать");
-    const auto chosen = Menu(menu.get(), screen);
+    const auto chosen = static_cast<UINT>(Menu(menu.get(), screen));
     if (chosen == 3) {
         BeginRename(Rename::Chat, row);
+        return;
+    }
+    if (chosen >= kMoveTo && chosen - kMoveTo < projects_.size()) {
+        MoveChat(folder, session, projects_[chosen - kMoveTo].folder);
         return;
     }
     if (chosen == 1) {
@@ -6442,6 +6468,33 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
     }
     if (current) {
         StartClaude();
+    }
+    RefreshSessions();
+    hover_ = {};
+    Refresh();
+}
+
+// A chat to another project (its transcript into that project's history). The open one is stopped first (the CLI
+// holds its file) and opened again there.
+void ChatWindow::MoveChat(std::wstring from, SessionInfo session, std::wstring to) {
+    const bool current = session.id == sessionId_ && from == workspace_;
+    if (current && busy_ &&
+        MessageBoxW(hwnd_, L"Claude сейчас отвечает. Остановить и перенести чат?", L"AIControls",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    if (current) {
+        ResetChat();
+    }
+    const bool moved = MoveSession(from, to, session.id);
+    if (moved) {
+        Flash(L"Чат перенесён в «" + ProjectName(to) + L"»", 3000);
+    } else {
+        Flash(L"Не удалось перенести чат", 3000);
+    }
+    if (current) {
+        sessionId_.clear();  // so OpenChat does not take it for the open one
+        OpenChat(moved ? to : from, session);
     }
     RefreshSessions();
     hover_ = {};

@@ -87,5 +87,7 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
 
 Settings LoadSettings();
 void SaveSettings(const Settings& settings);
+// A window that only shows samples (--gallery) must not write the settings of the real one.
+void SetSettingsReadOnly(bool readOnly);
 
 }  // namespace aic

@@ -475,7 +475,18 @@ Settings LoadSettings() {
     return settings;
 }
 
+namespace {
+bool g_settingsReadOnly = false;
+}  // namespace
+
+void SetSettingsReadOnly(bool readOnly) {
+    g_settingsReadOnly = readOnly;
+}
+
 void SaveSettings(const Settings& settings) {
+    if (g_settingsReadOnly) {
+        return;
+    }
     const fs::path file = SettingsFile();
     std::error_code error;
     fs::create_directories(file.parent_path(), error);

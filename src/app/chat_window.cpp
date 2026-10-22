@@ -306,6 +306,7 @@ enum class Verdict { Pending, Allowed, Denied, Cancelled };
 
 struct FeedItem {
     Kind kind = Kind::Notice;
+    bool leading = false;  // Kind::Notice: a tool call's line, set against the left edge like the text, not centred
     std::wstring text;
     std::string messageId;  // assistant text: the API message it streams into
     int block = -1;         // ... and its content block index
@@ -1075,13 +1076,15 @@ private:
     void Apply(const Settings& next);
 
     bool StartClaude();
+    void FillGallery();  // --gallery: one sample of every kind of feed item, awkward data included
+    bool gallery_ = false;
     void Restart();
     void ResetChat();
     void NewChat();
     void Submit();
     void OnClaude(const Json& message);
     void OnClaudeExit(const ExitInfo& exit);
-    void Add(Kind kind, std::wstring text);
+    void Add(Kind kind, std::wstring text, bool leading = false);
     void Refresh() { InvalidateRect(hwnd_, nullptr, FALSE); }
     bool HasConversation() const;
     bool hasContent() const { return hasText_ || !attachments_.empty(); }
@@ -1183,6 +1186,7 @@ private:
     wil::com_ptr<ID2D1StrokeStyle> round_;
     wil::com_ptr<IDWriteTextFormat> body_;
     wil::com_ptr<IDWriteTextFormat> notice_;
+    wil::com_ptr<IDWriteTextFormat> noticeLeading_;
     wil::com_ptr<IDWriteTextFormat> header_;
     wil::com_ptr<IDWriteTextFormat> ui_;
     wil::com_ptr<IDWriteTextFormat> uiBold_;
@@ -1274,6 +1278,15 @@ private:
 };
 
 int ChatWindow::Run(int show) {
+    {
+        int count = 0;
+        const std::unique_ptr<LPWSTR, decltype(&LocalFree)> args(CommandLineToArgvW(GetCommandLineW(), &count),
+                                                                  &LocalFree);
+        for (int i = 1; args && i < count; ++i) {
+            gallery_ = gallery_ || std::wstring_view(args.get()[i]) == L"--gallery";
+        }
+    }
+    SetSettingsReadOnly(gallery_);
     secrets_.Load();
     settings_ = LoadSettings();
     workspace_ = DefaultWorkspace();
@@ -1315,6 +1328,7 @@ int ChatWindow::Run(int show) {
     THROW_IF_FAILED(d2d_->CreateStrokeStyle(stroke, nullptr, 0, round_.put()));
     body_ = MakeFormat(kTextFont, 15.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     notice_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+    noticeLeading_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     header_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     ui_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     uiBold_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
@@ -1351,6 +1365,15 @@ int ChatWindow::Run(int show) {
         Add(Kind::Error, L"Встроенные шрифты не загрузились — показываю системным.");
     }
     RefreshSessions();
+    if (gallery_) {  // samples only: no CLI, no network, nothing written
+        FillGallery();
+        MSG galleryMessage;
+        while (GetMessageW(&galleryMessage, nullptr, 0, 0) > 0) {
+            TranslateMessage(&galleryMessage);
+            DispatchMessageW(&galleryMessage);
+        }
+        return static_cast<int>(galleryMessage.wParam);
+    }
     RefreshAuth();
     LoadRepos();
     CheckClaudeVersions();
@@ -3070,7 +3093,8 @@ void ChatWindow::MeasureFeed(float column) {
             }
             continue;
         }
-        IDWriteTextFormat* format = item.kind == Kind::Notice ? notice_.get() : body_.get();
+        IDWriteTextFormat* format = item.kind == Kind::Notice ? (item.leading ? noticeLeading_.get() : notice_.get())
+                                                              : body_.get();
         if (item.kind == Kind::Approval) {
             format = mono_.get();
         }
@@ -8151,7 +8175,7 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
             const std::string own = OwnToolName(ToUtf8(entry.text));
             const Json input = Json::parse(entry.toolInput, nullptr, false);
             if (own.empty() || !input.is_object()) {
-                Add(Kind::Notice, L"инструмент: " + entry.text);
+                Add(Kind::Notice, L"инструмент: " + entry.text, true);
                 break;
             }
             // Our own tools come back as the card they were: the call, and what it printed.
@@ -8283,6 +8307,9 @@ void ChatWindow::Apply(const Settings& next) {
 }
 
 bool ChatWindow::StartClaude() {
+    if (gallery_) {
+        return false;
+    }
     ClaudeOptions options;
     options.exe = FindClaudeExe();
     claudeMissing_ = options.exe.empty();
@@ -8489,7 +8516,7 @@ void ChatWindow::OnClaude(const Json& message) {
                 if (blockType == "text" && !streamed_.contains(id)) {
                     Add(Kind::Assistant, ToWide(JsonStr(block, "text")));
                 } else if (blockType == "tool_use" && OwnToolName(JsonStr(block, "name")).empty()) {
-                    Add(Kind::Notice, L"инструмент: " + ToWide(JsonStr(block, "name")));
+                    Add(Kind::Notice, L"инструмент: " + ToWide(JsonStr(block, "name")), true);
                 }
             }
         }
@@ -8649,7 +8676,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
         return;
     }
     if (!ToolNeedsApproval(name, input)) {
-        Add(Kind::Notice, summary.title + L": " + summary.detail);
+        Add(Kind::Notice, summary.title + L": " + summary.detail, true);
         claude_.Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
         return;
     }
@@ -8740,11 +8767,85 @@ void ChatWindow::OnClaudeExit(const ExitInfo& exit) {
     Add(exit.code == 0 ? Kind::Notice : Kind::Error, std::move(text));
 }
 
-void ChatWindow::Add(Kind kind, std::wstring text) {
+void ChatWindow::Add(Kind kind, std::wstring text, bool leading) {
     FeedItem item;
     item.kind = kind;
+    item.leading = leading;
     item.text = std::move(text);
     feed_.push_back(std::move(item));
+    Refresh();
+}
+
+void ChatWindow::FillGallery() {
+    const std::wstring longPath =
+        L"C:\\Users\\user\\.claude\\projects\\C--Users-user-AppData-Roaming-ssh-desktop-app-claude-workspace\\memory\\project_aicontrols.md";
+    const std::wstring longWord = L"Сверхдлинноеслововбезединогопробеладлятогочтобыпроверитьпереносстрокивузкойколонкеиобрезку";
+    Add(Kind::User, L"Короткое сообщение");
+    Add(Kind::User, L"Длинное сообщение пользователя с кириллицей, English words, 😀 эмодзи и ссылкой "
+                    L"https://example.com/очень/длинный/путь/который/не/помещается/в/колонку?query=1&other=2\n"
+                    L"вторая строка после перевода\n\n\nи после пустых строк. " + longWord);
+    Add(Kind::Assistant,
+        L"# Заголовок первого уровня\n\n## Заголовок второго\n\nОбычный абзац с **жирным**, *курсивом*, `inline code`, "
+        L"~~зачёркнутым~~ и [ссылкой](https://example.com). " + longWord + L"\n\n"
+        L"- пункт списка\n- второй пункт с длинным текстом, который должен перенестись на следующую строку и не "
+        L"потерять отступ у маркера\n  - вложенный пункт\n    - ещё глубже\n- третий\n\n"
+        L"1. первый\n2. второй\n10. десятый\n\n"
+        L"> Цитата, длинная, чтобы проверить перенос внутри цитаты и её левую черту, которая должна идти на всю высоту.\n\n"
+        L"---\n\n"
+        L"```cpp\nint main() {\n    std::cout << \"очень длинная строка кода, которая не помещается в колонку и должна "
+        L"прокручиваться или обрезаться, но не вылезать за карточку\" << std::endl;\n    return 0;\n}\n```\n\n"
+        L"```\nбез языка\n\tс табом\n```\n\n"
+        L"| Колонка | Ещё колонка | Длинные ячейки |\n|:--|--:|:-:|\n| a | 1 | " + longWord +
+        L" |\n| длинный текст ячейки, который переносится по словам | 22 | x |\n| `код` | **жирный** | [ссылка](https://example.com) |\n\n"
+        L"Последний абзац после таблицы.");
+    Add(Kind::Notice, L"Чат сжат: дальше Claude помнит начало по сводке");
+    Add(Kind::Notice, L"Показаны последние 200 сообщений.");
+    Add(Kind::Notice, L"Прочитать файл: " + longPath, true);
+    Add(Kind::Notice, L"Показать папку: .", true);
+    Add(Kind::Notice, L"инструмент: WebSearch", true);
+    Add(Kind::Notice, L"План: не выполнено — Записать файл: " + longPath);
+    Add(Kind::Error, L"Ошибка API: 529 overloaded_error — длинный текст ошибки, который должен переноситься по словам. " +
+                         longWord);
+
+    const auto card = [&](const std::string& tool, Json input, Verdict verdict, bool done, const std::wstring& output,
+                          bool failed) {
+        ToolSummary summary = SummarizeTool(tool, input);
+        FeedItem item;
+        item.kind = Kind::Approval;
+        item.title = std::move(summary.title);
+        item.text = std::move(summary.detail);
+        item.tool = tool;
+        item.input = std::move(input);
+        item.requestId = "gallery";
+        item.verdict = verdict;
+        item.done = done;
+        item.output = output;
+        item.outputError = failed;
+        feed_.push_back(std::move(item));
+    };
+    std::wstring manyLines;
+    for (int i = 1; i <= 60; ++i) {
+        manyLines += L"строка вывода номер " + std::to_wstring(i) + (i % 7 == 0 ? L" " + longWord + longWord : L"") + L"\n";
+    }
+    card("run_command", Json{{"command", "git status"}}, Verdict::Pending, false, L"", false);
+    card("run_command",
+         Json{{"command", "Get-ChildItem -Recurse -Include *.cpp,*.h src | Select-String -Pattern 'Прочитать файл|Показать папку' | "
+                          "ForEach-Object { \"$($_.Path):$($_.LineNumber): $($_.Line.Trim())\" } | Select -First 30"}},
+         Verdict::Allowed, true, L"[exit code 0, 512 ms]\n" + manyLines, false);
+    card("run_command", Json{{"command", "systemctl restart nginx"}, {"on", "root@example.com:2222"}}, Verdict::Allowed,
+         true, L"Job for nginx.service failed.\n[exit code 1, 80 ms]", true);
+    card("run_command", Json{{"command", "rm -rf build"}}, Verdict::Denied, false, L"", false);
+    card("run_command", Json{{"command", "sleep 100"}}, Verdict::Cancelled, false, L"", false);
+    card("write_file", Json{{"path", ToUtf8(longPath)}, {"content", "первая строка\nвторая строка\n"}}, Verdict::Pending,
+         false, L"", false);
+    card("write_file", Json{{"path", "C:\\Users\\user\\notes.txt"}, {"content", "текст"}}, Verdict::Allowed, true,
+         L"Wrote 5 bytes to C:\\Users\\user\\notes.txt", false);
+    card("edit_file",
+         Json{{"path", "C:\\Users\\user\\notes.txt"}, {"old_string", "было\nстарое"}, {"new_string", "стало\nновое\nи ещё"}},
+         Verdict::Pending, false, L"", false);
+    card("read_file", Json{{"path", ToUtf8(longPath)}}, Verdict::Allowed, true, L"содержимое файла\nвторая строка", false);
+    Add(Kind::Assistant, L"Финальный короткий ответ.");
+    stick_ = true;
     Refresh();
 }
 

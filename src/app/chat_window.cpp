@@ -468,7 +468,6 @@ enum class Target {
     CopyLoginUrl,
     Account,  // the sidebar's account row
     TerminalToggle,
-    TermClose,
     TermTab,       // row: the tab
     TermTabClose,  // row: the same
     TermAdd,
@@ -528,7 +527,6 @@ struct Geometry {
     D2D1_RECT_F splitSidebar{};   // a few DIPs either side of the sidebar's edge
     D2D1_RECT_F splitTerminal{};  // ... and of the terminal's
     D2D1_RECT_F term{};  // the terminal column (empty when closed)
-    D2D1_RECT_F termClose{};
     D2D1_RECT_F termWide{};   // beside a preview: widen it over the window, or back
     D2D1_RECT_F termScreen{};
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
@@ -2270,9 +2268,6 @@ void ChatWindow::OnClick(float x, float y) {
         SetTerminalOpen(!terminalOpen_);
         keepFocus = true;
         break;
-    case Target::TermClose:
-        SetTerminalOpen(false);
-        break;
     case Target::PreviewWide:
         SetPreviewWide(!previewWide_);
         break;
@@ -2676,7 +2671,6 @@ Geometry ChatWindow::Layout() const {
     }
     if (termWidth > 0) {
         g.term = D2D1::RectF(g.area, kHeader, g.width, g.height);
-        g.termClose = D2D1::RectF(g.term.right - 12 - 28, g.term.top + 8, g.term.right - 12, g.term.top + 36);
         g.termScreen = D2D1::RectF(g.term.left + 14, g.term.top + 44, g.term.right - 8, g.term.bottom - 12);
         float tabLeft = g.term.left + 10;
         for (const auto& tab : tabs_) {
@@ -2686,7 +2680,7 @@ Geometry ChatWindow::Layout() const {
         }
         g.termAdd = D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + 28, g.term.top + 36);
         if (PreviewShown() || previewWide_) {
-            g.termWide = D2D1::RectF(g.termClose.left - 4 - 28, g.termClose.top, g.termClose.left - 4, g.termClose.bottom);
+            g.termWide = D2D1::RectF(g.term.right - 12 - 28, g.term.top + 8, g.term.right - 12, g.term.top + 36);
         }
     }
     if (secretsOpen_ && sidebarWidth > 0) {
@@ -2866,9 +2860,6 @@ Hit ChatWindow::HitTest(float x, float y) const {
         return {};
     }
     if (Inside(g.term, x, y)) {
-        if (Inside(g.termClose, x, y)) {
-            return {Target::TermClose};
-        }
         if (Inside(g.termWide, x, y)) {
             return {Target::PreviewWide};
         }
@@ -4642,16 +4633,6 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         const uint32_t color = active ? kPrimary : kSecondary;
         Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
         Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
-    }
-    {  // a cross
-        const bool active = hover_.target == Target::TermClose;
-        if (active) {
-            Fill(g.termClose, 6.f, kRaised);
-        }
-        const D2D1_POINT_2F c{(g.termClose.left + g.termClose.right) / 2, (g.termClose.top + g.termClose.bottom) / 2};
-        const uint32_t color = active ? kPrimary : kSecondary;
-        Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.5f);
-        Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.5f);
     }
     if (g.termWide.right > g.termWide.left) {  // arrows out to the corners (widen), or in (back)
         const bool active = hover_.target == Target::PreviewWide;
@@ -7432,8 +7413,6 @@ std::wstring ChatWindow::TooltipText() {
                                        : std::wstring(L"Аккаунт, версия Claude, выход");
     case Target::TermAdd:
         return L"Новый терминал";
-    case Target::TermClose:
-        return L"Скрыть терминал";
     case Target::TermTabClose:
         return L"Закрыть вкладку";
     case Target::SaveMemoryBtn:
@@ -7714,8 +7693,6 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.account;
     case Target::TermAdd:
         return g.termAdd;
-    case Target::TermClose:
-        return g.termClose;
     case Target::PreviewWide:
         return g.termWide;
     case Target::TermTab:

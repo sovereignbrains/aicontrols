@@ -31,6 +31,8 @@ struct ClaudeOptions {
     // would ride in every request.
     bool connectors = false;
     std::string autocompact;  // --autocompact: the context size a chat is summed up at ("150k"); empty: the CLI's
+    // Off: nothing written to the history (the probes: their runs would sit among his chats).
+    bool persistSession = true;
 };
 
 // claude.exe in stream-json mode (see PLAN.md, "Протокол"): one process per chat, serving

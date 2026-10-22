@@ -44,6 +44,7 @@ int wmain(int argc, wchar_t** argv) {
     options.proxy = aic::PickProxy();
     options.model = argc >= 3 ? aic::ToUtf8(argv[2]) : "haiku";
     options.includePartial = false;
+    options.persistSession = false;  // a probe's run is not a chat of his
     std::cout << "proxy: " << (options.proxy.empty() ? "direct" : aic::ToUtf8(options.proxy)) << "\n";
 
     claude.Start(

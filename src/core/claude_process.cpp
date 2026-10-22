@@ -152,6 +152,9 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     if (!options.resume.empty()) {
         cmd += L" --resume " + QuoteArg(ToWide(options.resume));
     }
+    if (!options.persistSession) {
+        cmd += L" --no-session-persistence";
+    }
 
     // session_state_changed (running / requires_action / idle): the only reliable "is it still working",
     // since a message sent mid-turn is folded into the running turn and gets no result of its own.

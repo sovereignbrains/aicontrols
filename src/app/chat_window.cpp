@@ -6346,8 +6346,6 @@ void ChatWindow::OnPuffFrame() {
             puffing_ = false;
             KillTimer(hwnd_, kPuffTimer);
             SetTimer(hwnd_, kPuffIdleTimer, kPuffIdle, nullptr);
-    FetchUsage();  // the ring is right before the first message, not only after it
-    SetTimer(hwnd_, kUsageTimer, kUsageCheck, nullptr);
         }
     }
     Refresh();

@@ -141,7 +141,7 @@ int main() {
     }
     {
         const auto md = ParseMarkdown(L"| Key | Value |\n|---|---|\n| a | one two three four |\n| b | x |\nend", 16);
-        Expect(md.text == L"Key │ Value\n────┼───────────\na   │ one two\n    │ three four\n────┼───────────\nb   │ x\n────┼───────────\n\nend",
+        Expect(md.text == L"Key │ Value\n────┼───────────\na   │ one two\n    │ three four\n────┼───────────\nb   │ x\n────┴───────────\n\nend",
                "a wide table wraps inside its cells, rules part the rows", Narrow(md.text));
     }
     {

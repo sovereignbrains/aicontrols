@@ -5498,9 +5498,9 @@ bool ChatWindow::AllowedUnasked(const std::string& tool, const Json& input) cons
 
 void ChatWindow::ShowPermissionMenu() {
     constexpr std::array<const char*, 3> kModes = {"", "edits", "all"};
-    constexpr std::array<const wchar_t*, 3> kLabels = {L"Спрашивать\tвсё",
-                                                       L"Файлы без вопросов\tкоманды спрашивать",
-                                                       L"Без вопросов\tвсё подряд"};
+    constexpr std::array<const wchar_t*, 3> kLabels = {L"Спрашивать\tперед любым изменением",
+                                                       L"Файлы без вопросов\tправки сами, команды спрашивает",
+                                                       L"Без вопросов\tвсё сразу, без подтверждений"};
     wil::unique_hmenu menu(CreatePopupMenu());
     for (size_t i = 0; i < kModes.size(); ++i) {
         AppendMenuW(menu.get(), MF_STRING | (settings_.permissions == kModes[i] ? MF_CHECKED : 0),

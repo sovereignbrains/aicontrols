@@ -409,10 +409,10 @@ MdText ParseMarkdown(std::wstring_view source, size_t tableWidth) {
                         tall = tall || wrapped[r].back().size() > 1;
                     }
                 }
-                const auto rule = [&] {
+                const auto rule = [&](bool bottom = false) {  // the bottom one's crossings are tees: no stubs below it
                     out.text += L'\n';
                     for (size_t c = 0; c < columns; ++c) {
-                        out.text += c == 0 ? L"" : L"─┼─";
+                        out.text += c == 0 ? L"" : (bottom ? L"─┴─" : L"─┼─");
                         out.text.append(widths[c], L'─');
                     }
                 };
@@ -444,7 +444,7 @@ MdText ParseMarkdown(std::wstring_view source, size_t tableWidth) {
                     }
                 }
                 if (tall) {  // closed below, so the dividers of a many-lined last row do not end as stubs
-                    rule();
+                    rule(true);
                 }
                 out.spans.push_back(MdSpan{start, out.text.size() - start, kMdCode | kMdTable, 1.f, true});
                 out.spans.push_back(MdSpan{start, headerEnd - start, kMdBold, 1.f, false});

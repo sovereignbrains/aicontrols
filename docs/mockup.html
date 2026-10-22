@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>AIControls — макет 1 в 1</title>
+<style>
+/* Цифры — из src/app/chat_window.cpp (Layout() и kConstants), в DIP = px. Меняются в :root, не по месту. */
+@font-face{font-family:"Golos Text";src:local("Golos Text"),url("../assets/fonts/GolosText.ttf");font-weight:100 900}
+@font-face{font-family:"JetBrains Mono";src:local("JetBrains Mono"),url("../assets/fonts/JetBrainsMono.ttf");font-weight:100 900}
+@font-face{font-family:"Unbounded";src:local("Unbounded"),url("../assets/fonts/Unbounded.ttf");font-weight:100 900}
+:root{
+ --window:#0e0e0f;--panel:#121213;--card:#18181a;--raised:#232327;--bubble:#1d2738;--line:#2c2c31;
+ --primary:#f2f4f8;--secondary:#9c9ea4;--title:#c4c6cc;--accent:#4c92ff;--danger:#f06060;--code:#dadde4;
+ --header:34px;--sidebar:252px;--terminal:480px;--column-max:720px;--side:24px;--gap:14px;--bubble-pad:10px;
+ --card-pad:12px;--box-pad-y:5px;--btn:26px;--chip-row:24px;--chips-bottom:6px;--ring:20px;--win-btn:40px;
+ --text:"Golos Text","Segoe UI",sans-serif;--mono:"JetBrains Mono",Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--window);color:var(--primary);font:15px/1.4 var(--text);display:flex;flex-direction:column;-webkit-font-smoothing:antialiased;user-select:none}
+svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+
+/* шапка = заголовок окна */
+header{height:var(--header);flex:none;background:var(--panel);display:flex;align-items:center;font-size:12.5px;color:var(--title);position:relative}
+.hb{width:var(--btn);height:var(--btn);display:grid;place-items:center;border-radius:7px;color:var(--secondary);cursor:pointer;flex:none}
+.hb:hover{background:var(--raised);color:var(--primary)}
+#sideToggle{margin-left:10px}
+.title{margin-left:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.title b{font-weight:400;color:var(--secondary)}
+.title i{font-style:normal;color:var(--secondary);margin:0 6px}
+.sp{flex:1}
+.upd{height:var(--btn);padding:0 11px;border-radius:9px;background:var(--accent);color:#fff;font-weight:600;font-size:13px;display:grid;place-items:center;margin-right:8px;cursor:pointer}
+#termBtn{margin-right:10px}
+#termBtn.on{background:var(--raised);color:var(--primary)}
+.win{width:var(--win-btn);height:var(--header);display:grid;place-items:center;color:var(--secondary)}
+.win:hover{background:var(--raised)}.win.close:hover{background:#c42b1c;color:#fff}
+
+.app{flex:1;display:flex;min-height:0}
+/* боковая панель */
+aside{width:var(--sidebar);flex:none;background:var(--panel);display:flex;flex-direction:column;position:relative;font-size:13px;border-right:1px solid var(--line)}
+body.nosidebar aside{display:none}
+.search{margin:10px 10px 0;height:34px;border-radius:8px;background:var(--raised);display:flex;align-items:center;gap:8px;padding:0 10px;color:var(--secondary)}
+.nav{margin:8px 6px 0;height:34px;border-radius:8px;display:flex;align-items:center;gap:8px;padding:0 10px;color:var(--primary)}
+.label{height:26px;margin:8px 10px 0;display:flex;align-items:center;justify-content:space-between;color:var(--secondary);font-size:12px;padding-left:6px}
+.hrow{height:34px;margin:0 6px;border-radius:8px;padding:0 10px;display:flex;align-items:center;gap:6px;color:var(--title);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hrow.proj{color:var(--primary)}
+.hrow.in{margin-left:20px;padding-left:12px}
+.hrow.sel{background:var(--raised);color:var(--primary)}
+.hrow .tri{width:10px;color:var(--secondary);font-size:9px}
+.hrow .t{overflow:hidden;text-overflow:ellipsis}
+.grow{flex:1}
+.updside{margin:0 10px 10px;height:34px;border-radius:9px;background:var(--accent);color:#fff;font-weight:600;display:grid;place-items:center}
+.bottom{display:flex;padding:0 6px 6px;gap:2px}
+.acct{flex:1;height:34px;border-radius:8px;padding:0 10px;display:flex;align-items:center;color:var(--secondary)}
+.lock{width:34px;height:34px;border-radius:8px;display:grid;place-items:center;color:var(--secondary)}
+
+/* чат */
+main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
+.feed{flex:1;overflow-y:auto;min-height:0;padding-top:var(--gap);scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.col{width:min(calc(100% - 2 * var(--side)),var(--column-max));margin:0 auto;display:flex;flex-direction:column;gap:var(--gap);padding-bottom:var(--gap)}
+.user{align-self:flex-end;background:var(--bubble);border-radius:10px;padding:var(--bubble-pad);max-width:100%;font-size:15px;line-height:1.4}
+.asst{font-size:15px;line-height:1.45}
+.asst code,.asst .code{font:13.5px var(--mono)}
+.asst code{background:var(--raised);padding:1px 5px;border-radius:4px;color:var(--code)}
+.asst a{color:var(--accent)}
+.asst ul{padding-left:20px}
+.asst table{border-collapse:collapse;font-size:13.5px;margin-top:6px}
+.asst td,.asst th{border:1px solid var(--line);padding:4px 10px;text-align:left}.asst th{background:var(--card);font-weight:600}
+.notice{font-size:12.5px;color:var(--secondary);text-align:center}
+.tool{font-size:12.5px;color:var(--secondary);text-align:left;word-break:break-all}
+.err{font-size:15px;color:var(--danger)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:var(--card-pad)}
+.card .head{height:22px;display:flex;align-items:center;justify-content:space-between;font-size:13px;font-weight:600}
+.card .head small{font-weight:400;font-size:12px;color:var(--secondary)}
+.card pre{font:12.5px/1.45 var(--mono);white-space:pre-wrap;word-break:break-all;margin-top:6px;color:var(--secondary)}
+.card pre.out{color:var(--code);margin-top:12px}
+.card .btns{display:flex;gap:8px;margin-top:12px}
+.btn{height:30px;width:112px;border-radius:8px;background:var(--raised);display:grid;place-items:center;font-size:13px;font-weight:600}
+.btn.go{background:var(--accent);color:#fff}
+.status{font-size:12.5px;color:var(--secondary);height:24px}
+
+/* поле ввода и ряд под ним */
+.dock{flex:none;width:min(calc(100% - 2 * var(--side)),var(--column-max));margin:0 auto;position:relative}
+.box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:var(--box-pad-y) 8px;display:flex;align-items:center;gap:4px;min-height:calc(var(--btn) + 2 * var(--box-pad-y) + 2px)}
+.ph{flex:1;color:var(--secondary);padding:0 4px;font-size:15px}
+.ib{width:var(--btn);height:var(--btn);display:grid;place-items:center;color:var(--secondary);border-radius:50%}
+.ib.send{color:var(--accent)}
+.mascot{position:absolute;right:14px;top:-30px;width:32px;height:32px;pointer-events:none}
+.chips{height:var(--chip-row);margin:4px 0 var(--chips-bottom);display:flex;align-items:center;font-size:13px;color:var(--secondary);padding:0 6px 0 4px}
+.chips .chip{padding:0 9px;display:flex;align-items:center;gap:6px;height:20px}
+.ring{width:var(--ring);height:var(--ring);border-radius:50%;border:2px solid var(--line);border-top-color:var(--accent);margin-left:6px}
+
+/* правая панель */
+.term{width:var(--terminal);flex:none;background:var(--panel);border-left:1px solid var(--line);display:none;flex-direction:column}
+body.terminal .term{display:flex}
+.term .tabs{height:40px;display:flex;align-items:center;padding:0 8px;gap:6px;color:var(--title);font-size:13px}
+.term .tab{background:var(--raised);padding:5px 12px;border-radius:8px}
+.term .scr{flex:1;padding:8px 12px;font:12.5px/18px var(--mono);color:#d4d4d8}
+</style></head><body>
+<header>
+ <div class="hb" id="sideToggle" title="Боковая панель (S)"><svg viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M6 2.5v11"/></svg></div>
+ <div class="title" id="title"></div>
+ <div class="hb" title="Сохранить память"><svg viewBox="0 0 16 16"><path d="M8 10V2M5 5l3-3 3 3M3 9v4h10V9"/></svg></div>
+ <div class="sp"></div>
+ <div class="upd" id="updTop" style="display:none">Обновить клиент</div>
+ <div class="hb" id="termBtn" title="Терминал (T)"><svg viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6l2 2-2 2M8 10h3"/></svg></div>
+ <div class="win"><svg viewBox="0 0 16 16"><path d="M4 8h8"/></svg></div>
+ <div class="win"><svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1"/></svg></div>
+ <div class="win close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></div>
+</header>
+<div class="app">
+ <aside id="side"></aside>
+ <main>
+  <div class="feed" id="feed"><div class="col" id="col"></div></div>
+  <div class="dock">
+   <img class="mascot" src="../assets/mascot.png" alt="">
+   <div class="box"><div class="ib"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></div>
+    <div class="ph">Опиши задачу или задай вопрос</div>
+    <div class="ib send"><svg viewBox="0 0 16 16"><path d="M13 3v5H4M7 5L4 8l3 3"/></svg></div>
+    <div class="ib"><svg viewBox="0 0 16 16"><rect x="6" y="2" width="4" height="8" rx="2"/><path d="M3.5 8a4.5 4.5 0 009 0M8 12.5V14"/></svg></div></div>
+   <div class="chips"><span class="chip"><svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="8" rx="1.5"/><path d="M6 14h4M8 11v3"/></svg>Этот компьютер</span>
+    <span class="sp"></span><span class="chip" id="perm"></span><span class="chip" id="model"></span><span class="chip" id="effort"></span><span class="ring"></span></div>
+  </div>
+ </main>
+ <div class="term"><div class="tabs"><span class="tab">PowerShell</span></div><div class="scr">PS C:\Users\user\projects\aicontrols&gt; _</div></div>
+</div>
+<script>
+/* ---- Всё, что можно менять точечно: состояние окна и содержимое ленты ---- */
+const STATE = {
+  sidebar: true, terminal: false, update: true,
+  project: 'aicontrols', chat: 'го баги отображения в чате фиксить/дорабатывать, ты выводишь фейк хуйню…',
+  permission: 'Авто', model: 'Auto · Sonnet 5.5', effort: 'Auto',
+};
+const SIDEBAR = {
+  projects: [
+    {name: 'aicontrols', open: true, chats: ['го баги отображения в чате фиксить…']},
+    {name: 'dpiprobe', open: false, chats: []},
+  ],
+  general: ['почекай локальные записи по sovereign aicontrols dpipr…', 'не нажимается кнопка обновить клиент',
+    'клауд воркспейс это весь пк? или как', 'Забавный факт про российские Р', 'Ошибка API в aicontrols store.cpp',
+    'срисуй интерфейс го накидаем в хтмл че как будет', 'Память и контекст по проектам'],
+  selected: 'го баги отображения в чате фиксить…',
+};
+/* k: user | asst (html) | tool | notice | err | card {title, detail, out, state, buttons} */
+const FEED = [
+  {k:'user', t:'го баги отображения в чате фиксить/дорабатывать, ты выводишь фейк хуйню я скрин даю тебе и проверяешь'},
+  {k:'asst', h:'Начинаю. Сначала прочитаю заметку проекта и посмотрю, как устроена проверка окна через <code>probes\\ui</code>.'},
+  {k:'tool', t:'Прочитать файл: C:\\Users\\user\\.claude\\projects\\C--Users-user-AppData-Roaming-ssh-desktop-app-claude-workspace\\memory\\project_aicontrols.md'},
+  {k:'tool', t:'Показать папку: C:\\Users\\user\\projects\\aicontrols\\tools\\probes'},
+  {k:'card', title:'Выполнить команду', state:'Готово',
+   detail:'$ps = Get-Process aicontrols -ErrorAction SilentlyContinue | Select Id,MainWindowTitle,MainWindowHandle; $ps | ft -auto',
+   out:'[exit code 0, 2875 ms]\n… скрыто строк: 38 …\n 854, 982  Опиши задачу или задай вопрос'},
+  {k:'asst', h:'Скриншот не дошёл: в сообщении только текст. Пришлите его ещё раз, и я сверю с кодом.'},
+  {k:'card', title:'Записать файл', state:'Готово', detail:'C:\\Users\\user\\projects\\aicontrols\\docs\\mockup.html',
+   out:'Wrote 7372 bytes to C:\\Users\\user\\projects\\aicontrols\\docs\\mockup.html', buttons:['Превью','Открыть','В папке']},
+  {k:'card', title:'Выполнить команду', state:'', detail:'git status', buttons:['Разрешить','Отклонить'], go:0},
+  {k:'notice', t:'Чат сжат: дальше Claude помнит начало по сводке'},
+  {k:'asst', h:'Таблица:<table><tr><th>Режим</th><th>Что делает</th></tr><tr><td>Auto</td><td>правки и безобидные команды без вопросов</td></tr><tr><td>Plan</td><td>ничего не меняет, отвечает планом</td></tr></table>'},
+  {k:'err', t:'Ошибка API: 529 overloaded_error'},
+];
+
+/* ---- Отрисовка ---- */
+const $ = s => document.querySelector(s);
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function renderTitle(){ $('#title').innerHTML = `<b>${esc(STATE.project)}</b><i>/</i>${esc(STATE.chat)}`; }
+function renderSide(){
+  const h = [
+    '<div class="search"><svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Поиск</div>',
+    '<div class="nav"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg>Новый чат</div>',
+    '<div class="label"><span>Проекты</span><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></div>'];
+  for (const p of SIDEBAR.projects){
+    h.push(`<div class="hrow proj"><span class="tri">${p.open?'▾':'▸'}</span><span class="t">${esc(p.name)}</span></div>`);
+    if (p.open) for (const c of p.chats) h.push(`<div class="hrow in${c===SIDEBAR.selected?' sel':''}"><span class="t">${esc(c)}</span></div>`);
+  }
+  h.push('<div class="label"><span>Общие чаты</span></div>');
+  for (const c of SIDEBAR.general) h.push(`<div class="hrow${c===SIDEBAR.selected?' sel':''}"><span class="t">${esc(c)}</span></div>`);
+  h.push('<div class="grow"></div>');
+  if (STATE.update) h.push('<div class="updside">Обновить клиент</div>');
+  h.push('<div class="bottom"><div class="acct">Аккаунт</div><div class="lock"><svg viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2"/></svg></div></div>');
+  $('#side').innerHTML = h.join('');
+}
+function renderFeed(){
+  $('#col').innerHTML = FEED.map(i => {
+    switch (i.k){
+      case 'user': return `<div class="user">${esc(i.t)}</div>`;
+      case 'asst': return `<div class="asst">${i.h}</div>`;
+      case 'tool': return `<div class="tool">${esc(i.t)}</div>`;
+      case 'notice': return `<div class="notice">${esc(i.t)}</div>`;
+      case 'err': return `<div class="err">${esc(i.t)}</div>`;
+      case 'card': return `<div class="card"><div class="head"><span>${esc(i.title)}</span><small>${esc(i.state||'')}</small></div>`
+        + `<pre>${esc(i.detail)}</pre>` + (i.out ? `<pre class="out">${esc(i.out)}</pre>` : '')
+        + (i.buttons ? `<div class="btns">${i.buttons.map((b,n)=>`<span class="btn${i.go===n?' go':''}">${esc(b)}</span>`).join('')}</div>` : '') + '</div>';
+    }
+  }).join('');
+}
+function apply(){
+  document.body.classList.toggle('nosidebar', !STATE.sidebar);
+  document.body.classList.toggle('terminal', STATE.terminal);
+  $('#termBtn').classList.toggle('on', STATE.terminal);
+  $('#updTop').style.display = STATE.update && !STATE.sidebar ? 'grid' : 'none';  // в шапке — только пока сайдбар скрыт
+  renderSide();
+  $('#perm').textContent = STATE.permission; $('#model').textContent = STATE.model; $('#effort').textContent = STATE.effort;
+  const q = new URLSearchParams(); q.set('sidebar', +STATE.sidebar); q.set('terminal', +STATE.terminal); q.set('update', +STATE.update);
+  history.replaceState(null, '', '?' + q);
+}
+const q = new URLSearchParams(location.search);
+for (const k of ['sidebar','terminal','update']) if (q.has(k)) STATE[k] = q.get(k) === '1';
+$('#sideToggle').onclick = () => { STATE.sidebar = !STATE.sidebar; apply(); };
+$('#termBtn').onclick = () => { STATE.terminal = !STATE.terminal; apply(); };
+addEventListener('keydown', e => {
+  if (e.ctrlKey || e.altKey) return;
+  if (e.key === 's' || e.key === 'ы') { STATE.sidebar = !STATE.sidebar; apply(); }
+  if (e.key === 't' || e.key === 'е') { STATE.terminal = !STATE.terminal; apply(); }
+  if (e.key === 'u' || e.key === 'г') { STATE.update = !STATE.update; apply(); }
+});
+renderTitle(); renderFeed(); apply();
+$('#feed').scrollTop = 1e9;
+</script>
+</body></html>

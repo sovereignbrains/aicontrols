@@ -14,7 +14,7 @@ struct SessionInfo {
     FILETIME modified{};
 };
 
-enum class EntryKind { User, Assistant, Tool };
+enum class EntryKind { User, Assistant, Tool, Compacted };  // Compacted: the CLI summed up what came before
 
 struct TranscriptImage {
     std::string mediaType;

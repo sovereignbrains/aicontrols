@@ -131,6 +131,9 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     if (options.includePartial) {
         cmd += L" --include-partial-messages";
     }
+    if (!options.autocompact.empty()) {
+        cmd += L" --autocompact " + QuoteArg(ToWide(options.autocompact));
+    }
     if (!options.connectors) {
         cmd += L" --strict-mcp-config";  // only ours; the claude.ai ones go with the variable below
     }

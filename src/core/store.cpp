@@ -341,6 +341,14 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
         }
         const std::string type = JsonStr(entry, "type");
         const Json& message = JsonAt(entry, "message");
+        if (type == "system" && JsonStr(entry, "subtype") == "compact_boundary") {
+            lastAssistant.clear();
+            entries.push_back({EntryKind::Compacted});
+            return;
+        }
+        if (type == "user" && IsTrue(JsonAt(entry, "isCompactSummary"))) {
+            return;  // the summary the CLI wrote for itself, not the user's words
+        }
         if (type == "user") {
             lastAssistant.clear();
             const Json& content = JsonAt(message, "content");

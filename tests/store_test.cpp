@@ -49,6 +49,18 @@ int main() {
     std::ofstream(historyA / L"chat-1.jsonl") << "{}\n";  // the same id waiting there: nothing is overwritten
     Expect(!aic::MoveSession(b, a, "chat-1") && fs::exists(historyB / L"chat-1.jsonl"), "no chat is overwritten");
 
+    // A compacted chat: a mark where it was summed up, and the CLI's summary is not shown as the user's words.
+    std::ofstream(historyA / L"chat-2.jsonl")
+        << R"({"type":"user","message":{"role":"user","content":"remember pelican"}})" << "\n"
+        << R"({"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":3972,"post_tokens":743}})" << "\n"
+        << R"({"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}})" << "\n"
+        << R"({"type":"user","message":{"role":"user","content":"which word?"}})" << "\n";
+    bool truncated = false;
+    const std::vector<aic::TranscriptEntry> entries = aic::LoadTranscript(a, "chat-2", 100, truncated);
+    Expect(entries.size() == 3 && entries[0].kind == aic::EntryKind::User && entries[1].kind == aic::EntryKind::Compacted &&
+               entries[2].kind == aic::EntryKind::User && entries[2].text == L"which word?",
+           "a compacted chat: the mark, no summary");
+
     fs::remove_all(historyA, error);
     fs::remove_all(historyB, error);
     if (failures == 0) {

@@ -30,6 +30,7 @@ struct ClaudeOptions {
     // The claude.ai connectors and the user's other MCP servers; off, only ours: their tools' descriptions
     // would ride in every request.
     bool connectors = false;
+    std::string autocompact;  // --autocompact: the context size a chat is summed up at ("150k"); empty: the CLI's
 };
 
 // claude.exe in stream-json mode (see PLAN.md, "Протокол"): one process per chat, serving

@@ -8114,6 +8114,9 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
         case EntryKind::Assistant:
             Add(Kind::Assistant, entry.text);
             break;
+        case EntryKind::Compacted:
+            Add(Kind::Notice, L"Чат сжат: дальше Claude помнит начало по сводке");
+            break;
         case EntryKind::Tool: {
             const std::string own = OwnToolName(ToUtf8(entry.text));
             const Json input = Json::parse(entry.toolInput, nullptr, false);
@@ -8262,6 +8265,8 @@ bool ChatWindow::StartClaude() {
     options.model = settings_.model;
     options.effort = settings_.effort;
     options.connectors = settings_.connectors;
+    // Every turn reads the whole chat again: past 150k tokens it is summed up rather than left to grow.
+    options.autocompact = "150k";
     options.resume = sessionId_;  // a chat from the history, a restart, a crash: the same conversation
     route_ = options.proxy.empty() ? L"напрямую" : L"через " + options.proxy.substr(options.proxy.rfind(L'/') + 1);
 
@@ -8388,6 +8393,17 @@ void ChatWindow::OnClaude(const Json& message) {
         } else if (subtype == "session_state_changed") {
             stateEvents_ = true;
             busy_ = JsonStr(message, "state") != "idle";
+        } else if (subtype == "status" && JsonStr(message, "status") == "compacting") {
+            Flash(L"Сжимаю чат, чтобы дальше он тратил меньше лимита…", 8000);
+        } else if (subtype == "compact_boundary") {
+            // A long chat is summed up (--autocompact): every later turn reads the summary, not all of it.
+            const Json& meta = JsonAt(message, "compact_metadata");
+            const Json& before = JsonAt(meta, "pre_tokens");
+            const Json& after = JsonAt(meta, "post_tokens");
+            Add(Kind::Notice, before.is_number_integer() && after.is_number_integer()
+                                  ? std::format(L"Чат сжат: {} тыс. токенов → {} тыс.; дальше Claude помнит начало по сводке",
+                                                before.get<long long>() / 1000, std::max(1LL, after.get<long long>() / 1000))
+                                  : std::wstring(L"Чат сжат: дальше Claude помнит начало по сводке"));
         }
     } else if (type == "stream_event") {
         const Json& event = JsonAt(message, "event");

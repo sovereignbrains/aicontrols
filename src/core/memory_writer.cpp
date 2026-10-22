@@ -191,10 +191,14 @@ MemoryWrite WriteMemoryFromChat(const std::wstring& workspace, const std::string
         return result;
     }
     std::string chat;
+    if (workspace != DefaultWorkspace()) {  // the memory is every project's: what is learnt goes with this one
+        chat = "(Чат шёл в проекте «" + ToUtf8(fs::path(workspace).filename().wstring()) + "», папка " +
+               ToUtf8(workspace) + ".)\n\n";
+    }
     for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
         chat += *it + "\n\n";
     }
-    const std::wstring folder = MemoryFolder(workspace);
+    const std::wstring folder = SharedMemoryFolder();
 
     // The prompt goes in through a file on standard input (too long for a command line), the call runs in a
     // scratch folder and keeps no session: nothing of it shows among the chats.

@@ -134,6 +134,13 @@ constexpr UINT kPuffIdle = 7'000;        // ms between puffs while idle
 constexpr float kPuffSeconds = 1.2f;     // one puff, up and back
 constexpr float kPuffBusy = 0.18f;       // how much bigger at its fullest, while answering
 constexpr float kPuffCalm = 0.10f;       // ... and while idle
+// The middle button's scrolling, as browsers have it: a frame of it, the still zone round where it was pressed,
+// and held this long (or moved) it ends on release.
+constexpr UINT_PTR kPanTimer = 9;
+constexpr UINT kPanFrame = 16;           // ms
+constexpr float kPanStill = 10.f;
+constexpr ULONGLONG kPanHold = 300;      // ms
+constexpr float kBarStrip = 12.f;        // a scrollbar's strip a press takes: wider than the thumb drawn
 constexpr UINT_PTR kSubclassId = 1;
 constexpr size_t kTranscriptLimit = 200;
 
@@ -164,7 +171,8 @@ constexpr float kMinSidebar = 180.f;
 constexpr float kMaxSidebar = 480.f;
 constexpr uint32_t kTermFg = 0xd4d4d8;
 constexpr float kSidebar = 252.f;  // the left column: search, secrets, the chats
-constexpr float kHistoryRow = 34.f;
+constexpr float kHistoryRow = 34.f;  // a chat, or a project's head, in the sidebar
+constexpr float kProjectIndent = 14.f;  // a project's chats under its head
 constexpr float kNavRow = 34.f;
 constexpr float kMinChat = 420.f;  // the chat never gets narrower than this: side panels give way first
 constexpr float kMinChatPreview = 340.f;  // ... but beside a preview it may be a strip
@@ -416,8 +424,21 @@ Limit Current(const Limit& limit) {
     return limit;
 }
 
+// The lists that scroll: each has a bar at its right edge to be dragged, and scrolls under the middle button.
+enum class Scroller { None, Feed, Sidebar, Secrets, Terminal };
+
+// A list's scrollbar as laid out now: the strip a press takes, the thumb in it, and where the list is, in its
+// own units (DIPs for the feed, rows or lines for the others).
+struct ScrollBar {
+    D2D1_RECT_F strip{};
+    D2D1_RECT_F thumb{};
+    float pos = 0;
+    float max = 0;
+};
+
 enum class Target {
     None,
+    ScrollBar,  // row: a Scroller: its strip (the thumb, or beside it)
     SidebarToggle,
     SaveMemoryBtn,  // the header's "save the memory" (to its GitHub repository)
     Update,  // the header's "update to ..." (only while there is one)
@@ -459,7 +480,10 @@ enum class Target {
     SecretEye,     // show or hide the value being typed
     SecretCancel,  // leave editing a secret
     Send,
-    HistoryRow,   // row: an index into the filtered history
+    HistoryRow,   // row: an index into the sidebar's rows: a chat
+    ProjectRow,   // row: the same: a project's head (folds it or opens it)
+    ProjectNew,   // row: the same: "+" on the head, a new chat in that project
+    AddProject,   // "+" beside the projects' label: a folder or a GitHub repository
     ModelRow,     // row: an index into the main models
     MoreModels,   // the row that opens the other models
     MoreRow,      // row: an index into the other models
@@ -515,6 +539,7 @@ struct Geometry {
     D2D1_RECT_F secretCancel{};  // beside the save button while a secret is edited
     float secretsTop = 0;  // the first secret's row
     D2D1_RECT_F newItem{};  // the sidebar's "new chat" row
+    D2D1_RECT_F addProject{};  // "+" at the right of the projects' label
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
     D2D1_RECT_F computer{}; // under the input, at the left: where Claude works (this computer)
     D2D1_RECT_F folder{};   // ... and in which folder there
@@ -792,11 +817,13 @@ private:
 
     // The chat's folder: the default, recent ones, any folder, or a GitHub repository (cloned first).
     void LoadRepos();
-    void SwitchWorkspace(const std::wstring& folder);
+    void SetWorkspace(const std::wstring& folder);  // the folder only: it becomes a project, unfolded
+    void SwitchWorkspace(const std::wstring& folder);  // ... and a new chat starts there
+    void NewChatIn(const std::wstring& folder);
     void PickWorkspace();
     void OpenRepo(size_t index);
     void OnCloneDone(const CloneDone& done);
-    void ShowFolderMenu();
+    void ShowFolderMenu(POINT screen, bool above);
     void ShowPermissionMenu();
     std::wstring PermissionName() const;
     bool AllowedUnasked(const std::string& tool, const Json& input) const;
@@ -906,14 +933,48 @@ private:
     void SetPreviewWide(bool wide);
     float MinChat() const { return PreviewShown() ? kMinChatPreview : kMinChat; }
 
-    // The sidebar: search, the way to the secrets, the chats (or the secrets view in their place).
+    // The sidebar: search, the way to the secrets, the projects with their chats (or the secrets view in their
+    // place). A project is a folder its chats work in; the general one (DefaultWorkspace) is always first.
+    struct Project {
+        std::wstring folder;
+        std::wstring name;
+        std::vector<SessionInfo> sessions;  // newest first
+    };
+    static constexpr size_t kHead = SIZE_MAX;
+    struct SideRow {  // one row of the list: a project's head, or one of its chats
+        size_t project = 0;
+        size_t session = kHead;  // an index into its sessions; kHead: the project's own row
+    };
     void PaintSidebar(const Geometry& g);
     static size_t SidebarRows(const Geometry& g);
+    D2D1_RECT_F SideRowRect(const Geometry& g, size_t row) const;  // empty when it is scrolled out of view
+    static D2D1_RECT_F ProjectNewRect(const D2D1_RECT_F& head);
+    const SessionInfo* RowSession(size_t row) const;
+    const Project* RowProject(size_t row) const;
+    std::optional<size_t> RevealChat(const std::wstring& folder, const std::string& id);  // its row, made visible
     void SetSidebarOpen(bool open);
     void FocusSearch();
     void RefreshSessions();
     void OnSearchKey(WPARAM key);
     void OnSearchChar(wchar_t c);
+    bool ProjectFolded(const std::wstring& folder) const;
+    void ToggleProject(size_t row);
+    void ShowProjectMenu(size_t row, POINT screen);
+    void RemoveProject(const std::wstring& folder);
+    static std::wstring ProjectName(const std::wstring& folder);
+    std::string ProjectPrompt() const;  // tells Claude which project the chat is about
+
+    // Scrollbars: every list's thumb is taken and dragged (a press beside it brings it there), and the middle
+    // button scrolls whichever list it went down on.
+    std::optional<ScrollBar> Bar(const Geometry& g, Scroller s) const;
+    Scroller ScrollerAt(const Geometry& g, float x, float y) const;
+    void ScrollTo(Scroller s, float pos);       // in the list's own units, kept within it
+    void ScrollDips(Scroller s, float dips);    // the middle button's: DIPs into those units, the rest kept
+    void DragBar(float y);
+    void PaintBar(const Geometry& g, Scroller s);
+    void StartPan(Scroller s, D2D1_POINT_2F at);
+    void StopPan();
+    void PanStep();
 
     // The secrets view: names and masked values, delete, and a form to add or replace one.
     static LRESULT CALLBACK SecretEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id,
@@ -930,10 +991,8 @@ private:
     static D2D1_RECT_F SecretRowRect(const Geometry& g, size_t index);
     static D2D1_RECT_F SecretDeleteRect(const D2D1_RECT_F& row);
     static size_t SecretRowsFit(const Geometry& g);
-    // A list that is longer than its room: the first row shown is kept within the list, and a thin thumb on the
-    // panel's edge shows where in the list the window is (brighter while the pointer is over the panel).
+    // A list that is longer than its room: the first row shown is kept within the list.
     static size_t ClampFirst(size_t first, size_t total, size_t rows) { return total > rows ? std::min(first, total - rows) : 0; }
-    void PaintListThumb(float x, float top, float bottom, size_t first, size_t rows, size_t total, bool bright);
     std::wstring FieldText(HWND field) const;
     void Ring(D2D1_POINT_2F center, float radius, float fraction, uint32_t color);
     void Text(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect, uint32_t color);
@@ -986,14 +1045,15 @@ private:
     void PasteClipboard();
     void ShowInputMenu(POINT screen);
     void ShowCopyMenu(POINT screen, D2D1_POINT_2F at);
-    void ShowChatMenu(size_t filteredIndex, POINT screen);
+    void ShowChatMenu(size_t row, POINT screen);
     void Attached();
 
     void OpenPopup(Popup popup);
     void ClosePopup();
     void FilterSessions();
     void MoveSelection(int delta);
-    void OpenSession(size_t filteredIndex);
+    void OpenSession(size_t row);
+    void OpenChat(std::wstring folder, SessionInfo session);  // copies: the lists are made again on the way
 
     void IndexModels();
     const Json* CurrentModel() const;
@@ -1085,6 +1145,14 @@ private:
     float sidebarWidth_ = kSidebar;   // as dragged; kept in the settings
     float terminalWidth_ = kTerminal;
     Target dragging_ = Target::None;  // a splitter being dragged
+    Scroller barDrag_ = Scroller::None;  // a scrollbar's thumb being dragged
+    float barGrab_ = 0;                  // ... where in the thumb the pointer holds it
+    Scroller pan_ = Scroller::None;      // the middle button's scrolling
+    D2D1_POINT_2F panAt_{};              // ... where it went down
+    ULONGLONG panSince_ = 0;
+    bool panMoved_ = false;
+    bool panEndedByPress_ = false;       // the press that ended it: its release does nothing else
+    float panRemainder_ = 0;             // the part of a row or a line not scrolled yet
     bool sidebarOpen_ = true;
     bool searchFocus_ = false;  // typing goes to the sidebar's search (drawn here, no caret)
     bool secretsOpen_ = false;  // the sidebar shows the secrets instead of the chats
@@ -1138,9 +1206,9 @@ private:
     bool trackingMouse_ = false;
 
     Popup popup_ = Popup::None;
-    // History.
-    std::vector<SessionInfo> sessions_;
-    std::vector<size_t> filtered_;
+    // The sidebar's projects and chats, and its rows as shown (folded projects and the search leave some out).
+    std::vector<Project> projects_;
+    std::vector<SideRow> rows_;
     std::wstring searchText_;
     size_t firstRow_ = 0;
     size_t secretsFirst_ = 0;  // the first secret shown when they do not all fit
@@ -1152,6 +1220,7 @@ private:
     Rename renaming_ = Rename::None;
     WPARAM renameTab_ = 0;      // the tab's id
     std::string renameChat_;    // the chat's session id
+    std::wstring renameFolder_; // ... and its project's folder
     std::wstring renameText_;
     D2D1_POINT_2F mouse_{-1.f, -1.f};  // the pointer in DIPs; off the window after it leaves
     size_t selected_ = 0;
@@ -1165,7 +1234,7 @@ private:
     bool draggingEffort_ = false;
 
     std::wstring workspace_;
-    std::wstring folderName_;  // its last component, for the chip under the input
+    std::wstring folderName_;  // its project's name, for the chip under the input
     Settings settings_;
     Json models_ = Json::array();
     std::string userName_;
@@ -1190,19 +1259,14 @@ private:
 };
 
 int ChatWindow::Run(int show) {
-    workspace_ = DefaultWorkspace();
-    folderName_ = std::filesystem::path(workspace_).filename().wstring();
-    if (folderName_.empty()) {
-        folderName_ = workspace_;
-    }
-    tools_.SetCwd(workspace_);
     secrets_.Load();
     settings_ = LoadSettings();
+    workspace_ = DefaultWorkspace();
     if (std::error_code error; !settings_.workspace.empty() && std::filesystem::is_directory(settings_.workspace, error)) {
-        workspace_ = settings_.workspace;  // the folder chosen last time
-        folderName_ = std::filesystem::path(workspace_).filename().wstring();
-        tools_.SetCwd(workspace_);
+        workspace_ = settings_.workspace;  // the project chosen last time
     }
+    folderName_ = ProjectName(workspace_);
+    tools_.SetCwd(workspace_);
     if (settings_.sidebarWidth > 0) {
         sidebarWidth_ = std::clamp(settings_.sidebarWidth, kMinSidebar, kMaxSidebar);
     }
@@ -1279,9 +1343,10 @@ int ChatWindow::Run(int show) {
     if (!settings_.reopen.empty()) {  // back from an update: the chat it was in
         const std::string id = std::exchange(settings_.reopen, std::string());
         SaveSettings(settings_);
-        for (size_t i = 0; i < filtered_.size(); ++i) {
-            if (sessions_[filtered_[i]].id == id) {
-                OpenSession(i);
+        for (const Project& project : projects_) {
+            const auto found = std::ranges::find(project.sessions, id, &SessionInfo::id);
+            if (project.folder == workspace_ && found != project.sessions.end()) {
+                OpenChat(project.folder, *found);
                 break;
             }
         }
@@ -1581,6 +1646,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (overSplit) {
             Refresh();  // the lit stretch of the edge follows the pointer
         }
+        if (pan_ != Scroller::None) {  // the middle button's scrolling: its frames move the list
+            return 0;
+        }
+        if (barDrag_ != Scroller::None) {
+            DragBar(at.y);
+            return 0;
+        }
         if (draggingEffort_) {
             SetEffortAt(at.x);
             return 0;
@@ -1648,7 +1720,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT && reinterpret_cast<HWND>(wParam) == hwnd_) {
             const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup &&
-                                   hover_.target != Target::TermScreen;
+                                   hover_.target != Target::TermScreen && hover_.target != Target::ScrollBar;
             bool text = hover_.target == Target::TermScreen;
             bool link = false;
             if (hover_.target == Target::None && popup_ == Popup::None && HasConversation()) {  // over the feed: text
@@ -1670,6 +1742,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONDOWN: {
         const D2D1_POINT_2F at = CursorDip(lParam);
         HideTip();
+        if (pan_ != Scroller::None) {  // a press ends the middle button's scrolling, and does nothing else
+            StopPan();
+            panEndedByPress_ = true;
+            return 0;
+        }
         if (renaming_ != Rename::None) {  // a click elsewhere keeps what was typed
             CommitRename();
         }
@@ -1677,6 +1754,18 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             popup_ == Popup::None && (target == Target::SplitSidebar || target == Target::SplitTerminal)) {
             dragging_ = target;
             SetCapture(hwnd_);
+            return 0;
+        }
+        if (const Hit hit = HitTest(at.x, at.y); popup_ == Popup::None && hit.target == Target::ScrollBar) {
+            const auto scroller = static_cast<Scroller>(hit.row);
+            if (const auto bar = Bar(Layout(), scroller)) {
+                // Taken on the thumb, it is held where it was taken; beside it, the thumb comes there first.
+                const float thumb = bar->thumb.bottom - bar->thumb.top;
+                barGrab_ = Inside(bar->thumb, at.x, at.y) ? at.y - bar->thumb.top : thumb / 2;
+                barDrag_ = scroller;
+                SetCapture(hwnd_);
+                DragBar(at.y);
+            }
             return 0;
         }
         if (popup_ == Popup::None && Screen() && HitTest(at.x, at.y).target == Target::TermScreen) {
@@ -1712,6 +1801,16 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_LBUTTONUP: {
+        if (std::exchange(panEndedByPress_, false)) {
+            return 0;
+        }
+        if (barDrag_ != Scroller::None) {
+            barDrag_ = Scroller::None;
+            ReleaseCapture();
+            hover_ = HitTest(CursorDip(lParam).x, CursorDip(lParam).y);
+            Refresh();
+            return 0;
+        }
         if (dragging_ != Target::None) {
             dragging_ = Target::None;
             ReleaseCapture();
@@ -1763,6 +1862,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_MOUSEWHEEL: {
         HideTip();
+        StopPan();  // the wheel takes over from the middle button
         POINT at{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(hwnd_, &at);
         const float steps = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
@@ -1785,7 +1885,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             Refresh();
         } else if (popup_ == Popup::None && !secretsOpen_ && Inside(g.sidebar, ToDip(at.x), ToDip(at.y))) {
             const auto moved = static_cast<long long>(firstRow_) + wholeRows(3.f);
-            firstRow_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), filtered_.size(), SidebarRows(g));
+            firstRow_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), rows_.size(), SidebarRows(g));
             hover_ = HitTest(ToDip(at.x), ToDip(at.y));
             Refresh();
         } else if (popup_ == Popup::None) {
@@ -1793,7 +1893,42 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+    case WM_MBUTTONDOWN: {  // the middle button on a list: it scrolls by where the pointer goes, as in browsers
+        HideTip();
+        if (pan_ != Scroller::None) {
+            StopPan();
+            return 0;
+        }
+        const D2D1_POINT_2F at = CursorDip(lParam);
+        if (popup_ == Popup::None && barDrag_ == Scroller::None && dragging_ == Target::None) {
+            if (const Scroller scroller = ScrollerAt(Layout(), at.x, at.y); scroller != Scroller::None) {
+                StartPan(scroller, at);
+            }
+        }
+        return 0;
+    }
+    case WM_MBUTTONUP:  // held and moved, it ends on release; clicked, it goes on until the next press
+        if (pan_ != Scroller::None && (panMoved_ || GetTickCount64() - panSince_ >= kPanHold)) {
+            StopPan();
+        }
+        return 0;
+    case WM_RBUTTONDOWN:
+        if (pan_ != Scroller::None) {
+            StopPan();
+            panEndedByPress_ = true;
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:  // another window took the mouse (a menu, a dialog): what was held is let go
+        if (reinterpret_cast<HWND>(lParam) != hwnd_) {
+            barDrag_ = Scroller::None;
+            StopPan();
+        }
+        break;
     case WM_RBUTTONUP:
+        if (std::exchange(panEndedByPress_, false)) {
+            return 0;
+        }
         if (popup_ == Popup::None && Screen() &&
             HitTest(CursorDip(lParam).x, CursorDip(lParam).y).target == Target::TermScreen) {
             if (HasTermSelection()) {  // as in Windows Terminal: a right click copies a selection, else pastes
@@ -1821,6 +1956,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             switch (const Hit hit = HitTest(at.x, at.y); hit.target) {
             case Target::HistoryRow:
                 ShowChatMenu(hit.row, screen);
+                return 0;
+            case Target::ProjectRow:
+            case Target::ProjectNew:
+                ShowProjectMenu(hit.row, screen);
                 return 0;
             case Target::TermTab:
             case Target::TermTabClose:
@@ -1858,6 +1997,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_KEYDOWN:
         HideTip();
+        if (pan_ != Scroller::None) {  // a key ends the middle button's scrolling, and does nothing else
+            StopPan();
+            return 0;
+        }
         if (renaming_ != Rename::None) {
             OnRenameKey(wParam);
         } else if (popup_ != Popup::None) {
@@ -1907,6 +2050,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             OnPuffFrame();
         } else if (wParam == kPuffIdleTimer) {
             StartPuff();
+        } else if (wParam == kPanTimer) {
+            PanStep();
         } else if (wParam == kTipTimer) {
             KillTimer(hwnd_, kTipTimer);
             if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
@@ -2118,6 +2263,22 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::HistoryRow:
         OpenSession(hit.row);
         break;
+    case Target::ProjectRow:
+        ToggleProject(hit.row);
+        break;
+    case Target::ProjectNew:
+        if (const Project* project = RowProject(hit.row)) {
+            NewChatIn(std::wstring(project->folder));
+        }
+        break;
+    case Target::AddProject: {
+        const Geometry g = Layout();
+        POINT screen{ToPx(g.addProject.left), ToPx(g.addProject.bottom + 4.f)};
+        ClientToScreen(hwnd_, &screen);
+        ShowFolderMenu(screen, false);
+        keepFocus = true;
+        break;
+    }
     case Target::ModelChip:
         OpenPopup(Popup::Models);
         break;
@@ -2131,10 +2292,14 @@ void ChatWindow::OnClick(float x, float y) {
         OpenPopup(Popup::Usage);
         break;
     case Target::FolderChip:
-    case Target::ComputerChip:  // the only place for now; servers will join it
-        ShowFolderMenu();
+    case Target::ComputerChip: {  // the only place for now; servers will join it
+        const Geometry g = Layout();
+        POINT screen{ToPx(g.computer.left), ToPx(g.computer.top - 4.f)};
+        ClientToScreen(hwnd_, &screen);
+        ShowFolderMenu(screen, true);
         keepFocus = true;
         break;
+    }
     case Target::Secrets:
         SetSecretsOpen(true);
         keepFocus = true;
@@ -2438,7 +2603,8 @@ Geometry ChatWindow::Layout() const {
         g.newItem = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
         g.secrets = D2D1::RectF(6, g.newItem.bottom + 2, sidebarWidth - 6, g.newItem.bottom + 2 + kNavRow);
         g.account = D2D1::RectF(6, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
-        g.listTop = g.secrets.bottom + 8 + 26;  // under the "chats" label
+        g.addProject = D2D1::RectF(sidebarWidth - 10 - 24, g.secrets.bottom + 7, sidebarWidth - 10, g.secrets.bottom + 31);
+        g.listTop = g.secrets.bottom + 8 + 26;  // under the "projects" label
         g.listBottom = g.account.top - 6;
     }
     if (termWidth > 0) {
@@ -2561,6 +2727,13 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.splitTerminal, x, y)) {
         return {Target::SplitTerminal};
     }
+    if (popup_ == Popup::None) {  // a list's scrollbar: before its rows, which reach under it
+        for (const Scroller s : {Scroller::Feed, Scroller::Sidebar, Scroller::Secrets, Scroller::Terminal}) {
+            if (const auto bar = Bar(g, s); bar && Inside(bar->strip, x, y)) {
+                return {Target::ScrollBar, static_cast<size_t>(s)};
+            }
+        }
+    }
     if (secretsOpen_ && Inside(g.panel, x, y)) {  // the sidebar in its secrets view
         if (Inside(g.panelClose, x, y)) {
             return {Target::SecretsClose};
@@ -2601,10 +2774,17 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.secrets, x, y)) {
             return {Target::Secrets};
         }
+        if (Inside(g.addProject, x, y)) {
+            return {Target::AddProject};
+        }
         if (y >= g.listTop && y < g.listBottom) {
             const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
-            if (row < filtered_.size() && row < firstRow_ + SidebarRows(g)) {
-                return {Target::HistoryRow, row};
+            if (row < rows_.size() && row < firstRow_ + SidebarRows(g)) {
+                if (rows_[row].session != kHead) {
+                    return {Target::HistoryRow, row};
+                }
+                return Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
+                                                                          : Hit{Target::ProjectRow, row};
             }
         }
         return {};
@@ -2984,6 +3164,12 @@ void ChatWindow::Paint() {
             Fill(D2D1::RectF(x - 1.f, top, x + 1.f, bottom), 1.f, kAccent);
         }
     }
+    if (pan_ != Scroller::None) {  // where the middle button went down: the farther from it, the faster
+        Fill(D2D1::RectF(panAt_.x - 12.f, panAt_.y - 12.f, panAt_.x + 12.f, panAt_.y + 12.f), 12.f, 0x14181f, 0.85f);
+        brush_->SetColor(Color(kPrimary, 0.6f));
+        target_->DrawEllipse(D2D1::Ellipse(panAt_, 12.f, 12.f), brush_.get(), 1.2f);
+        Fill(D2D1::RectF(panAt_.x - 2.5f, panAt_.y - 2.5f, panAt_.x + 2.5f, panAt_.y + 2.5f), 2.5f, kPrimary, 0.85f);
+    }
     switch (popup_) {
     case Popup::Models:
         PaintModels(g);
@@ -3073,12 +3259,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         }
         Text(shown, ui_.get(), D2D1::RectF(left + (busy_ || recorder_.Recording() || transcribing_ ? 18.f : 0.f), y, left + g.column, y + kStatusRow), kSecondary);
     }
-    if (maxScroll_ > 0) {  // a thin scroll thumb on the right edge
-        const float track = g.feed.bottom - g.feed.top;
-        const float thumb = std::max(24.f, track * track / (track + maxScroll_));
-        const float top = g.feed.top + (track - thumb) * (scroll_ / maxScroll_);
-        Fill(D2D1::RectF(g.area - 7.f, top, g.area - 3.f, top + thumb), 2.f, kLine);
-    }
+    PaintBar(g, Scroller::Feed);
     target_->PopAxisAlignedClip();
 }
 
@@ -3808,8 +3989,7 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
     const size_t fit = SecretRowsFit(g);
     secretsFirst_ = ClampFirst(secretsFirst_, names.size(), fit);
     const size_t shown = std::min(names.size() - secretsFirst_, fit);
-    PaintListThumb(g.panel.right - 5.f, g.secretsTop, g.secretsTop + static_cast<float>(fit) * kSecretRow, secretsFirst_, fit,
-                   names.size(), Inside(g.panel, mouse_.x, mouse_.y));
+    PaintBar(g, Scroller::Secrets);
     for (size_t slot = 0; slot < shown; ++slot) {
         const size_t i = secretsFirst_ + slot;
         const D2D1_RECT_F row = SecretRowRect(g, slot);
@@ -4510,15 +4690,8 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
             target_->DrawRectangle(block, brush_.get(), 1.f);
         }
     }
-    if (Screen()->ScrollbackSize() > 0) {  // where the view is within the scrollback
-        const float track = g.termScreen.bottom - g.termScreen.top;
-        const float total = static_cast<float>(Screen()->LineCount());
-        const float thumb = std::max(20.f, track * static_cast<float>(rows) / total);
-        const float shown = static_cast<float>(first) / std::max(1.f, total - static_cast<float>(rows));
-        const float top = g.termScreen.top + (track - thumb) * std::clamp(shown, 0.f, 1.f);
-        Fill(D2D1::RectF(g.term.right - 6.f, top, g.term.right - 3.f, top + thumb), 1.5f, kLine);
-    }
     target_->PopAxisAlignedClip();
+    PaintBar(g, Scroller::Terminal);  // where the view is within the scrollback
 }
 
 // ---- The account --------------------------------------------------------------------------------
@@ -5076,36 +5249,44 @@ void ChatWindow::LoadRepos() {
     });
 }
 
-// The chats now work in `folder`: a new chat starts there, with that folder's history in the sidebar.
+// The chat's folder is `folder`: a project in the sidebar from now on (added at the end), unfolded.
+void ChatWindow::SetWorkspace(const std::wstring& folder) {
+    workspace_ = folder;
+    folderName_ = ProjectName(folder);
+    tools_.SetCwd(folder);
+    const bool general = folder == DefaultWorkspace();
+    settings_.workspace = general ? std::wstring() : folder;
+    if (!general && std::ranges::find(settings_.projects, folder) == settings_.projects.end()) {
+        settings_.projects.push_back(folder);
+    }
+    std::erase(settings_.closedProjects, folder);
+    SaveSettings(settings_);
+}
+
+// The chats now work in `folder`: a new chat starts there.
 void ChatWindow::SwitchWorkspace(const std::wstring& folder) {
     if (folder.empty() || folder == workspace_) {
         return;
     }
-    if (busy_ && MessageBoxW(hwnd_, L"Claude сейчас отвечает. Сменить папку и начать новый чат?", L"AIControls",
+    if (busy_ && MessageBoxW(hwnd_, L"Claude сейчас отвечает. Перейти в другой проект и начать новый чат?", L"AIControls",
                              MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
-    workspace_ = folder;
-    folderName_ = std::filesystem::path(folder).filename().wstring();
-    if (folderName_.empty()) {
-        folderName_ = folder;
-    }
-    tools_.SetCwd(folder);
-    settings_.workspace = folder == DefaultWorkspace() ? std::wstring() : folder;
-    std::erase(settings_.recentFolders, folder);
-    settings_.recentFolders.insert(settings_.recentFolders.begin(), folder);
-    if (settings_.recentFolders.size() > 8) {
-        settings_.recentFolders.resize(8);
-    }
-    SaveSettings(settings_);
+    SetWorkspace(folder);
     ResetChat();
     StartClaude();
-    firstRow_ = 0;
-    selected_ = 0;
     RefreshSessions();
     PlaceChildren();
-    Flash(L"Папка чата: " + folderName_, 2500);
+    Flash(L"Проект: " + folderName_, 2500);
     Refresh();
+}
+
+void ChatWindow::NewChatIn(const std::wstring& folder) {
+    if (folder == workspace_) {
+        NewChat();
+    } else {
+        SwitchWorkspace(folder);
+    }
 }
 
 void ChatWindow::PickWorkspace() {
@@ -5180,7 +5361,9 @@ void ChatWindow::OnCloneDone(const CloneDone& done) {
     Refresh();
 }
 
-void ChatWindow::ShowFolderMenu() {
+// The projects (a folder on this computer each) to work in, and the ways to add one: any folder, or a GitHub
+// repository (cloned first).
+void ChatWindow::ShowFolderMenu(POINT screen, bool above) {
     constexpr UINT kDefault = 2;
     constexpr UINT kPick = 3;
     constexpr UINT kReload = 4;
@@ -5188,13 +5371,13 @@ void ChatWindow::ShowFolderMenu() {
     constexpr UINT kRepo = 1000;
     const std::wstring standard = DefaultWorkspace();
     wil::unique_hmenu menu(CreatePopupMenu());
-    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, L"Этот компьютер — папка");
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, L"Проект — папка на этом компьютере");
     AppendMenuW(menu.get(), MF_STRING | (workspace_ == standard ? MF_CHECKED : 0), kDefault,
-                (std::filesystem::path(standard).filename().wstring() + L"\tпо умолчанию").c_str());
+                (ProjectName(standard) + L"\t" + std::filesystem::path(standard).filename().wstring()).c_str());
     std::vector<std::wstring> recent;
-    for (const std::wstring& folder : settings_.recentFolders) {
+    for (const std::wstring& folder : settings_.projects) {
         std::error_code error;
-        if (folder != standard && recent.size() < 8 && std::filesystem::is_directory(folder, error)) {
+        if (folder != standard && kRecent + recent.size() < kRepo && std::filesystem::is_directory(folder, error)) {
             recent.push_back(folder);
             // The folder's name, and where it is (its parent) quieter at the right.
             const std::filesystem::path path(folder);
@@ -5227,10 +5410,7 @@ void ChatWindow::ShowFolderMenu() {
     AppendMenuW(menu.get(), MF_POPUP | (cloning_ ? MF_GRAYED : 0), reinterpret_cast<UINT_PTR>(repoMenu.release()),
                 cloning_ ? (L"Клонирую " + cloningName_ + L"…").c_str() : L"Репозитории GitHub");
 
-    const Geometry g = Layout();
-    POINT screen{ToPx(g.computer.left), ToPx(g.computer.top - 4.f)};
-    ClientToScreen(hwnd_, &screen);
-    const auto chosen = static_cast<UINT>(Menu(menu.get(), screen, true));
+    const auto chosen = static_cast<UINT>(Menu(menu.get(), screen, above));
     if (chosen == kDefault) {
         SwitchWorkspace(standard);
     } else if (chosen == kPick) {
@@ -5399,45 +5579,410 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
              D2D1::RectF(g.secrets.left + 42, g.secrets.top, g.secrets.right - 8, g.secrets.bottom), color);
     }
 
-    Text(L"Чаты", ui_.get(),
-         D2D1::RectF(g.sidebar.left + 16, g.secrets.bottom + 8, g.sidebar.right - 10, g.secrets.bottom + 8 + 22),
-         kSecondary);
-    if (filtered_.empty()) {
-        const std::wstring empty = sessions_.empty() ? L"Чатов пока нет" : L"Ничего не найдено";
-        Text(empty, ui_.get(),
+    {  // the projects' label, and "+" for another one
+        Text(L"Проекты", ui_.get(),
+             D2D1::RectF(g.sidebar.left + 16, g.secrets.bottom + 8, g.addProject.left - 4, g.secrets.bottom + 8 + 22),
+             kSecondary);
+        const bool active = hover_.target == Target::AddProject;
+        if (active) {
+            Fill(g.addProject, 6.f, kRaised);
+        }
+        const uint32_t color = active ? kPrimary : kSecondary;
+        const D2D1_POINT_2F c{(g.addProject.left + g.addProject.right) / 2, (g.addProject.top + g.addProject.bottom) / 2};
+        Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
+        Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
+    }
+    if (rows_.empty()) {
+        Text(L"Ничего не найдено", ui_.get(),
              D2D1::RectF(g.sidebar.left + 16, g.listTop, g.sidebar.right - 10, g.listTop + kHistoryRow), kSecondary);
         return;
     }
-    firstRow_ = ClampFirst(firstRow_, filtered_.size(), SidebarRows(g));
-    const size_t last = std::min(filtered_.size(), firstRow_ + SidebarRows(g));
-    PaintListThumb(g.sidebar.right - 5.f, g.listTop, g.listBottom, firstRow_, SidebarRows(g), filtered_.size(),
-                   Inside(g.sidebar, mouse_.x, mouse_.y));
+    firstRow_ = ClampFirst(firstRow_, rows_.size(), SidebarRows(g));
+    const size_t last = std::min(rows_.size(), firstRow_ + SidebarRows(g));
     for (size_t row = firstRow_; row < last; ++row) {
-        const SessionInfo& session = sessions_[filtered_[row]];
-        const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
-        const D2D1_RECT_F r = D2D1::RectF(g.sidebar.left + 6, top, g.sidebar.right - 6, top + kHistoryRow);
-        if (renaming_ == Rename::Chat && session.id == renameChat_) {
-            PaintRenameField(r);
+        const D2D1_RECT_F r = SideRowRect(g, row);
+        const Project& project = projects_[rows_[row].project];
+        const bool hovered = (hover_.target == Target::HistoryRow || hover_.target == Target::ProjectRow ||
+                              hover_.target == Target::ProjectNew) &&
+                             hover_.row == row;
+        if (rows_[row].session == kHead) {
+            // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
+            // chat in it under the pointer, else how many chats it has.
+            if (hovered) {
+                Fill(r, 8.f, kRaised);
+            }
+            const D2D1_POINT_2F c{r.left + 14.f, (r.top + r.bottom) / 2};
+            if (!searchText_.empty() || !ProjectFolded(project.folder)) {
+                Line({c.x - 4.f, c.y - 2.f}, {c.x, c.y + 2.f}, kSecondary, 1.4f);
+                Line({c.x, c.y + 2.f}, {c.x + 4.f, c.y - 2.f}, kSecondary, 1.4f);
+            } else {
+                Line({c.x - 2.f, c.y - 4.f}, {c.x + 2.f, c.y}, kSecondary, 1.4f);
+                Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.4f);
+            }
+            const D2D1_RECT_F plus = ProjectNewRect(r);
+            Text(project.name, uiBold_.get(), D2D1::RectF(r.left + 28, r.top, plus.left - 4, r.bottom),
+                 project.folder == workspace_ ? kPrimary : kSecondary);
+            if (hovered) {
+                const bool on = hover_.target == Target::ProjectNew;
+                if (on) {
+                    Fill(plus, 6.f, kLine);
+                }
+                const D2D1_POINT_2F p{(plus.left + plus.right) / 2, (plus.top + plus.bottom) / 2};
+                Line({p.x - 5.f, p.y}, {p.x + 5.f, p.y}, on ? kPrimary : kSecondary, 1.5f);
+                Line({p.x, p.y - 5.f}, {p.x, p.y + 5.f}, on ? kPrimary : kSecondary, 1.5f);
+            } else if (!project.sessions.empty()) {
+                Text(std::to_wstring(project.sessions.size()), uiRight_.get(), plus, kSecondary);
+            }
             continue;
         }
-        const bool hovered = hover_.target == Target::HistoryRow && hover_.row == row;
-        if (hovered || (searchFocus_ && row == selected_)) {
-            Fill(r, 8.f, kRaised);
+        const SessionInfo& session = project.sessions[rows_[row].session];
+        const D2D1_RECT_F chat = D2D1::RectF(r.left + kProjectIndent, r.top, r.right, r.bottom);
+        if (renaming_ == Rename::Chat && session.id == renameChat_ && project.folder == renameFolder_) {
+            PaintRenameField(chat);
+            continue;
         }
-        const bool current = session.id == sessionId_;
+        if (hovered || (searchFocus_ && row == selected_)) {
+            Fill(chat, 8.f, kRaised);
+        }
+        const bool current = session.id == sessionId_ && project.folder == workspace_;
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
-             D2D1::RectF(r.left + 10, r.top, r.right - 8, r.bottom), current ? kAccent : kPrimary);
+             D2D1::RectF(chat.left + 10, chat.top, chat.right - 8, chat.bottom), current ? kAccent : kPrimary);
+    }
+    PaintBar(g, Scroller::Sidebar);
+}
+
+D2D1_RECT_F ChatWindow::SideRowRect(const Geometry& g, size_t row) const {
+    if (row < firstRow_ || row >= firstRow_ + SidebarRows(g)) {
+        return {};
+    }
+    const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
+    return D2D1::RectF(g.sidebar.left + 6, top, g.sidebar.right - 6, top + kHistoryRow);
+}
+
+// Clear of the scrollbar's strip, which takes the row's right end when the list scrolls.
+D2D1_RECT_F ChatWindow::ProjectNewRect(const D2D1_RECT_F& head) {
+    return D2D1::RectF(head.right - 34, head.top + 5, head.right - 10, head.bottom - 5);
+}
+
+const ChatWindow::Project* ChatWindow::RowProject(size_t row) const {
+    return row < rows_.size() ? &projects_[rows_[row].project] : nullptr;
+}
+
+const SessionInfo* ChatWindow::RowSession(size_t row) const {
+    if (row >= rows_.size() || rows_[row].session == kHead) {
+        return nullptr;
+    }
+    return &projects_[rows_[row].project].sessions[rows_[row].session];
+}
+
+bool ChatWindow::ProjectFolded(const std::wstring& folder) const {
+    return std::ranges::find(settings_.closedProjects, folder) != settings_.closedProjects.end();
+}
+
+std::wstring ChatWindow::ProjectName(const std::wstring& folder) {
+    if (folder == DefaultWorkspace()) {
+        return L"Общее";
+    }
+    std::wstring name = std::filesystem::path(folder).filename().wstring();
+    return name.empty() ? folder : name;
+}
+
+// The chat's project, for Claude: a request is about it unless the user names another. The memory is the same
+// for every project (StartClaude points the CLI at it), so its note there is what to read first.
+std::string ChatWindow::ProjectPrompt() const {
+    if (workspace_ == DefaultWorkspace()) {
+        return " This chat is in the general workspace, not in one of the user's projects: when a bug, a task or a "
+               "change could be about more than one project, ask which one before changing anything.";
+    }
+    return " This chat belongs to the user's project \"" + ToUtf8(folderName_) + "\" (" + ToUtf8(workspace_) +
+           "), which is also its working directory: a bug, a task or a change the user mentions is about this "
+           "project unless they name another. Your memory is shared by all the user's projects: before working, "
+           "read this project's note if the memory index has one.";
+}
+
+void ChatWindow::ToggleProject(size_t row) {
+    const Project* project = RowProject(row);
+    if (project == nullptr || !searchText_.empty()) {  // the search shows every project it finds unfolded
+        return;
+    }
+    const std::wstring folder = project->folder;
+    if (ProjectFolded(folder)) {
+        std::erase(settings_.closedProjects, folder);
+    } else {
+        settings_.closedProjects.push_back(folder);
+    }
+    SaveSettings(settings_);
+    const size_t first = firstRow_;
+    FilterSessions();
+    firstRow_ = first;  // kept within the list when painted
+    hover_ = HitTest(mouse_.x, mouse_.y);
+    Refresh();
+}
+
+// A project's menu in the sidebar: a new chat in it, fold it, its folder, or take it off the list.
+void ChatWindow::ShowProjectMenu(size_t row, POINT screen) {
+    const Project* project = RowProject(row);
+    if (project == nullptr) {
+        return;
+    }
+    const std::wstring folder = project->folder;
+    constexpr UINT kNew = 1, kFold = 2, kOpen = 3, kRemove = 4;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат в проекте");
+    AppendMenuW(menu.get(), MF_STRING | (searchText_.empty() ? 0 : MF_GRAYED), kFold,
+                ProjectFolded(folder) ? L"Развернуть" : L"Свернуть");
+    AppendMenuW(menu.get(), MF_STRING, kOpen, L"Открыть папку");
+    if (folder != DefaultWorkspace()) {
+        AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu.get(), MF_STRING, kRemove, L"Убрать из списка");
+    }
+    switch (Menu(menu.get(), screen)) {
+    case kNew:
+        NewChatIn(folder);
+        break;
+    case kFold:
+        ToggleProject(row);
+        break;
+    case kOpen:
+        ShellExecuteW(hwnd_, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        break;
+    case kRemove:
+        RemoveProject(folder);
+        break;
+    default:
+        return;
+    }
+    SetFocus(input_);
+}
+
+// Off the sidebar only: the folder and its chats stay where they are, and picking the folder again brings them back.
+void ChatWindow::RemoveProject(const std::wstring& folder) {
+    if (folder == workspace_) {
+        SwitchWorkspace(DefaultWorkspace());
+        if (folder == workspace_) {
+            return;  // the answer running was kept
+        }
+    }
+    std::erase(settings_.projects, folder);
+    std::erase(settings_.closedProjects, folder);
+    SaveSettings(settings_);
+    RefreshSessions();
+    hover_ = {};
+    Flash(L"Проект убран из списка, папка и чаты на месте", 3000);
+    Refresh();
+}
+
+// A chat's row, shown: the search that hides it is cleared and its project unfolded.
+std::optional<size_t> ChatWindow::RevealChat(const std::wstring& folder, const std::string& id) {
+    const auto find = [&]() -> std::optional<size_t> {
+        for (size_t row = 0; row < rows_.size(); ++row) {
+            if (const SessionInfo* session = RowSession(row);
+                session != nullptr && session->id == id && projects_[rows_[row].project].folder == folder) {
+                return row;
+            }
+        }
+        return std::nullopt;
+    };
+    RefreshSessions();
+    if (const auto row = find()) {
+        return row;
+    }
+    searchText_.clear();
+    std::erase(settings_.closedProjects, folder);
+    SaveSettings(settings_);
+    FilterSessions();
+    return find();
+}
+
+// ---- Scrollbars -----------------------------------------------------------------------------------
+
+std::optional<ScrollBar> ChatWindow::Bar(const Geometry& g, Scroller s) const {
+    float right = 0, top = 0, bottom = 0;  // the strip
+    float pos = 0, max = 0, view = 0;      // in the list's units
+    switch (s) {
+    case Scroller::Feed:
+        right = g.area - 4.f;  // the terminal's splitter begins there
+        top = g.feed.top;
+        bottom = g.feed.bottom;
+        pos = scroll_;
+        max = maxScroll_;
+        view = bottom - top;
+        break;
+    case Scroller::Sidebar: {
+        if (secretsOpen_ || g.sidebar.right <= g.sidebar.left) {
+            return std::nullopt;
+        }
+        const size_t rows = SidebarRows(g);
+        right = g.sidebar.right - 3.f;  // ... and the sidebar's there
+        top = g.listTop;
+        bottom = g.listBottom;
+        pos = static_cast<float>(ClampFirst(firstRow_, rows_.size(), rows));
+        max = rows_.size() > rows ? static_cast<float>(rows_.size() - rows) : 0.f;
+        view = static_cast<float>(rows);
+        break;
+    }
+    case Scroller::Secrets: {
+        if (!secretsOpen_ || g.panel.right <= g.panel.left) {
+            return std::nullopt;
+        }
+        const size_t fit = SecretRowsFit(g);
+        const size_t total = secrets_.Names().size();
+        right = g.panel.right - 3.f;
+        top = g.secretsTop;
+        bottom = g.secretsTop + static_cast<float>(fit) * kSecretRow;
+        pos = static_cast<float>(ClampFirst(secretsFirst_, total, fit));
+        max = total > fit ? static_cast<float>(total - fit) : 0.f;
+        view = static_cast<float>(fit);
+        break;
+    }
+    case Scroller::Terminal: {
+        const VtScreen* screen = Screen();
+        if (g.term.right <= g.term.left || screen == nullptr) {
+            return std::nullopt;
+        }
+        right = g.term.right - 3.f;
+        top = g.termScreen.top;
+        bottom = g.termScreen.bottom;
+        max = static_cast<float>(screen->ScrollbackSize());
+        pos = max - static_cast<float>(std::min(Tab()->scroll, screen->ScrollbackSize()));  // from the top
+        view = static_cast<float>(screen->Rows());
+        break;
+    }
+    case Scroller::None:
+        return std::nullopt;
+    }
+    if (max <= 0 || bottom - top < 30.f) {
+        return std::nullopt;
+    }
+    const float track = bottom - top;
+    const float thumb = std::min(track, std::max(24.f, track * view / (view + max)));
+    const float at = top + (track - thumb) * std::clamp(pos / max, 0.f, 1.f);
+    ScrollBar bar;
+    bar.strip = D2D1::RectF(right - kBarStrip, top, right, bottom);
+    bar.thumb = D2D1::RectF(right - kBarStrip, at, right, at + thumb);
+    bar.pos = pos;
+    bar.max = max;
+    return bar;
+}
+
+// The list the middle button went down on, if it has anything to scroll.
+Scroller ChatWindow::ScrollerAt(const Geometry& g, float x, float y) const {
+    Scroller s = Scroller::None;
+    if (Inside(g.term, x, y)) {
+        s = Scroller::Terminal;
+    } else if (Inside(g.sidebar, x, y)) {
+        s = secretsOpen_ ? Scroller::Secrets : Scroller::Sidebar;
+    } else if (Inside(g.feed, x, y)) {
+        s = Scroller::Feed;
+    }
+    return Bar(g, s) ? s : Scroller::None;
+}
+
+void ChatWindow::ScrollTo(Scroller s, float pos) {
+    const auto whole = [](float at) { return static_cast<size_t>(std::max(0L, std::lround(at))); };
+    switch (s) {
+    case Scroller::Feed:
+        ScrollBy(pos - scroll_);  // kept within the feed; following its end again when it gets there
+        return;
+    case Scroller::Sidebar:
+        firstRow_ = ClampFirst(whole(pos), rows_.size(), SidebarRows(Layout()));
+        break;
+    case Scroller::Secrets:
+        secretsFirst_ = ClampFirst(whole(pos), secrets_.Names().size(), SecretRowsFit(Layout()));
+        break;
+    case Scroller::Terminal:
+        if (Screen() != nullptr) {
+            const size_t most = Screen()->ScrollbackSize();
+            Tab()->scroll = most - std::min(whole(pos), most);
+        }
+        break;
+    case Scroller::None:
+        return;
+    }
+    if (barDrag_ == Scroller::None && pan_ == Scroller::None) {
+        hover_ = HitTest(mouse_.x, mouse_.y);  // the rows moved under the pointer
+    }
+    Refresh();
+}
+
+void ChatWindow::ScrollDips(Scroller s, float dips) {
+    if (s == Scroller::Feed) {
+        ScrollBy(dips);
+        return;
+    }
+    const float unit = s == Scroller::Sidebar ? kHistoryRow : (s == Scroller::Secrets ? kSecretRow : cellH_);
+    panRemainder_ += dips / unit;
+    const float whole = std::trunc(panRemainder_);
+    if (whole == 0.f) {
+        return;
+    }
+    panRemainder_ -= whole;
+    if (const auto bar = Bar(Layout(), s)) {
+        ScrollTo(s, bar->pos + whole);
     }
 }
 
-void ChatWindow::PaintListThumb(float x, float top, float bottom, size_t first, size_t rows, size_t total, bool bright) {
-    if (rows == 0 || total <= rows || bottom <= top) {
+// The thumb follows the pointer, held where it was taken.
+void ChatWindow::DragBar(float y) {
+    const auto bar = Bar(Layout(), barDrag_);
+    if (!bar) {
         return;
     }
-    const float track = bottom - top;
-    const float thumb = std::max(24.f, track * static_cast<float>(rows) / static_cast<float>(total));
-    const float at = top + (track - thumb) * static_cast<float>(first) / static_cast<float>(total - rows);
-    Fill(D2D1::RectF(x, at, x + 3.f, at + thumb), 1.5f, bright ? kSecondary : kLine);
+    const float room = (bar->strip.bottom - bar->strip.top) - (bar->thumb.bottom - bar->thumb.top);
+    const float at = room > 0 ? std::clamp((y - barGrab_ - bar->strip.top) / room, 0.f, 1.f) : 0.f;
+    ScrollTo(barDrag_, at * bar->max);
+}
+
+// Thin at rest; wider under the pointer and while dragged, to be taken.
+void ChatWindow::PaintBar(const Geometry& g, Scroller s) {
+    const auto bar = Bar(g, s);
+    if (!bar) {
+        return;
+    }
+    const bool hot = barDrag_ == s || (hover_.target == Target::ScrollBar && hover_.row == static_cast<size_t>(s));
+    const float width = hot ? 8.f : 3.f;
+    const float right = bar->strip.right - 1.f;
+    Fill(D2D1::RectF(right - width, bar->thumb.top + 1.f, right, bar->thumb.bottom - 1.f), width / 2,
+         hot || Inside(bar->strip, mouse_.x, mouse_.y) ? kSecondary : kLine);
+}
+
+void ChatWindow::StartPan(Scroller s, D2D1_POINT_2F at) {
+    SetCapture(hwnd_);  // first: taken from another, WM_CAPTURECHANGED would end it
+    pan_ = s;
+    panAt_ = at;
+    panSince_ = GetTickCount64();
+    panMoved_ = false;
+    panRemainder_ = 0;
+    SetTimer(hwnd_, kPanTimer, kPanFrame, nullptr);
+    SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+    Refresh();
+}
+
+void ChatWindow::StopPan() {
+    if (pan_ == Scroller::None) {
+        return;
+    }
+    pan_ = Scroller::None;
+    KillTimer(hwnd_, kPanTimer);
+    if (GetCapture() == hwnd_) {
+        ReleaseCapture();
+    }
+    Refresh();
+}
+
+// A frame of it: the farther the pointer from where the button went down, the faster - a few rows a second
+// near, whole screens far.
+void ChatWindow::PanStep() {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    ScreenToClient(hwnd_, &cursor);
+    const float off = ToDip(cursor.y) - panAt_.y;
+    const float beyond = std::abs(off) - kPanStill;
+    if (pan_ == Scroller::None || beyond <= 0) {
+        return;
+    }
+    panMoved_ = true;
+    ScrollDips(pan_, std::copysign(beyond * 0.12f + beyond * beyond * 0.003f, off));
 }
 
 void ChatWindow::SetSidebarOpen(bool open) {
@@ -5475,9 +6020,22 @@ void ChatWindow::FocusSearch() {
 void ChatWindow::RefreshSessions() {
     const size_t first = firstRow_;
     const size_t selected = selected_;
-    sessions_ = ListSessions(workspace_);
+    std::vector<std::wstring> folders{DefaultWorkspace()};
+    for (const std::wstring& folder : settings_.projects) {
+        std::error_code error;
+        if (std::ranges::find(folders, folder) == folders.end() && std::filesystem::is_directory(folder, error)) {
+            folders.push_back(folder);
+        }
+    }
+    if (std::ranges::find(folders, workspace_) == folders.end()) {
+        folders.push_back(workspace_);
+    }
+    projects_.clear();
+    for (const std::wstring& folder : folders) {
+        projects_.push_back({folder, ProjectName(folder), ListSessions(folder)});
+    }
     FilterSessions();
-    const size_t most = filtered_.empty() ? 0 : filtered_.size() - 1;
+    const size_t most = rows_.empty() ? 0 : rows_.size() - 1;
     firstRow_ = std::min(first, most);
     selected_ = std::min(selected, most);
 }
@@ -5493,7 +6051,7 @@ void ChatWindow::OnSearchKey(WPARAM key) {
         SetFocus(input_);
         Refresh();
     } else if (key == VK_RETURN) {
-        if (selected_ < filtered_.size()) {
+        if (RowSession(selected_) != nullptr) {
             searchFocus_ = false;
             OpenSession(selected_);
             SetFocus(input_);
@@ -5821,11 +6379,13 @@ void ChatWindow::ShowInputMenu(POINT screen) {
 }
 
 // A chat's menu in the sidebar: delete it (to the Recycle Bin, so it can still be brought back).
-void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
-    if (filteredIndex >= filtered_.size()) {
+void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
+    const SessionInfo* found = RowSession(row);
+    if (found == nullptr) {
         return;
     }
-    const SessionInfo session = sessions_[filtered_[filteredIndex]];
+    const SessionInfo session = *found;
+    const std::wstring folder = projects_[rows_[row].project].folder;
     wil::unique_hmenu menu(CreatePopupMenu());
     AppendMenuW(menu.get(), MF_STRING, 1, L"Открыть");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
@@ -5833,11 +6393,11 @@ void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
     InsertMenuW(menu.get(), 1, MF_BYPOSITION | MF_STRING, 3, L"Переименовать");
     const auto chosen = Menu(menu.get(), screen);
     if (chosen == 3) {
-        BeginRename(Rename::Chat, filteredIndex);
+        BeginRename(Rename::Chat, row);
         return;
     }
     if (chosen == 1) {
-        OpenSession(filteredIndex);
+        OpenSession(row);
         SetFocus(input_);
         return;
     }
@@ -5849,11 +6409,11 @@ void ChatWindow::ShowChatMenu(size_t filteredIndex, POINT screen) {
     if (MessageBoxW(hwnd_, question.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
-    const bool current = session.id == sessionId_;
+    const bool current = session.id == sessionId_ && folder == workspace_;
     if (current) {  // the CLI holds the file open: it goes first
         ResetChat();
     }
-    if (DeleteSession(workspace_, session.id)) {
+    if (DeleteSession(folder, session.id)) {
         Flash(L"Чат удалён");
     } else {
         Flash(L"Не удалось удалить чат", 3000);
@@ -6287,7 +6847,7 @@ void ChatWindow::SaveMemoryNow() {
     Flash(sessionId_.empty() ? L"Сохраняю память…" : L"Haiku записывает память из этого чата…", 300'000);
     const HWND hwnd = hwnd_;
     const std::wstring workspace = workspace_;
-    const std::wstring folder = MemoryFolder(workspace_);
+    const std::wstring folder = SharedMemoryFolder();
     const std::string session = sessionId_;
     memoryThread_ = std::thread([hwnd, workspace, folder, session, token] {
         // First Haiku writes down what this chat taught (one call, no tools); then the folder goes up, also
@@ -6693,14 +7253,21 @@ std::wstring ChatWindow::TooltipText() {
         }
         return busy_ ? L"Отправить сейчас: Claude учтёт по ходу (Enter)" : L"Отправить (Enter)";
     case Target::HistoryRow: {  // the whole title, when the row cuts it
-        if (hover_.row >= filtered_.size()) {
+        const SessionInfo* session = RowSession(hover_.row);
+        if (session == nullptr) {
             return {};
         }
-        const SessionInfo& session = sessions_[filtered_[hover_.row]];
         const Geometry g = Layout();
-        const float room = (g.sidebar.right - 14.f) - (g.sidebar.left + 16.f);
-        return !session.title.empty() && TextWidth(session.title, ui_.get()) > room ? session.title : std::wstring();
+        const float room = (g.sidebar.right - 14.f) - (g.sidebar.left + 16.f + kProjectIndent);
+        return !session->title.empty() && TextWidth(session->title, ui_.get()) > room ? session->title : std::wstring();
     }
+    case Target::ProjectRow:
+        return RowProject(hover_.row) != nullptr ? RowProject(hover_.row)->folder : std::wstring();
+    case Target::ProjectNew:
+        return RowProject(hover_.row) != nullptr ? L"Новый чат в проекте «" + RowProject(hover_.row)->name + L"»"
+                                                 : std::wstring();
+    case Target::AddProject:
+        return L"Добавить проект: папку на этом компьютере или репозиторий GitHub";
     case Target::None: {  // a link: where it goes
         std::wstring url = LinkAt(Layout(), mouse_.x, mouse_.y);
         if (url.size() > 140) {
@@ -6946,11 +7513,18 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         }
         break;
     case Target::HistoryRow:
-        if (row >= firstRow_) {
-            const float top = g.listTop + static_cast<float>(row - firstRow_) * kHistoryRow;
-            return D2D1::RectF(g.sidebar.left + 6, top, g.sidebar.right - 6, top + kHistoryRow);
+    case Target::ProjectRow:
+        if (const D2D1_RECT_F r = SideRowRect(g, row); r.right > r.left) {
+            return r;
         }
         break;
+    case Target::ProjectNew:
+        if (const D2D1_RECT_F r = SideRowRect(g, row); r.right > r.left) {
+            return ProjectNewRect(r);
+        }
+        break;
+    case Target::AddProject:
+        return g.addProject;
     default:
         break;
     }
@@ -6969,12 +7543,13 @@ void ChatWindow::BeginRename(Rename what, size_t index) {
         renameText_ = TabLabel(*tabs_[index]);
         SetTerminalOpen(true);
     } else if (what == Rename::Chat) {
-        if (index >= filtered_.size()) {
+        const SessionInfo* session = RowSession(index);
+        if (session == nullptr) {
             return;
         }
-        const SessionInfo& session = sessions_[filtered_[index]];
-        renameChat_ = session.id;
-        renameText_ = session.title;
+        renameChat_ = session->id;
+        renameFolder_ = projects_[rows_[index].project].folder;
+        renameText_ = session->title;
         if (secretsOpen_) {
             SetSecretsOpen(false);
         }
@@ -7011,8 +7586,8 @@ void ChatWindow::CommitRename() {
             }
         }
     } else if (what == Rename::Chat && !text.empty()) {
-        if (RenameSession(workspace_, renameChat_, text)) {
-            if (renameChat_ == sessionId_) {
+        if (RenameSession(renameFolder_, renameChat_, text)) {
+            if (renameChat_ == sessionId_ && renameFolder_ == workspace_) {
                 title_ = text;
             }
             RefreshSessions();
@@ -7189,18 +7764,8 @@ void ChatWindow::ShowTitleMenu(POINT screen) {
     AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат");
     switch (Menu(menu.get(), screen)) {
     case kRename: {
-        const auto find = [&] {
-            return std::ranges::find_if(filtered_, [&](size_t i) { return sessions_[i].id == sessionId_; });
-        };
-        RefreshSessions();
-        auto at = find();
-        if (at == filtered_.end() && !searchText_.empty()) {  // the search hides it
-            searchText_.clear();
-            FilterSessions();
-            at = find();
-        }
-        if (at != filtered_.end()) {
-            BeginRename(Rename::Chat, static_cast<size_t>(at - filtered_.begin()));
+        if (const auto row = RevealChat(workspace_, sessionId_)) {
+            BeginRename(Rename::Chat, *row);
         } else {
             Flash(L"Чат ещё не сохранён: сначала напишите что-нибудь", 3000);
         }
@@ -7272,25 +7837,46 @@ void ChatWindow::ClosePopup() {
     Refresh();
 }
 
+// The rows: each project's head, and under it its chats unless it is folded. A search shows the projects whose
+// name has it (all their chats) and the chats whose title has it, under their heads.
 void ChatWindow::FilterSessions() {
     const std::wstring query = Lowercase(searchText_);
-    filtered_.clear();
-    for (size_t i = 0; i < sessions_.size(); ++i) {
-        if (query.empty() || Lowercase(sessions_[i].title).find(query) != std::wstring::npos) {
-            filtered_.push_back(i);
+    rows_.clear();
+    for (size_t p = 0; p < projects_.size(); ++p) {
+        const Project& project = projects_[p];
+        const bool named = !query.empty() && Lowercase(project.name).find(query) != std::wstring::npos;
+        std::vector<size_t> chats;
+        for (size_t i = 0; i < project.sessions.size(); ++i) {
+            if (query.empty() || named || Lowercase(project.sessions[i].title).find(query) != std::wstring::npos) {
+                chats.push_back(i);
+            }
+        }
+        if (!query.empty() && !named && chats.empty()) {
+            continue;
+        }
+        rows_.push_back({p, kHead});
+        if (query.empty() && ProjectFolded(project.folder)) {
+            continue;
+        }
+        for (const size_t i : chats) {
+            rows_.push_back({p, i});
         }
     }
     firstRow_ = 0;
-    selected_ = 0;
+    // The keys go through the chats: the first one is picked.
+    const auto chat = std::ranges::find_if(rows_, [](const SideRow& row) { return row.session != kHead; });
+    selected_ = chat == rows_.end() ? 0 : static_cast<size_t>(chat - rows_.begin());
     Refresh();
 }
 
 void ChatWindow::MoveSelection(int delta) {
-    if (filtered_.empty()) {
-        return;
+    auto next = static_cast<long long>(selected_);
+    for (long long at = next + delta; at >= 0 && at < static_cast<long long>(rows_.size()); at += delta) {
+        if (rows_[static_cast<size_t>(at)].session != kHead) {  // the heads are passed over
+            next = at;
+            break;
+        }
     }
-    const auto next = std::clamp<long long>(static_cast<long long>(selected_) + delta, 0,
-                                            static_cast<long long>(filtered_.size()) - 1);
     selected_ = static_cast<size_t>(next);
     if (selected_ < firstRow_) {
         firstRow_ = selected_;
@@ -7300,16 +7886,23 @@ void ChatWindow::MoveSelection(int delta) {
     Refresh();
 }
 
-void ChatWindow::OpenSession(size_t filteredIndex) {
-    if (filteredIndex >= filtered_.size()) {
-        return;
+void ChatWindow::OpenSession(size_t row) {
+    if (const SessionInfo* session = RowSession(row)) {
+        OpenChat(projects_[rows_[row].project].folder, *session);
     }
-    const SessionInfo session = sessions_[filtered_[filteredIndex]];
+}
+
+// A chat of any project: its project becomes the chat's folder, and the CLI resumes it there.
+void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     ClosePopup();
-    if (session.id == sessionId_) {
+    if (session.id == sessionId_ && folder == workspace_) {
         return;
     }
     ResetChat();
+    if (folder != workspace_) {
+        SetWorkspace(folder);
+        PlaceChildren();  // the folder's chip under the input
+    }
     bool truncated = false;
     const std::vector<TranscriptEntry> entries = LoadTranscript(workspace_, session.id, kTranscriptLimit, truncated);
     if (truncated) {
@@ -7467,7 +8060,10 @@ bool ChatWindow::StartClaude() {
         return false;
     }
     options.cwd = workspace_;
-    options.appendSystemPrompt = Tools::SystemPrompt();
+    options.appendSystemPrompt = Tools::SystemPrompt() + ProjectPrompt();
+    // One memory for all the projects: the CLI would keep one per folder, and a project's chats would start
+    // knowing nothing.
+    options.settings = Json{{"autoMemoryDirectory", ToUtf8(SharedMemoryFolder())}}.dump();
     options.proxy = PickProxy();
     options.model = settings_.model;
     options.effort = settings_.effort;

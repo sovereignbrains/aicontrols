@@ -25,6 +25,7 @@ struct ClaudeOptions {
     std::string effort;   // low … max; empty: the model's default
     std::string resume;   // a session id to continue; empty: a new chat
     std::string appendSystemPrompt;  // added to the CLI's own system prompt; empty: nothing
+    std::string settings;  // JSON for --settings, over the user's own settings; empty: none
     bool includePartial = true;  // stream_event deltas while a message is written
 };
 

@@ -48,9 +48,12 @@ struct Settings {
     // The side panels' widths as the user dragged them, in DIPs; 0: the default.
     float sidebarWidth = 0;
     float terminalWidth = 0;
-    // The folder the chats work in (empty: DefaultWorkspace) and the ones used before, newest first.
+    // The folder the chats work in (empty: DefaultWorkspace).
     std::wstring workspace;
-    std::vector<std::wstring> recentFolders;
+    // The sidebar's projects: the folders chats work in, in the order they were added (the general one,
+    // DefaultWorkspace, is always there and not among them), and the ones folded there.
+    std::vector<std::wstring> projects;
+    std::vector<std::wstring> closedProjects;
     // A chat to open again at the next start (set by an update, which restarts the client); cleared once opened.
     std::string reopen;
 };
@@ -61,6 +64,9 @@ std::wstring DefaultWorkspace();
 
 // Claude's memory for a workspace: ~\.claude\projects\<workspace>\memory.
 std::wstring MemoryFolder(const std::wstring& workspace);
+// The one memory every project's chats share (the CLI is pointed at it with autoMemoryDirectory): the general
+// workspace's, which is kept in its own repository.
+std::wstring SharedMemoryFolder();
 
 std::vector<SessionInfo> ListSessions(const std::wstring& workspace);  // newest first
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);

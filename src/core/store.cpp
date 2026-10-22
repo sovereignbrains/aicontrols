@@ -204,6 +204,10 @@ std::wstring MemoryFolder(const std::wstring& workspace) {
     return (ProjectDir(workspace) / L"memory").wstring();
 }
 
+std::wstring SharedMemoryFolder() {
+    return MemoryFolder(DefaultWorkspace());
+}
+
 std::vector<SessionInfo> ListSessions(const std::wstring& workspace) {
     std::vector<SessionInfo> sessions;
     std::error_code error;
@@ -401,13 +405,23 @@ Settings LoadSettings() {
     settings.terminalWidth = real("terminalWidth");
     settings.workspace = ToWide(JsonStr(data, "workspace"));
     settings.reopen = JsonStr(data, "reopen");
-    if (const Json& recent = JsonAt(data, "recentFolders"); recent.is_array()) {
-        for (const Json& folder : recent) {
-            if (folder.is_string()) {
-                settings.recentFolders.push_back(ToWide(folder.get<std::string>()));
+    const auto folders = [&](const char* key) {
+        std::vector<std::wstring> list;
+        if (const Json& value = JsonAt(data, key); value.is_array()) {
+            for (const Json& folder : value) {
+                if (folder.is_string()) {
+                    list.push_back(ToWide(folder.get<std::string>()));
+                }
             }
         }
+        return list;
+    };
+    // Before projects there were the recent folders (newest first): they become the projects, oldest first.
+    settings.projects = JsonAt(data, "projects").is_array() ? folders("projects") : folders("recentFolders");
+    if (!JsonAt(data, "projects").is_array()) {
+        std::ranges::reverse(settings.projects);
     }
+    settings.closedProjects = folders("closedProjects");
     return settings;
 }
 
@@ -416,10 +430,13 @@ void SaveSettings(const Settings& settings) {
     std::error_code error;
     fs::create_directories(file.parent_path(), error);
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
-    Json recent = Json::array();
-    for (const std::wstring& folder : settings.recentFolders) {
-        recent.push_back(ToUtf8(folder));
-    }
+    const auto folders = [](const std::vector<std::wstring>& list) {
+        Json array = Json::array();
+        for (const std::wstring& folder : list) {
+            array.push_back(ToUtf8(folder));
+        }
+        return array;
+    };
     out << Json{{"model", settings.model},
                 {"effort", settings.effort},
                 {"permissions", settings.permissions},
@@ -430,7 +447,8 @@ void SaveSettings(const Settings& settings) {
                 {"sidebarWidth", settings.sidebarWidth},
                 {"terminalWidth", settings.terminalWidth},
                 {"workspace", ToUtf8(settings.workspace)},
-                {"recentFolders", recent},
+                {"projects", folders(settings.projects)},
+                {"closedProjects", folders(settings.closedProjects)},
                 {"reopen", settings.reopen}}
                .dump(2)
         << "\n";

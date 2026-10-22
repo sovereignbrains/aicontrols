@@ -134,6 +134,9 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
     if (!options.appendSystemPrompt.empty()) {
         cmd += L" --append-system-prompt " + QuoteArg(ToWide(options.appendSystemPrompt));
     }
+    if (!options.settings.empty()) {
+        cmd += L" --settings " + QuoteArg(ToWide(options.settings));
+    }
     if (!options.model.empty()) {
         cmd += L" --model " + QuoteArg(ToWide(options.model));
     }

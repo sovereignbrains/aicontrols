@@ -2340,8 +2340,8 @@ void ChatWindow::OnClick(float x, float y) {
         SubmitSecret();
         keepFocus = true;
         break;
-    case Target::NewChat:
-        NewChat();
+    case Target::NewChat:  // as in Claude's app: the top one is the general chat's; a project's is its "+"
+        NewChatIn(DefaultWorkspace());
         break;
     case Target::Attach:
         PickFiles();
@@ -2480,8 +2480,8 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             Flash(L"останавливаю…");
             return 1;
         }
-        if (filter.wParam == 'N' && control) {
-            NewChat();
+        if (filter.wParam == 'N' && control) {  // the top "new chat"
+            NewChatIn(DefaultWorkspace());
             return 1;
         }
         if (filter.wParam == 'H' && control) {
@@ -5525,8 +5525,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Text(searchText_, ui_.get(), field, kPrimary);
     }
 
-    {  // a new chat: lit while the open chat is empty, as "New" is in Claude's app
-        const bool active = hover_.target == Target::NewChat || !HasConversation();
+    {  // a new general chat: lit while the open chat is one, empty, as "New" is in Claude's app
+        const bool active = hover_.target == Target::NewChat || (!HasConversation() && workspace_ == DefaultWorkspace());
         if (active) {
             Fill(g.newItem, 8.f, kRaised);
         }
@@ -5536,9 +5536,6 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Line({c.x, c.y - 5.5f}, {c.x, c.y + 5.5f}, color, 1.5f);
         Text(L"Новый чат", ui_.get(),
              D2D1::RectF(g.newItem.left + 42, g.newItem.top, g.newItem.right - 8, g.newItem.bottom), color);
-        // ... in which project: the open chat's
-        Text(folderName_, uiRight_.get(), D2D1::RectF(g.newItem.left + 130, g.newItem.top, g.newItem.right - 10, g.newItem.bottom),
-             kSecondary);
     }
 
     {  // the account, at the bottom: who is signed in and the plan, or the way to sign in
@@ -7288,6 +7285,8 @@ std::wstring ChatWindow::TooltipText() {
                                                  : std::wstring();
     case Target::AddProject:
         return L"Добавить проект: папку на этом компьютере или репозиторий GitHub";
+    case Target::NewChat:
+        return L"Новый чат в «Общем» (Ctrl+N). Чат в проекте — «+» в строке проекта";
     case Target::None: {  // a link: where it goes
         std::wstring url = LinkAt(Layout(), mouse_.x, mouse_.y);
         if (url.size() > 140) {
@@ -7545,6 +7544,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         break;
     case Target::AddProject:
         return g.addProject;
+    case Target::NewChat:
+        return g.newItem;
     default:
         break;
     }
@@ -7875,13 +7876,13 @@ void ChatWindow::FilterSessions() {
             continue;
         }
         rows_.push_back({p, kHead});
-        // The open chat, new: first under its project, folded or not - it says where the chat is.
+        if (query.empty() && ProjectFolded(project.folder)) {
+            continue;
+        }
+        // The open chat, new: first under its project (a new chat unfolds it), it says where the chat is.
         if (query.empty() && project.folder == workspace_ &&
             std::ranges::find(project.sessions, sessionId_, &SessionInfo::id) == project.sessions.end()) {
             rows_.push_back({p, kDraft});
-        }
-        if (query.empty() && ProjectFolded(project.folder)) {
-            continue;
         }
         for (const size_t i : chats) {
             rows_.push_back({p, i});
@@ -8166,7 +8167,11 @@ void ChatWindow::NewChat() {
     ClosePopup();
     ResetChat();
     StartClaude();
-    RebuildRows();  // the new chat shows under its project
+    if (ProjectFolded(workspace_)) {  // the new chat shows under its project
+        std::erase(settings_.closedProjects, workspace_);
+        SaveSettings(settings_);
+    }
+    RebuildRows();
 }
 
 void ChatWindow::Submit() {

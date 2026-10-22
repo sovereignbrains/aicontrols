@@ -89,8 +89,26 @@ std::wstring FirstPrompt(std::string_view text) {
         if (first == std::wstring::npos || prompt[first] == L'<') {  // tool results, command and system insertions
             return;
         }
-        prompt = prompt.substr(first);
-        prompt = prompt.substr(0, prompt.find_first_of(L"\r\n"));
+        // The title is the first line of the words; a picture or file mark (an attachment's line) only if there are
+        // none, and then without the mark, which a font may draw as a squiggle.
+        const std::wstring_view mark = L"📎 ";
+        std::wstring titled;
+        std::wstring attached;
+        for (size_t at = first; at < prompt.size();) {
+            const size_t end = std::min(prompt.find_first_of(L"\r\n", at), prompt.size());
+            const std::wstring_view row = std::wstring_view(prompt).substr(at, end - at);
+            if (row.starts_with(mark)) {
+                attached = attached.empty() ? std::wstring(row.substr(mark.size())) : attached;
+            } else if (!row.empty()) {
+                titled = row;
+                break;
+            }
+            at = end + 1;
+        }
+        prompt = titled.empty() ? attached : titled;
+        if (prompt.empty()) {
+            return;
+        }
         constexpr size_t kLongest = 70;
         if (prompt.size() > kLongest) {
             prompt = prompt.substr(0, kLongest) + L"…";

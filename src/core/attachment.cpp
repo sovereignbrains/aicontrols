@@ -21,7 +21,7 @@ namespace fs = std::filesystem;
 // The API's own limits: 5 MB per image as sent; past 1568 px the model sees it scaled down anyway.
 constexpr uint64_t kImageBytes = 3'700'000;  // ~5 MB once in base64
 constexpr UINT kImageSide = 1568;
-constexpr UINT kThumbnailSide = 112;
+constexpr UINT kThumbnailSide = 360;
 constexpr uint64_t kTextBytes = 256 * 1024;
 constexpr uint64_t kPdfBytes = 24 * 1024 * 1024;
 

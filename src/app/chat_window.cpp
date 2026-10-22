@@ -224,7 +224,9 @@ constexpr float kModelsWidth = 270.f;
 constexpr float kMoreWidth = 230.f;
 constexpr float kEffortWidth = 250.f;
 constexpr float kEffortHeight = 112.f;
-constexpr float kAttachmentRow = 56.f;
+constexpr float kAttachmentRow = 88.f;
+constexpr float kImageChip = 120.f;
+constexpr float kAttachmentGap = 8.f;
 constexpr float kFileChip = 190.f;
 constexpr float kCardPad = 12.f;
 constexpr float kCardTitle = 22.f;
@@ -1042,6 +1044,7 @@ private:
     void CopyImage(const std::wstring& path);
     void OpenFile(const std::wstring& path);  // with its app; a flash when it is gone
 
+    D2D1_RECT_F AttachmentFlow(float width, size_t index, size_t* rows) const;
     D2D1_RECT_F AttachmentRect(const Geometry& g, size_t index) const;
     static D2D1_RECT_F RemoveRect(const D2D1_RECT_F& chip);
     void PaintAttachments(const Geometry& g);
@@ -2455,7 +2458,8 @@ void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
     }
     const WORD code = HIWORD(wParam);
     if (code == EN_CHANGE) {
-        hasText_ = GetWindowTextLengthW(input_) > 0;
+        // Spaces and line breaks alone are nothing to send.
+        hasText_ = std::ranges::any_of(FieldText(input_), [](wchar_t c) { return !std::iswspace(c); });
         InvalidateRect(input_, nullptr, TRUE);  // the placeholder comes and goes
         Refresh();
     } else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
@@ -2567,11 +2571,16 @@ Geometry ChatWindow::Layout() const {
     const float chipsBottom = g.height - kChipsBottom;
     const float chipsTop = chipsBottom - kChipRow;
     const float boxBottom = chipsTop - 4;
-    const float attachmentsHeight = attachments_.empty() ? 0.f : kAttachmentRow + 8;
+    size_t attachmentRows = 0;
+    // The pictures stand over the text, not over "+": one column down the card, as in Claude's app.
+    const float attachmentsLeft = left + 8 + kInputButton + 4;
+    AttachmentFlow(right - 12 - attachmentsLeft, 0, &attachmentRows);
+    const float attachmentsHeight =
+        attachmentRows == 0 ? 0.f : static_cast<float>(attachmentRows) * (kAttachmentRow + kAttachmentGap);
     const float rowHeight = std::max(textHeight_, kInputButton);
     const float boxTop = boxBottom - (2 * kBoxPadY + attachmentsHeight + rowHeight);
     g.box = D2D1::RectF(left, boxTop, right, boxBottom);
-    g.attachments = D2D1::RectF(left + 12, boxTop + kBoxPadY, right - 12, boxTop + kBoxPadY + kAttachmentRow);
+    g.attachments = D2D1::RectF(attachmentsLeft, boxTop + kBoxPadY, right - 12, boxTop + kBoxPadY + kAttachmentRow);
     const float rowTop = boxTop + kBoxPadY + attachmentsHeight;
     const float rowBottom = rowTop + rowHeight;
     g.attach = D2D1::RectF(left + 8, rowBottom - kInputButton, left + 8 + kInputButton, rowBottom);
@@ -2601,7 +2610,7 @@ Geometry ChatWindow::Layout() const {
     // Where Claude works: this computer; the folder there is chosen in its menu (as environments are in
     // Claude's app). While a repository is being cloned, that shows here.
     const float computerWidth =
-        std::min(TextWidth(ComputerLabel(), ui_.get()) + 34.f, std::max(0.f, g.permission.left - left - 12.f));
+        std::min(TextWidth(ComputerLabel(), ui_.get()) + 37.f, std::max(0.f, g.permission.left - left - 12.f));
     g.computer = D2D1::RectF(left + 4, chipTop, left + 4 + computerWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
@@ -2639,7 +2648,7 @@ Geometry ChatWindow::Layout() const {
     }
     if (secretsOpen_ && sidebarWidth > 0) {
         g.panel = g.sidebar;
-        g.panelClose = D2D1::RectF(g.panel.right - 12 - 28, g.panel.top + 10, g.panel.right - 12, g.panel.top + 38);
+        g.panelClose = D2D1::RectF(g.panel.left + 6, g.panel.top + 8, g.panel.right - 6, g.panel.top + 40);  // the whole header: back
         const float fieldLeft = g.panel.left + kPanelPad;
         const float fieldRight = g.panel.right - kPanelPad;
         g.saveButton = D2D1::RectF(fieldLeft, g.panel.bottom - kPanelPad - kFieldHeight, fieldRight,
@@ -2932,7 +2941,7 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.usage, x, y)) {
         return {Target::UsageChip};
     }
-    if (SendShown() && Inside(g.send, x, y)) {
+    if (SendShown() && Inside(g.send, x, y)) {  // the arrow is drawn always, but a press takes only when it is lit
         return {Target::Send};
     }
     return {};
@@ -3608,13 +3617,19 @@ void ChatWindow::PaintInput(const Geometry& g) {
             Fill(g.computer, 6.f, kRaised);
         }
         const uint32_t color = active ? kPrimary : kSecondary;
-        const D2D1_POINT_2F c{g.computer.left + 12.f, (g.computer.top + g.computer.bottom) / 2};
+        const D2D1_POINT_2F c{g.computer.left + 13.f, (g.computer.top + g.computer.bottom) / 2 - 0.5f};
         brush_->SetColor(Color(color));
-        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 4.5f, c.y - 4.f, c.x + 4.5f, c.y + 2.f), 1.f, 1.f),
+        // A desk computer (this one is not a laptop): a monitor with sharp corners on its neck and foot, a keyboard
+        // under it and a mouse beside it. Outlines, as the rest of the icons.
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y - 7.f, c.x + 6.f, c.y + 0.5f), 0.6f, 0.6f),
                                       brush_.get(), 1.2f);
-        Line({c.x - 6.5f, c.y + 4.5f}, {c.x + 6.5f, c.y + 4.5f}, color, 1.2f);
+        Line({c.x, c.y + 0.5f}, {c.x, c.y + 2.f}, color, 1.2f);
+        Line({c.x - 2.5f, c.y + 2.2f}, {c.x + 2.5f, c.y + 2.2f}, color, 1.2f);
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y + 4.f, c.x + 2.5f, c.y + 7.f), 0.6f, 0.6f),
+                                      brush_.get(), 1.1f);
+        target_->DrawEllipse(D2D1::Ellipse({c.x + 5.5f, c.y + 5.5f}, 1.7f, 2.3f), brush_.get(), 1.1f);
         Text(ComputerLabel(), ui_.get(),
-             D2D1::RectF(g.computer.left + 26, g.computer.top, g.computer.right - 6, g.computer.bottom), color);
+             D2D1::RectF(g.computer.left + 29, g.computer.top, g.computer.right - 6, g.computer.bottom), color);
     }
     // The model, then its effort in a box of its own, as in Claude's app.
     if (g.folder.right > g.folder.left) {  // the folder the chat works in: a menu to change it
@@ -3692,21 +3707,25 @@ void ChatWindow::PaintInput(const Geometry& g) {
         Line({c.x - 3.f, c.y + 3.5f}, {c.x + 3.f, c.y + 3.5f}, color, 1.4f);
         Line({c.x, c.y + 3.5f}, {c.x, c.y + 6.5f}, color, 1.4f);
     }
-    if (!SendShown()) {  // as in Claude's app: nothing to send, no button
+    const D2D1_POINT_2F c{(g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2};
+    if (busy_ && !hasContent()) {  // stop: a lit circle with a square
+        const float radius = (g.send.right - g.send.left) / 2;
+        brush_->SetColor(Color(kAccent, hover_.target == Target::Send ? 0.85f : 1.f));
+        target_->FillEllipse(D2D1::Ellipse(c, radius, radius), brush_.get());
+        Fill(D2D1::RectF(c.x - 4.5f, c.y - 4.5f, c.x + 4.5f, c.y + 4.5f), 1.5f, kPrimary);
         return;
     }
-    const D2D1_POINT_2F c{(g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2};
-    const float radius = (g.send.right - g.send.left) / 2;
-    brush_->SetColor(Color(kAccent, hover_.target == Target::Send ? 0.85f : 1.f));
-    target_->FillEllipse(D2D1::Ellipse(c, radius, radius), brush_.get());
-    const uint32_t mark = kPrimary;
-    if (busy_ && !hasContent()) {  // stop
-        Fill(D2D1::RectF(c.x - 4.5f, c.y - 4.5f, c.x + 4.5f, c.y + 4.5f), 1.5f, mark);
-    } else {  // an arrow up
-        Line({c.x, c.y + 5.5f}, {c.x, c.y - 5.5f}, mark, 1.8f);
-        Line({c.x - 4.5f, c.y - 1.f}, {c.x, c.y - 5.5f}, mark, 1.8f);
-        Line({c.x + 4.5f, c.y - 1.f}, {c.x, c.y - 5.5f}, mark, 1.8f);
+    // As in Claude's app: the return arrow, always there; quiet while there is nothing to send, bright when there is.
+    const bool ready = hasContent();
+    const bool active = ready && hover_.target == Target::Send;
+    const uint32_t color = ready ? kPrimary : 0x66686e;
+    if (active) {
+        Fill(g.send, 6.f, kRaised);
     }
+    Line({c.x + 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 1.f}, color, 1.5f);
+    Line({c.x + 5.f, c.y + 1.f}, {c.x - 5.f, c.y + 1.f}, color, 1.5f);
+    Line({c.x - 5.f, c.y + 1.f}, {c.x - 1.5f, c.y - 2.5f}, color, 1.5f);
+    Line({c.x - 5.f, c.y + 1.f}, {c.x - 1.5f, c.y + 4.5f}, color, 1.5f);
 }
 
 // When a limit window resets: "через 3 ч 56 мин" for the short one, "вт 3:00" for the week.
@@ -3989,17 +4008,18 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
     if (!secretsOpen_) {
         return;
     }
-    Text(L"Секреты", uiBold_.get(),
-         D2D1::RectF(g.panel.left + kPanelPad, g.panel.top + 10, g.panelClose.left - 8, g.panel.top + 38), kPrimary);
-    {  // a cross
+    {  // the header is the way back to the chats: an arrow and the title, the whole row a button
         const bool active = hover_.target == Target::SecretsClose;
         if (active) {
-            Fill(g.panelClose, 6.f, kRaised);
+            Fill(g.panelClose, 8.f, kRaised);
         }
-        const D2D1_POINT_2F c{(g.panelClose.left + g.panelClose.right) / 2, (g.panelClose.top + g.panelClose.bottom) / 2};
+        const D2D1_POINT_2F c{g.panelClose.left + 22.f, (g.panelClose.top + g.panelClose.bottom) / 2};
         const uint32_t color = active ? kPrimary : kSecondary;
-        Line({c.x - 5.f, c.y - 5.f}, {c.x + 5.f, c.y + 5.f}, color, 1.5f);
-        Line({c.x - 5.f, c.y + 5.f}, {c.x + 5.f, c.y - 5.f}, color, 1.5f);
+        Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
+        Line({c.x - 5.f, c.y}, {c.x - 1.f, c.y - 4.f}, color, 1.5f);
+        Line({c.x - 5.f, c.y}, {c.x - 1.f, c.y + 4.f}, color, 1.5f);
+        Text(L"Секреты", uiBold_.get(),
+             D2D1::RectF(g.panelClose.left + 42, g.panelClose.top, g.panelClose.right - 8, g.panelClose.bottom), kPrimary);
     }
     Text(L"Значения хранятся зашифрованными. Claude видит только имена.",
          small_.get(),
@@ -5639,6 +5659,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
     const size_t last = std::min(rows_.size(), firstRow_ + SidebarRows(g));
     for (size_t row = firstRow_; row < last; ++row) {
         const D2D1_RECT_F r = SideRowRect(g, row);
+        // The lit rows keep a gap between them, so the open chat and a hovered head do not run into one.
+        const auto lit = [](const D2D1_RECT_F& rect) { return D2D1::RectF(rect.left, rect.top + 2.f, rect.right, rect.bottom - 2.f); };
         const Project& project = projects_[rows_[row].project];
         const bool hovered = (hover_.target == Target::HistoryRow || hover_.target == Target::ProjectRow ||
                               hover_.target == Target::ProjectNew) &&
@@ -5652,7 +5674,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
             // chat in it under the pointer, else how many chats it has.
             if (hovered) {
-                Fill(r, 8.f, kRaised);
+                Fill(lit(r), 8.f, kRaised);
             }
             const D2D1_POINT_2F c{r.left + 14.f, (r.top + r.bottom) / 2};
             if (!searchText_.empty() || !ProjectFolded(project.folder)) {
@@ -5682,7 +5704,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         const float indent = project.folder == DefaultWorkspace() ? 0.f : kProjectIndent;
         const D2D1_RECT_F chat = D2D1::RectF(r.left + indent, r.top, r.right, r.bottom);
         if (rows_[row].session == kDraft) {  // the new chat that is open: lit, in its project
-            Fill(chat, 8.f, kRaised);
+            Fill(lit(chat), 8.f, kRaised);
             Text(L"Новый чат", ui_.get(), D2D1::RectF(chat.left + 10, chat.top, chat.right - 8, chat.bottom), kAccent);
             continue;
         }
@@ -5692,7 +5714,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             continue;
         }
         if (hovered || (searchFocus_ && row == selected_)) {
-            Fill(chat, 8.f, kRaised);
+            Fill(lit(chat), 8.f, kRaised);
         }
         const bool current = session.id == sessionId_ && project.folder == workspace_;
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
@@ -6255,16 +6277,38 @@ void ChatWindow::Flash(std::wstring status, UINT milliseconds) {
     Refresh();
 }
 
-D2D1_RECT_F ChatWindow::AttachmentRect(const Geometry& g, size_t index) const {
-    float x = g.attachments.left;
-    for (size_t i = 0; i <= index && i < attachments_.size(); ++i) {
-        const float width = attachments_[i].type == Attachment::Type::Image ? kAttachmentRow : kFileChip;
-        if (i == index) {
-            return D2D1::RectF(x, g.attachments.top, x + width, g.attachments.bottom);
+// The attachments flow left to right and wrap to the next row when the box is narrow. Every picture is one size
+// (the middle of it, as in Claude's app), so the same screenshot always looks the same. The chip of `index`, in
+// the flow's own coordinates; `rows` gets how many rows all of them take.
+D2D1_RECT_F ChatWindow::AttachmentFlow(float width, size_t index, size_t* rows) const {
+    D2D1_RECT_F found{};
+    float x = 0;
+    size_t row = 0;
+    for (size_t i = 0; i < attachments_.size(); ++i) {
+        const float w = attachments_[i].type == Attachment::Type::Image ? kImageChip : kFileChip;
+        if (x > 0 && x + w > width) {
+            ++row;
+            x = 0;
         }
-        x += width + 8;
+        if (i == index) {
+            const float top = static_cast<float>(row) * (kAttachmentRow + kAttachmentGap);
+            found = D2D1::RectF(x, top, x + w, top + kAttachmentRow);
+        }
+        x += w + kAttachmentGap;
     }
-    return {};
+    if (rows != nullptr) {
+        *rows = attachments_.empty() ? 0 : row + 1;
+    }
+    return found;
+}
+
+D2D1_RECT_F ChatWindow::AttachmentRect(const Geometry& g, size_t index) const {
+    const D2D1_RECT_F chip = AttachmentFlow(g.attachments.right - g.attachments.left, index, nullptr);
+    if (chip.right <= chip.left) {
+        return {};
+    }
+    return D2D1::RectF(g.attachments.left + chip.left, g.attachments.top + chip.top, g.attachments.left + chip.right,
+                       g.attachments.top + chip.bottom);
 }
 
 D2D1_RECT_F ChatWindow::RemoveRect(const D2D1_RECT_F& chip) {
@@ -6282,12 +6326,27 @@ void ChatWindow::PaintAttachments(const Geometry& g) {
         wil::com_ptr<ID2D1Bitmap> bitmap;
         if (attachment.thumbnail &&
             SUCCEEDED(target_->CreateBitmapFromWicBitmap(attachment.thumbnail.get(), nullptr, bitmap.put()))) {
-            // Cover the square: the middle of the picture.
+            // A picture near the chip's proportions covers it (the middle of it); a much wider or taller one (a strip
+            // of a screen, a phone's page) is shown whole in the middle, never blown up past its own size.
             const D2D1_SIZE_F size = bitmap->GetSize();
-            const float side = std::min(size.width, size.height);
-            const D2D1_RECT_F source = D2D1::RectF((size.width - side) / 2, (size.height - side) / 2,
-                                                   (size.width + side) / 2, (size.height + side) / 2);
-            target_->DrawBitmap(bitmap.get(), chip, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &source);
+            const float chipW = chip.right - chip.left;
+            const float chipH = chip.bottom - chip.top;
+            const float chipAspect = chipW / chipH;
+            const float ratio = (size.width / size.height) / chipAspect;
+            if (ratio >= 0.7f && ratio <= 1.5f) {
+                const float sourceW = std::min(size.width, size.height * chipAspect);
+                const float sourceH = sourceW / chipAspect;
+                const D2D1_RECT_F source = D2D1::RectF((size.width - sourceW) / 2, (size.height - sourceH) / 2,
+                                                       (size.width + sourceW) / 2, (size.height + sourceH) / 2);
+                target_->DrawBitmap(bitmap.get(), chip, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &source);
+            } else {
+                const float scale = std::min({chipW / size.width, chipH / size.height, 1.f});
+                const float w = size.width * scale;
+                const float h = size.height * scale;
+                const D2D1_RECT_F dest = D2D1::RectF(chip.left + (chipW - w) / 2, chip.top + (chipH - h) / 2,
+                                                     chip.left + (chipW + w) / 2, chip.top + (chipH + h) / 2);
+                target_->DrawBitmap(bitmap.get(), dest, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            }
         } else {
             const std::wstring kind = attachment.type == Attachment::Type::Document ? L"PDF" : L"текст";
             Text(attachment.name, ui_.get(), D2D1::RectF(chip.left + 12, chip.top + 6, chip.right - 24, chip.top + 30),

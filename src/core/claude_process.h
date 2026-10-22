@@ -55,6 +55,8 @@ public:
     // A message as content blocks: pictures, documents, text.
     void SendUserContent(Json content);
     void Interrupt();
+    // Another model for the turns to come, the conversation kept (set_model; no restart).
+    void SetModel(const std::string& model);
     void Respond(const std::string& requestId, Json response);
     void RespondError(const std::string& requestId, std::string_view error);
 

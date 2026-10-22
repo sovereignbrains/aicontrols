@@ -31,6 +31,7 @@ add_library(aic_core STATIC
   src/core/highlight.cpp
   src/core/markdown.cpp
   src/core/memory_writer.cpp
+  src/core/model_router.cpp
   src/core/pty.cpp
   src/core/secrets.cpp
   src/core/store.cpp
@@ -52,7 +53,7 @@ target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32 sh
 
 # Tests of the core without the UI: `ctest --test-dir build/dev`.
 enable_testing()
-foreach(name tools markdown highlight vt_screen pty auth claude_install attachment app_update usage store)
+foreach(name tools markdown highlight vt_screen pty auth claude_install attachment app_update usage store model_router)
   add_executable(aic_${name}_test tests/${name}_test.cpp)
   target_link_libraries(aic_${name}_test PRIVATE aic_core)
   add_test(NAME ${name} COMMAND aic_${name}_test)

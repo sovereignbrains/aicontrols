@@ -47,6 +47,7 @@
 #include "core/github.h"
 #include "core/markdown.h"
 #include "core/memory_writer.h"
+#include "core/model_router.h"
 #include "core/pty.h"
 #include "core/secrets.h"
 #include "core/store.h"
@@ -1238,6 +1239,10 @@ private:
     std::vector<size_t> mainModels_;
     std::vector<size_t> moreModels_;
     std::string defaultResolved_;  // what the CLI's "default" stands for
+    // "Auto" (settings model "auto"): the alias the chat runs on now, and how big the chat is (the last turn's
+    // input), as switching down in a big chat would rewrite its whole cache.
+    std::string autoModel_ = "sonnet";
+    long long lastContext_ = 0;
     bool moreOpen_ = false;
     // Effort, applied when its panel closes.
     std::string pendingEffort_;
@@ -8183,6 +8188,14 @@ const Json* ChatWindow::CurrentModel() const {
 }
 
 std::wstring ChatWindow::ModelName() const {
+    if (settings_.model == "auto") {  // and what it picked for the chat now: "Auto · Sonnet 5.5"
+        for (const Json& model : models_) {
+            if (JsonStr(model, "value") == autoModel_) {
+                return L"Auto · " + ToWide(JsonStr(model, "displayName"));
+            }
+        }
+        return L"Auto";
+    }
     if (const Json* model = CurrentModel(); model != nullptr) {
         return ToWide(JsonStr(*model, "displayName"));
     }
@@ -8262,7 +8275,7 @@ bool ChatWindow::StartClaude() {
     // knowing nothing.
     options.settings = Json{{"autoMemoryDirectory", ToUtf8(SharedMemoryFolder())}}.dump();
     options.proxy = PickProxy();
-    options.model = settings_.model;
+    options.model = settings_.model == "auto" ? autoModel_ : settings_.model;
     options.effort = settings_.effort;
     options.connectors = settings_.connectors;
     // Every turn reads the whole chat again: past 150k tokens it is summed up rather than left to grow.
@@ -8319,6 +8332,7 @@ void ChatWindow::ResetChat() {
     busy_ = false;
     sessionId_.clear();
     title_.clear();
+    lastContext_ = 0;
     currentMessageId_.clear();
     streamed_.clear();
     feed_.clear();
@@ -8371,6 +8385,15 @@ void ChatWindow::Submit() {
     if (!text.empty()) {
         content.push_back(Json{{"type", "text"}, {"text", ToUtf8(text)}});
         shown += (shown.empty() ? L"" : L"\n\n") + text;
+    }
+    // "Auto": the model for this task, chosen before it goes (a message during a turn joins that turn: no switch).
+    if (settings_.model == "auto" && !busy_) {
+        const bool opening = std::ranges::none_of(feed_, [](const FeedItem& item) { return item.kind == Kind::User; });
+        const std::string pick = RouteModel({text, attachments_.size(), opening, autoModel_, lastContext_});
+        if (pick != autoModel_) {
+            autoModel_ = pick;
+            claude_.SetModel(pick);
+        }
     }
     claude_.SendUserContent(std::move(content));
     Add(Kind::User, std::move(shown));
@@ -8464,6 +8487,20 @@ void ChatWindow::OnClaude(const Json& message) {
             busy_ = false;
         }
         FetchUsage();  // a turn spent some: the ring follows
+        {  // how big the chat is now, for "Auto": its last request (the turn's sum counts the chat once per call)
+            const Json& total = JsonAt(message, "usage");
+            const Json& iterations = JsonAt(total, "iterations");
+            const Json& usage = iterations.is_array() && !iterations.empty() ? iterations.back() : total;
+            const auto tokens = [&](const char* key) {
+                const Json& value = JsonAt(usage, key);
+                return value.is_number_integer() ? value.get<long long>() : 0LL;
+            };
+            if (const long long context = tokens("input_tokens") + tokens("cache_creation_input_tokens") +
+                                          tokens("cache_read_input_tokens");
+                context > 0) {
+                lastContext_ = context;
+            }
+        }
         const Json& isError = JsonAt(message, "is_error");
         if ((isError.is_boolean() && isError.get<bool>()) || JsonStr(message, "subtype") != "success") {
             std::string text = JsonStr(message, "result");
@@ -8512,6 +8549,28 @@ void ChatWindow::OnClaude(const Json& message) {
             const Json& answer = JsonAt(response, "response");
             if (JsonAt(answer, "models").is_array()) {
                 models_ = JsonAt(answer, "models");
+                // "Auto" after the aliases (their keys 1–4 stay): the client picks Haiku, Sonnet or Opus per task.
+                // Its efforts: those all three have, so a switch never meets one its model refuses.
+                std::vector<std::string> efforts;
+                bool firstAlias = true;
+                for (const Json& model : models_) {
+                    const std::string value = JsonStr(model, "value");
+                    if (value != "opus" && value != "sonnet" && value != "haiku") {
+                        continue;
+                    }
+                    std::vector<std::string> own;
+                    for (const Json& level : JsonAt(model, "supportedEffortLevels")) {
+                        if (level.is_string() && (firstAlias || std::ranges::find(efforts, level.get<std::string>()) != efforts.end())) {
+                            own.push_back(level.get<std::string>());
+                        }
+                    }
+                    efforts = std::move(own);
+                    firstAlias = false;
+                }
+                models_.push_back(Json{{"value", "auto"},
+                                       {"displayName", "Auto"},
+                                       {"description", "Haiku, Sonnet or Opus by the task"},
+                                       {"supportedEffortLevels", efforts}});
                 IndexModels();
             }
             const std::string email = JsonStr(JsonAt(answer, "account"), "email");

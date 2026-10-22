@@ -290,6 +290,13 @@ void ClaudeProcess::Interrupt() {
          true);
 }
 
+void ClaudeProcess::SetModel(const std::string& model) {
+    Send(Json{{"type", "control_request"},
+              {"request_id", "aic_" + std::to_string(++requestCounter_)},
+              {"request", {{"subtype", "set_model"}, {"model", model}}}},
+         true);
+}
+
 void ClaudeProcess::Respond(const std::string& requestId, Json response) {
     Send(Json{{"type", "control_response"},
               {"response", {{"subtype", "success"}, {"request_id", requestId}, {"response", std::move(response)}}}},

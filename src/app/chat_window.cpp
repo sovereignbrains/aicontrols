@@ -2811,6 +2811,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.secrets, x, y)) {
             return {Target::Secrets};
         }
+        if (Inside(g.update, x, y)) {  // over the account; the header's check below is only for a hidden sidebar
+            return {Target::Update};
+        }
         if (Inside(g.addProject, x, y)) {
             return {Target::AddProject};
         }

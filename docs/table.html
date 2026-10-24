@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>Исходники AIControls</title>
+<style>
+@font-face{font-family:Golos;src:url(../assets/fonts/GolosText.ttf)}
+@font-face{font-family:JBM;src:url(../assets/fonts/JetBrainsMono.ttf)}
+:root{--bg:#121213;--card:#18181a;--raised:#232327;--line:#2c2c31;--fg:#f2f4f8;--dim:#9c9ea4;--accent:#4c92ff;--good:#4cd27a;--bad:#f06060}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13.5px/1.45 Golos,'Segoe UI',sans-serif;height:100vh;display:flex;flex-direction:column}
+header{padding:16px 20px 10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;border-bottom:1px solid var(--line)}
+h1{font-size:16px;font-weight:600;margin:0 12px 0 0}
+input[type=search]{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;width:220px;font:inherit;outline:none}
+input[type=search]:focus{border-color:var(--accent)}
+.chip{background:var(--card);border:1px solid var(--line);color:var(--dim);border-radius:999px;padding:3px 10px;cursor:pointer;user-select:none;font-size:12.5px}
+.chip.on{background:#1d2738;border-color:var(--accent);color:var(--fg)}
+label{color:var(--dim);font-size:12.5px;display:flex;gap:6px;align-items:center}
+button{background:var(--raised);border:0;color:var(--fg);border-radius:6px;padding:5px 10px;font:inherit;font-size:12.5px;cursor:pointer}
+button:hover{background:#2e2e33}
+.wrap{flex:1;overflow:auto}
+table{border-collapse:separate;border-spacing:0;min-width:100%;white-space:nowrap}
+thead th{position:sticky;background:var(--bg);z-index:2;color:var(--dim);font-weight:500;font-size:12px;padding:6px 10px;border-bottom:1px solid var(--line);text-align:left}
+thead tr:first-child th{top:0;height:28px;text-align:center;color:#c4c6cc;border-bottom:1px solid var(--line)}
+thead tr:first-child th+th{border-left:1px solid var(--line)}
+thead tr:nth-child(2) th{top:28px;cursor:pointer;user-select:none}
+thead tr:nth-child(2) th:hover{color:var(--fg)}
+th.num,td.num{text-align:right;font-family:JBM,Consolas,monospace;font-size:12.5px}
+th .arrow{display:inline-block;width:10px;color:var(--accent)}
+td{padding:5px 10px;border-bottom:1px solid #1e1e21}
+th.first{left:0;z-index:3}
+td.first{position:sticky;left:0;background:var(--bg);z-index:1;font-family:JBM,Consolas,monospace;font-size:12.5px}
+tbody tr.row:hover td{background:var(--card)}
+tbody tr.row.sel td{background:#1d2738}
+tr.group td{background:var(--card);color:#c4c6cc;font-weight:600;cursor:pointer;position:sticky;top:57px;z-index:1}
+tr.group td.first{z-index:2}
+tr.group .fold{display:inline-block;width:14px;color:var(--dim);transition:transform .15s}
+tr.group.closed .fold{transform:rotate(-90deg)}
+tr.group .n{color:var(--dim);font-weight:400;margin-left:6px}
+.bar{display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.bar i{display:block;height:6px;border-radius:3px;background:var(--accent);opacity:.85}
+.heat{border-radius:4px;padding:1px 6px}
+.add{color:var(--good)}.del{color:var(--bad)}
+.ext{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-left:6px}
+tfoot td{position:sticky;bottom:0;background:var(--raised);font-weight:600;border-top:1px solid var(--line)}
+tfoot td.first{background:var(--raised)}
+.hide{display:none}
+#status{color:var(--dim);font-size:12.5px;margin-left:auto}
+</style></head><body>
+<header>
+ <h1>Исходники AIControls</h1>
+ <input type="search" id="q" placeholder="Фильтр по пути…">
+ <span id="exts"></span>
+ <label>от <input type="range" id="min" min="0" max="1000" step="10" value="0"> <span id="minv">0</span> строк</label>
+ <label><input type="checkbox" id="grouped" checked> по папкам</label>
+ <button id="copy">Копировать TSV</button>
+ <span id="status"></span>
+</header>
+<div class="wrap"><table id="t">
+<thead>
+ <tr><th class="first" rowspan="1"></th><th colspan="3">Размер</th><th colspan="6">История в git</th></tr>
+ <tr id="cols"></tr>
+</thead>
+<tbody id="body"></tbody>
+<tfoot><tr id="foot"></tr></tfoot>
+</table></div>
+<script>
+const DATA = [{"f":"CMakeLists.txt","dir":"","ext":"txt","lines":62,"kb":2.7,"commits":23,"first":"2026-10-17","last":"2026-10-22","add":118,"del":48},{"f":"docs/mockup.html","dir":"docs","ext":"html","lines":223,"kb":17.9,"commits":3,"first":"2026-10-22","last":"2026-10-22","add":244,"del":15},{"f":"docs/protocol.md","dir":"docs","ext":"md","lines":51,"kb":4.7,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":65,"del":0},{"f":"src/app/aicontrols.rc","dir":"src/app","ext":"rc","lines":6,"kb":0.3,"commits":4,"first":"2026-10-20","last":"2026-10-21","add":9,"del":1},{"f":"src/app/chat_window.cpp","dir":"src/app","ext":"cpp","lines":8503,"kb":369.2,"commits":82,"first":"2026-10-17","last":"2026-10-22","add":10397,"del":1506},{"f":"src/app/chat_window.h","dir":"src/app","ext":"h","lines":6,"kb":0.2,"commits":1,"first":"2026-10-17","last":"2026-10-17","add":10,"del":0},{"f":"src/app/fonts.cpp","dir":"src/app","ext":"cpp","lines":65,"kb":2.5,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":76,"del":0},{"f":"src/app/fonts.h","dir":"src/app","ext":"h","lines":15,"kb":0.8,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":22,"del":0},{"f":"src/app/main.cpp","dir":"src/app","ext":"cpp","lines":75,"kb":2.9,"commits":2,"first":"2026-10-17","last":"2026-10-20","add":83,"del":0},{"f":"src/app/popup_menu.cpp","dir":"src/app","ext":"cpp","lines":466,"kb":18.2,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":490,"del":0},{"f":"src/app/popup_menu.h","dir":"src/app","ext":"h","lines":18,"kb":0.9,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":23,"del":0},{"f":"src/app/resource.h","dir":"src/app","ext":"h","lines":8,"kb":0.3,"commits":4,"first":"2026-10-20","last":"2026-10-21","add":13,"del":3},{"f":"src/core/app_update.cpp","dir":"src/core","ext":"cpp","lines":58,"kb":2.4,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":70,"del":0},{"f":"src/core/app_update.h","dir":"src/core","ext":"h","lines":19,"kb":0.9,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":27,"del":0},{"f":"src/core/attachment.cpp","dir":"src/core","ext":"cpp","lines":444,"kb":19.4,"commits":4,"first":"2026-10-20","last":"2026-10-22","add":479,"del":3},{"f":"src/core/attachment.h","dir":"src/core","ext":"h","lines":38,"kb":2.2,"commits":3,"first":"2026-10-20","last":"2026-10-21","add":48,"del":0},{"f":"src/core/auth.cpp","dir":"src/core","ext":"cpp","lines":142,"kb":6,"commits":3,"first":"2026-10-20","last":"2026-10-21","add":161,"del":6},{"f":"src/core/auth.h","dir":"src/core","ext":"h","lines":38,"kb":1.8,"commits":3,"first":"2026-10-20","last":"2026-10-21","add":48,"del":2},{"f":"src/core/claude_install.cpp","dir":"src/core","ext":"cpp","lines":319,"kb":12.5,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":341,"del":0},{"f":"src/core/claude_install.h","dir":"src/core","ext":"h","lines":32,"kb":1.9,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":42,"del":0},{"f":"src/core/claude_process.cpp","dir":"src/core","ext":"cpp","lines":452,"kb":17.5,"commits":11,"first":"2026-10-17","last":"2026-10-22","add":500,"del":7},{"f":"src/core/claude_process.h","dir":"src/core","ext":"h","lines":90,"kb":4.3,"commits":10,"first":"2026-10-17","last":"2026-10-22","add":110,"del":0},{"f":"src/core/github.cpp","dir":"src/core","ext":"cpp","lines":179,"kb":8.3,"commits":2,"first":"2026-10-20","last":"2026-10-21","add":210,"del":16},{"f":"src/core/github.h","dir":"src/core","ext":"h","lines":40,"kb":1.9,"commits":3,"first":"2026-10-20","last":"2026-10-21","add":50,"del":0},{"f":"src/core/highlight.cpp","dir":"src/core","ext":"cpp","lines":267,"kb":12.6,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":289,"del":0},{"f":"src/core/highlight.h","dir":"src/core","ext":"h","lines":16,"kb":0.8,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":22,"del":0},{"f":"src/core/markdown.cpp","dir":"src/core","ext":"cpp","lines":483,"kb":19.8,"commits":6,"first":"2026-10-20","last":"2026-10-22","add":532,"del":17},{"f":"src/core/markdown.h","dir":"src/core","ext":"h","lines":38,"kb":1.7,"commits":4,"first":"2026-10-20","last":"2026-10-22","add":50,"del":3},{"f":"src/core/memory_writer.cpp","dir":"src/core","ext":"cpp","lines":230,"kb":10.9,"commits":2,"first":"2026-10-21","last":"2026-10-22","add":250,"del":1},{"f":"src/core/memory_writer.h","dir":"src/core","ext":"h","lines":40,"kb":1.7,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":49,"del":0},{"f":"src/core/model_router.cpp","dir":"src/core","ext":"cpp","lines":57,"kb":2.7,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":68,"del":0},{"f":"src/core/model_router.h","dir":"src/core","ext":"h","lines":21,"kb":1.3,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":26,"del":0},{"f":"src/core/pty.cpp","dir":"src/core","ext":"cpp","lines":159,"kb":5.8,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":178,"del":0},{"f":"src/core/pty.h","dir":"src/core","ext":"h","lines":44,"kb":1.6,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":55,"del":0},{"f":"src/core/secrets.cpp","dir":"src/core","ext":"cpp","lines":174,"kb":6.4,"commits":2,"first":"2026-10-20","last":"2026-10-20","add":197,"del":0},{"f":"src/core/secrets.h","dir":"src/core","ext":"h","lines":39,"kb":1.8,"commits":2,"first":"2026-10-20","last":"2026-10-20","add":48,"del":0},{"f":"src/core/store.cpp","dir":"src/core","ext":"cpp","lines":484,"kb":20.3,"commits":18,"first":"2026-10-17","last":"2026-10-22","add":548,"del":29},{"f":"src/core/store.h","dir":"src/core","ext":"h","lines":80,"kb":4.4,"commits":15,"first":"2026-10-17","last":"2026-10-22","add":96,"del":3},{"f":"src/core/tools.cpp","dir":"src/core","ext":"cpp","lines":980,"kb":44.6,"commits":7,"first":"2026-10-20","last":"2026-10-22","add":1234,"del":181},{"f":"src/core/tools.h","dir":"src/core","ext":"h","lines":77,"kb":3.6,"commits":4,"first":"2026-10-20","last":"2026-10-22","add":98,"del":2},{"f":"src/core/usage.cpp","dir":"src/core","ext":"cpp","lines":130,"kb":5.3,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":143,"del":0},{"f":"src/core/usage.h","dir":"src/core","ext":"h","lines":19,"kb":0.8,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":25,"del":0},{"f":"src/core/voice.cpp","dir":"src/core","ext":"cpp","lines":221,"kb":8.8,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":241,"del":0},{"f":"src/core/voice.h","dir":"src/core","ext":"h","lines":37,"kb":1.4,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":47,"del":0},{"f":"src/core/vt_screen.cpp","dir":"src/core","ext":"cpp","lines":683,"kb":21.2,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":717,"del":0},{"f":"src/core/vt_screen.h","dir":"src/core","ext":"h","lines":104,"kb":3.9,"commits":2,"first":"2026-10-20","last":"2026-10-20","add":121,"del":0},{"f":"tests/app_update_test.cpp","dir":"tests","ext":"cpp","lines":39,"kb":1.8,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":46,"del":0},{"f":"tests/attachment_test.cpp","dir":"tests","ext":"cpp","lines":52,"kb":2.3,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":62,"del":0},{"f":"tests/auth_test.cpp","dir":"tests","ext":"cpp","lines":74,"kb":3.4,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":83,"del":0},{"f":"tests/claude_install_test.cpp","dir":"tests","ext":"cpp","lines":64,"kb":3.3,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":76,"del":0},{"f":"tests/highlight_test.cpp","dir":"tests","ext":"cpp","lines":63,"kb":4.1,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":75,"del":0},{"f":"tests/markdown_test.cpp","dir":"tests","ext":"cpp","lines":166,"kb":8.2,"commits":6,"first":"2026-10-20","last":"2026-10-22","add":178,"del":3},{"f":"tests/model_router_test.cpp","dir":"tests","ext":"cpp","lines":40,"kb":2.2,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":50,"del":0},{"f":"tests/probes/e2e_probe.cpp","dir":"tests/probes","ext":"cpp","lines":100,"kb":4.7,"commits":4,"first":"2026-10-20","last":"2026-10-22","add":107,"del":0},{"f":"tests/probes/github_probe.cpp","dir":"tests/probes","ext":"cpp","lines":30,"kb":1.3,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":32,"del":0},{"f":"tests/probes/memory_probe.cpp","dir":"tests/probes","ext":"cpp","lines":33,"kb":1.6,"commits":2,"first":"2026-10-21","last":"2026-10-21","add":41,"del":5},{"f":"tests/probes/store_probe.cpp","dir":"tests/probes","ext":"cpp","lines":24,"kb":1,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":26,"del":0},{"f":"tests/pty_test.cpp","dir":"tests","ext":"cpp","lines":106,"kb":3.9,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":120,"del":0},{"f":"tests/store_test.cpp","dir":"tests","ext":"cpp","lines":60,"kb":3.4,"commits":2,"first":"2026-10-22","last":"2026-10-22","add":70,"del":0},{"f":"tests/tools_test.cpp","dir":"tests","ext":"cpp","lines":229,"kb":14,"commits":6,"first":"2026-10-20","last":"2026-10-22","add":247,"del":0},{"f":"tests/usage_test.cpp","dir":"tests","ext":"cpp","lines":27,"kb":1.3,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":34,"del":0},{"f":"tests/vt_screen_test.cpp","dir":"tests","ext":"cpp","lines":146,"kb":6.1,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":154,"del":0},{"f":"tools/build.cmd","dir":"tools","ext":"cmd","lines":8,"kb":0.4,"commits":1,"first":"2026-10-17","last":"2026-10-17","add":8,"del":0},{"f":"tools/dist.cmd","dir":"tools","ext":"cmd","lines":18,"kb":0.6,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":18,"del":0},{"f":"tools/make-icon.ps1","dir":"tools","ext":"ps1","lines":58,"kb":3,"commits":1,"first":"2026-10-21","last":"2026-10-21","add":62,"del":0},{"f":"tools/probes/probe-midturn.ps1","dir":"tools/probes","ext":"ps1","lines":65,"kb":4.3,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":67,"del":0},{"f":"tools/probes/probe-protocol.ps1","dir":"tools/probes","ext":"ps1","lines":56,"kb":3.4,"commits":1,"first":"2026-10-20","last":"2026-10-20","add":59,"del":0},{"f":"tools/probes/ui/README.md","dir":"tools/probes/ui","ext":"md","lines":18,"kb":1.9,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":21,"del":0},{"f":"tools/probes/ui/column.ps1","dir":"tools/probes/ui","ext":"ps1","lines":14,"kb":0.6,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":14,"del":0},{"f":"tools/probes/ui/crop.ps1","dir":"tools/probes/ui","ext":"ps1","lines":18,"kb":1.1,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":18,"del":0},{"f":"tools/probes/ui/mouse.ps1","dir":"tools/probes/ui","ext":"ps1","lines":34,"kb":1.8,"commits":2,"first":"2026-10-22","last":"2026-10-22","add":36,"del":2},{"f":"tools/probes/ui/ocr.ps1","dir":"tools/probes/ui","ext":"ps1","lines":25,"kb":1.6,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":25,"del":0},{"f":"tools/probes/ui/shot.ps1","dir":"tools/probes/ui","ext":"ps1","lines":24,"kb":0.9,"commits":1,"first":"2026-10-22","last":"2026-10-22","add":24,"del":0}];
+const COLS = [
+  {k:'f',     t:'Файл',          cls:'first'},
+  {k:'lines', t:'Строк',         num:1, bar:1},
+  {k:'kb',    t:'КБ',            num:1, fmt:v => v.toFixed(1)},
+  {k:'share', t:'Доля',          num:1, fmt:v => (v*100).toFixed(1)+'%'},
+  {k:'commits',t:'Коммитов',     num:1, heat:1},
+  {k:'first', t:'Создан'},
+  {k:'last',  t:'Изменён'},
+  {k:'add',   t:'+',             num:1, cls2:'add'},
+  {k:'del',   t:'−',             num:1, cls2:'del'},
+  {k:'churn', t:'Переписано',    num:1, fmt:v => v.toFixed(2)+'×'},
+];
+const total = DATA.reduce((s, r) => s + r.lines, 0);
+DATA.forEach(r => { r.share = r.lines / total; r.churn = r.lines ? (r.add + r.del) / r.lines : 0; r.dir = r.dir || '.'; });
+const maxLines = Math.max(...DATA.map(r => r.lines)), maxCommits = Math.max(...DATA.map(r => r.commits));
+const st = {sort:'lines', up:false, q:'', exts:new Set(), min:0, grouped:true, closed:new Set(), sel:null};
+const $ = s => document.querySelector(s);
+
+$('#cols').innerHTML = COLS.map(c => `<th class="${c.num?'num ':''}${c.cls||''}" data-k="${c.k}">${c.t}<span class="arrow"></span></th>`).join('');
+const exts = [...new Set(DATA.map(r => r.ext))].sort();
+$('#exts').innerHTML = exts.map(e => `<span class="chip" data-e="${e}">.${e}</span>`).join(' ');
+$('#min').max = Math.ceil(maxLines / 10) * 10;
+
+function cell(c, r) {
+  const v = r[c.k];
+  if (c.k === 'f') return `<td class="first">${r.f.slice(r.dir === '.' ? 0 : r.dir.length + 1)}<span class="ext">${r.ext}</span></td>`;
+  let html = c.fmt ? c.fmt(v) : String(v);
+  if (c.bar) html = `<span class="bar"><i style="width:${Math.max(2, 80 * v / maxLines)}px"></i>${v}</span>`;
+  if (c.heat) html = `<span class="heat" style="background:rgba(76,146,255,${(0.08 + 0.6 * v / maxCommits).toFixed(2)})">${v}</span>`;
+  return `<td class="${c.num?'num ':''}${c.cls2||''}">${html}</td>`;
+}
+function sum(rows) {
+  const s = {f:'', lines:0, kb:0, share:0, commits:0, add:0, del:0, first:'', last:''};
+  for (const r of rows) { for (const k of ['lines','kb','share','commits','add','del']) s[k] += r[k];
+    if (!s.first || r.first < s.first) s.first = r.first; if (r.last > s.last) s.last = r.last; }
+  s.churn = s.lines ? (s.add + s.del) / s.lines : 0;
+  return s;
+}
+function visible() {
+  return DATA.filter(r => r.f.toLowerCase().includes(st.q) && (!st.exts.size || st.exts.has(r.ext)) && r.lines >= st.min)
+    .sort((a, b) => { const x = a[st.sort], y = b[st.sort];
+      return (typeof x === 'number' ? x - y : String(x).localeCompare(String(y))) * (st.up ? 1 : -1); });
+}
+function render() {
+  const rows = visible();
+  let html = '';
+  if (st.grouped) {
+    const groups = new Map();
+    rows.forEach(r => { if (!groups.has(r.dir)) groups.set(r.dir, []); groups.get(r.dir).push(r); });
+    const order = [...groups.keys()].sort((a, b) => sum(groups.get(b)).lines - sum(groups.get(a)).lines);
+    for (const d of order) {
+      const g = groups.get(d), s = sum(g), closed = st.closed.has(d);
+      html += `<tr class="group${closed?' closed':''}" data-d="${d}"><td class="first"><span class="fold">▾</span>${d}/<span class="n">${g.length}</span></td>`
+            + COLS.slice(1).map(c => cell(c, s)).join('') + '</tr>';
+      if (!closed) html += g.map(r => `<tr class="row${st.sel===r.f?' sel':''}" data-f="${r.f}">` + COLS.map(c => cell(c, r)).join('') + '</tr>').join('');
+    }
+  } else {
+    html = rows.map(r => `<tr class="row${st.sel===r.f?' sel':''}" data-f="${r.f}">` + COLS.map(c => cell(c, {...r, dir:'.'})).join('') + '</tr>').join('');
+  }
+  $('#body').innerHTML = html;
+  const s = sum(rows);
+  $('#foot').innerHTML = `<td class="first">Итого: ${rows.length} из ${DATA.length}</td>` + COLS.slice(1).map(c => cell(c, s)).join('');
+  document.querySelectorAll('#cols th').forEach(th => th.querySelector('.arrow').textContent = th.dataset.k === st.sort ? (st.up ? '▲' : '▼') : '');
+  document.querySelectorAll('#exts .chip').forEach(ch => ch.classList.toggle('on', st.exts.has(ch.dataset.e)));
+  $('#status').textContent = st.sel ? st.sel : 'клик — выделить строку, ↑/↓ — по строкам';
+}
+$('#cols').onclick = e => { const th = e.target.closest('th'); if (!th) return;
+  if (st.sort === th.dataset.k) st.up = !st.up; else { st.sort = th.dataset.k; st.up = !COLS.find(c => c.k === th.dataset.k).num; } render(); };
+$('#exts').onclick = e => { const e2 = e.target.dataset.e; if (!e2) return; st.exts.has(e2) ? st.exts.delete(e2) : st.exts.add(e2); render(); };
+$('#q').oninput = e => { st.q = e.target.value.toLowerCase(); render(); };
+$('#min').oninput = e => { st.min = +e.target.value; $('#minv').textContent = st.min; render(); };
+$('#grouped').onchange = e => { st.grouped = e.target.checked; render(); };
+$('#body').onclick = e => { const g = e.target.closest('tr.group'), r = e.target.closest('tr.row');
+  if (g) { const d = g.dataset.d; st.closed.has(d) ? st.closed.delete(d) : st.closed.add(d); }
+  if (r) st.sel = st.sel === r.dataset.f ? null : r.dataset.f;
+  render(); };
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || !['ArrowUp','ArrowDown'].includes(e.key)) return;
+  const list = [...document.querySelectorAll('tr.row')].map(r => r.dataset.f); if (!list.length) return;
+  const i = list.indexOf(st.sel); st.sel = list[Math.max(0, Math.min(list.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
+  e.preventDefault(); render(); document.querySelector('tr.row.sel')?.scrollIntoView({block:'nearest'}); });
+$('#copy').onclick = () => {
+  const tsv = [COLS.map(c => c.t).join('\t'), ...visible().map(r => COLS.map(c => c.fmt ? c.fmt(r[c.k]) : r[c.k]).join('\t'))].join('\n');
+  navigator.clipboard.writeText(tsv).then(() => { $('#status').textContent = 'Скопировано: ' + visible().length + ' строк'; }); };
+render();
+</script>
+</body></html>

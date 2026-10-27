@@ -2410,9 +2410,14 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::WinMax:
         ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
         return;
-    case Target::WinClose:
-        PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+    case Target::WinClose: {  // asked first: the cross is easy to hit by mistake (the updater closes unasked)
+        const std::wstring question = AnyBusy() ? L"Закрыть AIControls?\nЧаты, которые сейчас отвечают, оборвутся."
+                                                : std::wstring(L"Закрыть AIControls?");
+        if (MessageBoxW(hwnd_, question.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+            PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+        }
         return;
+    }
     case Target::SignIn:
         SignIn();
         break;
@@ -3922,11 +3927,11 @@ void ChatWindow::PaintInput(const Geometry& g) {
         Line({c.x, c.y + 3.5f}, {c.x, c.y + 6.5f}, color, 1.4f);
     }
     const D2D1_POINT_2F c{(g.send.left + g.send.right) / 2, (g.send.top + g.send.bottom) / 2};
-    if (busy_ && !hasContent()) {  // stop: a lit circle with a square
-        const float radius = (g.send.right - g.send.left) / 2;
-        brush_->SetColor(Color(kAccent, hover_.target == Target::Send ? 0.85f : 1.f));
-        target_->FillEllipse(D2D1::Ellipse(c, radius, radius), brush_.get());
-        Fill(D2D1::RectF(c.x - 4.5f, c.y - 4.5f, c.x + 4.5f, c.y + 4.5f), 1.5f, kPrimary);
+    if (busy_ && !hasContent()) {  // stop: a plain square, quiet as the arrow, no lit button
+        if (hover_.target == Target::Send) {
+            Fill(g.send, 6.f, kRaised);
+        }
+        Fill(D2D1::RectF(c.x - 5.f, c.y - 5.f, c.x + 5.f, c.y + 5.f), 2.f, kPrimary);
         return;
     }
     // As in Claude's app: the return arrow, always there; quiet while there is nothing to send, bright when there is.
@@ -5747,7 +5752,7 @@ std::wstring ChatWindow::PermissionName() const {
         return L"Без вопросов";
     }
     if (settings_.permissions == "auto") {
-        return L"Авто";
+        return L"Auto";  // as the model's and the effort's Auto beside it
     }
     if (settings_.permissions == "plan") {
         return L"План";
@@ -5772,7 +5777,7 @@ void ChatWindow::ShowPermissionMenu() {
     constexpr std::array<const wchar_t*, 5> kLabels = {
         L"Спрашивать\tперед любым изменением",
         L"Файлы без вопросов\tправки сами, команды спрашивает",
-        L"Авто\tбезобидное сам, опасное спрашивает",
+        L"Auto\tбезобидное сам, опасное спрашивает",
         L"План\tтолько читает и предлагает план",
         L"Без вопросов\tвсё сразу, без подтверждений"};
     wil::unique_hmenu menu(CreatePopupMenu());

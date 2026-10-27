@@ -4,9 +4,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "core/chat_export.h"
 #include "core/store.h"
 
 namespace {
@@ -99,6 +101,11 @@ int main() {
                fs::exists(grokA / L"g-1" / L"chat_history.jsonl"),
            "a grok chat renamed, its history left as it is");
     Expect(!aic::RenameSession(a, "..\\g-1", L"x") && !aic::MoveSession(a, b, "g-1"), "no paths; grok's are not moved");
+    const std::optional<std::string> markdown = aic::ChatMarkdown(a, "g-1");
+    Expect(markdown && markdown->starts_with("# Навигация\n") && markdown->find("## Grok") != std::string::npos &&
+               markdown->find("Прочитать файл") != std::string::npos && markdown->find("```\nhello\n```") != std::string::npos,
+           "a chat as Markdown: its title, who said what, the tool's card and output");
+    Expect(!aic::ChatMarkdown(a, "nope"), "no Markdown for a chat that is not there");
     fs::remove_all(grokA, error);
 
     // The sidebar's order: the open project first when sorting by recent, the general chats always last.

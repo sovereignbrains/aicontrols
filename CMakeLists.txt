@@ -25,6 +25,7 @@ add_library(aic_core STATIC
   src/core/app_update.cpp
   src/core/attachment.cpp
   src/core/auth.cpp
+  src/core/chat_export.cpp
   src/core/claude_install.cpp
   src/core/claude_process.cpp
   src/core/github.cpp

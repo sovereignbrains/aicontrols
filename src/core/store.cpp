@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -165,9 +166,12 @@ struct CachedTitle {
     std::wstring title;
 };
 
-// UI thread only.
+// The titles' caches: the sidebar reads them, and so do list_chats and read_chat on their threads.
+std::mutex g_titlesMutex;
+
 std::wstring CachedReadTitle(const fs::path& file, const WIN32_FILE_ATTRIBUTE_DATA& data) {
     static std::map<std::wstring, CachedTitle> cache;
+    const std::lock_guard lock(g_titlesMutex);
     const uint64_t modified = ToTicks(data.ftLastWriteTime);
     const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
     CachedTitle& entry = cache[file.wstring()];
@@ -365,9 +369,9 @@ struct CachedGrokTitle {
     std::optional<std::wstring> title;
 };
 
-// UI thread only.
 std::optional<std::wstring> GrokTitle(const fs::path& history, const WIN32_FILE_ATTRIBUTE_DATA& data) {
     static std::map<std::wstring, CachedGrokTitle> cache;
+    const std::lock_guard lock(g_titlesMutex);
     const uint64_t modified = ToTicks(data.ftLastWriteTime);
     const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
     CachedGrokTitle& entry = cache[history.wstring()];

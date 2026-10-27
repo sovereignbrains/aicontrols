@@ -18,6 +18,9 @@
 
 #include <wil/resource.h>
 
+#include "core/chat_export.h"
+#include "core/store.h"
+
 namespace aic {
 namespace {
 
@@ -192,6 +195,21 @@ std::string LineWindow(std::string_view text, size_t first, size_t limit, size_t
 size_t LineCount(std::string_view text) {
     const size_t count = static_cast<size_t>(std::ranges::count(text, '\n'));
     return text.empty() || text.ends_with('\n') ? count : count + 1;
+}
+
+// A read's window (offset, limit) of a text: a file's or a chat's (`what`).
+ToolResult ReadWindow(std::string_view bytes, const Json& input, const char* what) {
+    const size_t first = std::max<size_t>(LineArg(input, "offset"), 1);
+    size_t start = 0;
+    for (size_t line = 1; line < first && start < bytes.size(); ++line) {
+        const size_t newline = bytes.find('\n', start);
+        start = newline == std::string_view::npos ? bytes.size() : newline + 1;
+    }
+    const size_t total = LineCount(bytes);
+    if (start >= bytes.size() && first > 1) {
+        return ToolResult{std::format("The {} has {} lines; offset {} is past its end", what, total, first), true};
+    }
+    return ToolResult{LineWindow(bytes.substr(start), first, LineArg(input, "limit"), total), false};
 }
 
 std::string Truncated(const std::string& text, size_t limit) {
@@ -514,11 +532,15 @@ std::string OwnToolName(const std::string& fullName) {
     return fullName.starts_with(prefix) ? fullName.substr(prefix.size()) : std::string();
 }
 
+bool ReadOnlyTool(const std::string& name) {
+    return name == "read_file" || name == "list_directory" || name == "list_chats" || name == "read_chat";
+}
+
 bool ToolNeedsApproval(const std::string& name, const Json& input) {
     if (!StringArg(input, "on").empty()) {  // a server is not ours to look around in unasked
         return true;
     }
-    return name != "read_file" && name != "list_directory";
+    return !ReadOnlyTool(name);
 }
 
 namespace {
@@ -610,6 +632,13 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
     if (name == "list_directory") {
         return {L"Показать папку", path.empty() ? L"." : path};
     }
+    const std::wstring project = ToWide(StringArg(input, "project"));
+    if (name == "list_chats") {
+        return {L"Список чатов", project.empty() ? L"все проекты" : project};
+    }
+    if (name == "read_chat") {
+        return {L"Прочитать чат", ToWide(StringArg(input, "id")) + (project.empty() ? L"" : L"\n" + project)};
+    }
     return {ToWide(name), ToWide(Truncated(input.dump(-1, ' ', false, Json::error_handler_t::replace), 800))};
 }
 
@@ -628,7 +657,8 @@ Tools::Tools(SecretStore& secrets, std::wstring cwd) : secrets_(secrets), cwd_(s
 std::string Tools::SystemPrompt() {
     return "You are running inside AIControls, a native Windows chat client, on the user's computer. Claude Code's "
            "own local tools are off: use only the mcp__aic__* tools run_command, read_file, list_directory, "
-           "write_file and edit_file. On this computer run_command is PowerShell 5.1 (non-interactive). Paths are "
+           "write_file and edit_file, and list_chats and read_chat for this client's other chats (Claude's and "
+           "Grok's): when the user points to another chat, read it rather than guess. On this computer run_command is PowerShell 5.1 (non-interactive). Paths are "
            "paths on this computer; relative ones resolve against the chat's working directory. Every run_command, "
            "write_file and edit_file call, and anything aimed at a server, is shown to the user for approval, so "
            "keep commands focused and say briefly why you run them. "
@@ -658,6 +688,8 @@ Json Tools::Definitions() const {
                   {"description",
                    "Do it on this server instead of this computer: user@host or user@host:port (key login through the "
                    "system ssh). Paths and commands are then the server's; its shell is bash or sh, not PowerShell."}};
+    const Json project{{"type", "string"},
+                       {"description", "A project's folder (default: this chat's project first, then the others)"}};
     return Json::array({
         Json{{"name", "run_command"},
              {"description",
@@ -700,6 +732,21 @@ Json Tools::Definitions() const {
         Json{{"name", "list_directory"},
              {"description", "List a folder on this computer (default: the chat's working directory)."},
              {"inputSchema", Schema({{"on", on}, {"path", str}}, Json::array())}},
+        Json{{"name", "list_chats"},
+             {"description",
+              "List this client's chats, Claude's and Grok's, newest first: id, who answers, last change, title. "
+              "Without project: every project the client knows, the newest 20 of each."},
+             {"inputSchema", Schema({{"project", project}}, Json::array())}},
+        Json{{"name", "read_chat"},
+             {"description",
+              "Read one of this client's chats (Claude's or Grok's) as Markdown: the messages, and each tool call "
+              "with the start of its output. Up to 2000 lines or 60 KB at a time; read on with offset."},
+             {"inputSchema",
+              Schema({{"id", {{"type", "string"}, {"description", "The chat's id, from list_chats"}}},
+                      {"project", project},
+                      {"offset", {{"type", "integer"}, {"minimum", 1}, {"description", "First line to read, from 1"}}},
+                      {"limit", {{"type", "integer"}, {"minimum", 1}, {"description", "How many lines (default 2000)"}}}},
+                     Json::array({"id"}))}},
     });
 }
 
@@ -718,6 +765,10 @@ ToolResult Tools::Execute(const std::string& name, const Json& input, const std:
             result = EditFile(input);
         } else if (name == "list_directory") {
             result = ListDirectory(input);
+        } else if (name == "list_chats") {
+            result = ListChats(input);
+        } else if (name == "read_chat") {
+            result = ReadChat(input);
         } else {
             return Error("Unknown tool: " + name);
         }
@@ -895,17 +946,65 @@ ToolResult Tools::ReadFile(const Json& input) const {
     } else if (bytes.starts_with("\xEF\xBB\xBF")) {
         bytes.erase(0, 3);
     }
-    const size_t first = std::max<size_t>(LineArg(input, "offset"), 1);
-    size_t start = 0;
-    for (size_t line = 1; line < first && start < bytes.size(); ++line) {
-        const size_t newline = bytes.find('\n', start);
-        start = newline == std::string::npos ? bytes.size() : newline + 1;
+    return ReadWindow(bytes, input, "file");
+}
+
+// The projects this client knows: this chat's first, then the sidebar's, the general one last.
+std::vector<std::wstring> Tools::Projects(const std::string& project) const {
+    if (!project.empty()) {
+        return {Resolve(project)};
     }
-    const size_t total = LineCount(bytes);
-    if (start >= bytes.size() && first > 1) {
-        return Error(std::format("The file has {} lines; offset {} is past its end", total, first));
+    std::vector<std::wstring> folders{cwd_};
+    for (std::wstring folder : LoadSettings().projects) {
+        folders.push_back(std::move(folder));
     }
-    return ToolResult{LineWindow(std::string_view(bytes).substr(start), first, LineArg(input, "limit"), total), false};
+    folders.push_back(DefaultWorkspace());
+    std::vector<std::wstring> unique;
+    for (std::wstring& folder : folders) {
+        if (!folder.empty() && std::ranges::none_of(unique, [&](const std::wstring& seen) {
+                return CompareStringOrdinal(seen.c_str(), -1, folder.c_str(), -1, TRUE) == CSTR_EQUAL;
+            })) {
+            unique.push_back(std::move(folder));
+        }
+    }
+    return unique;
+}
+
+ToolResult Tools::ListChats(const Json& input) const {
+    const std::string project = StringArg(input, "project");
+    const size_t most = project.empty() ? 20 : 200;
+    std::string out;
+    for (const std::wstring& folder : Projects(project)) {
+        const std::vector<SessionInfo> sessions = ListSessions(folder);
+        out += ToUtf8(folder) + (folder == cwd_ ? "  (this chat's project)" : "") + "\n";
+        if (sessions.empty()) {
+            out += "  no chats\n";
+        }
+        for (size_t i = 0; i < sessions.size() && i < most; ++i) {
+            const SessionInfo& session = sessions[i];
+            out += std::format("  {}  {:<6}  {}  {}\n", session.id, session.grok ? "Grok" : "Claude",
+                               ChatTime(session.modified), ToUtf8(session.title));
+        }
+        if (sessions.size() > most) {
+            out += std::format("  … and {} older: list_chats with this project lists up to 200\n", sessions.size() - most);
+        }
+    }
+    return ToolResult{std::move(out), false};
+}
+
+ToolResult Tools::ReadChat(const Json& input) const {
+    const std::string id = StringArg(input, "id");
+    if (id.empty()) {
+        return Error("id is required (list_chats lists them)");
+    }
+    const std::string project = StringArg(input, "project");
+    for (const std::wstring& folder : Projects(project)) {
+        if (const std::optional<std::string> markdown = ChatMarkdown(folder, id)) {
+            return ReadWindow(*markdown, input, "chat");
+        }
+    }
+    return Error("No chat " + id + (project.empty() ? " in any project" : " in " + project) +
+                 "; list_chats lists them");
 }
 
 ToolResult Tools::WriteFile(const Json& input) const {

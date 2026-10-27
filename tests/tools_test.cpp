@@ -169,7 +169,7 @@ int main() {
             if (id == "r1") {
                 Expect(body["result"]["protocolVersion"] == "2025-06-18", "initialize echoes the version");
             } else if (id == "r2") {
-                Expect(body["result"]["tools"].size() == 5, "tools/list has five tools");
+                Expect(body["result"]["tools"].size() == 7, "tools/list has seven tools");
             } else if (id == "r3") {
                 Expect(body["id"] == 2 && body["result"]["isError"] == false &&
                            Has(body["result"]["content"][0]["text"], "crlf.txt"),
@@ -203,7 +203,9 @@ int main() {
         const std::string listed = tools.Definitions().dump();
         Expect(Has(listed, "TOKEN_A") && Has(listed, "SHORT") && !Has(listed, "hunter2value"),
                "run_command's description names the secrets, not their values");
-        Expect(Has(listed, "\"on\""), "every tool accepts on");
+        Expect(Has(listed, "\"on\""), "the file tools accept on");
+        Expect(!aic::ToolNeedsApproval("list_chats") && !aic::ToolNeedsApproval("read_chat", {{"id", "x"}}),
+               "reading the client's chats asks nothing");
         const std::string prompt = aic::Tools::SystemPrompt();
         Expect(Has(prompt, "mcp__aic__") && Has(prompt, "`on`") && Has(prompt, "language the user writes"),
                "system prompt");

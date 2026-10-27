@@ -1,8 +1,9 @@
 // By hand: how the chats of the default workspace are titled (how many still have none); --grok <folder>: a project's
-// Grok chats.
+// Grok chats; --md <folder> <id>: a chat as Markdown.
 #include <iostream>
 #include <string>
 
+#include "core/chat_export.h"
 #include "core/claude_process.h"
 #include "core/store.h"
 
@@ -11,6 +12,11 @@ int wmain(int argc, wchar_t** argv) {
         const bool ok = argc > 2 && aic::DeleteSession(aic::DefaultWorkspace(), aic::ToUtf8(argv[2]));
         std::cout << (ok ? "deleted\n" : "not deleted\n");
         return ok ? 0 : 1;
+    }
+    if (argc > 3 && std::wstring(argv[1]) == L"--md") {  // a chat as its Markdown file would be
+        const auto markdown = aic::ChatMarkdown(argv[2], aic::ToUtf8(argv[3]));
+        std::cout << (markdown ? *markdown : std::string("no such chat\n"));
+        return markdown ? 0 : 1;
     }
     if (argc > 2 && std::wstring(argv[1]) == L"--grok") {  // a project's Grok chats, and what opening one shows
         for (const auto& session : aic::ListSessions(argv[2])) {

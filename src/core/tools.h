@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/claude_process.h"
 #include "core/secrets.h"
@@ -27,6 +28,8 @@ struct ToolSummary {
 
 // A tool's name as the model sees it (mcp__aic__run_command) → ours (run_command); empty if it is not ours.
 std::string OwnToolName(const std::string& fullName);
+// The tools that change nothing: reading and listing files, and this client's chats.
+bool ReadOnlyTool(const std::string& name);
 // Reading and listing run without asking; commands and writes wait for the user.
 // Anything aimed at a server (`on`) waits too.
 bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object());
@@ -35,7 +38,8 @@ bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object
 bool AutoAllows(const std::string& name, const Json& input);
 ToolSummary SummarizeTool(const std::string& name, const Json& input);
 
-// The five tools: run_command, read_file, write_file, edit_file, list_directory.
+// The tools: run_command, read_file, write_file, edit_file, list_directory (the five work on a server too), and
+// list_chats and read_chat for the client's own chats.
 class Tools {
 public:
     Tools(SecretStore& secrets, std::wstring cwd);
@@ -57,6 +61,9 @@ private:
     ToolResult WriteFile(const Json& input) const;
     ToolResult EditFile(const Json& input) const;
     ToolResult ListDirectory(const Json& input) const;
+    ToolResult ListChats(const Json& input) const;
+    ToolResult ReadChat(const Json& input) const;
+    std::vector<std::wstring> Projects(const std::string& project) const;  // the given one, else all known
     std::wstring Resolve(const std::string& path) const;
 
     SecretStore& secrets_;

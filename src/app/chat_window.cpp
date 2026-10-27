@@ -223,6 +223,7 @@ constexpr const wchar_t* kPickScript = LR"JS((() => {
 })();)JS";
 constexpr float kMenuRow = 30.f;
 constexpr float kModelsWidth = 270.f;
+constexpr float kOptionsWidth = 220.f;
 constexpr float kEffortWidth = 250.f;
 constexpr float kEffortHeight = 112.f;
 constexpr float kAttachmentRow = 88.f;
@@ -495,6 +496,8 @@ enum class Target {
     ProjectNew,   // row: the same: "+" on the head, a new chat in that project
     AddProject,   // "+" beside the projects' label: a folder or a GitHub repository
     ModelRow,     // row: an index into the models
+    AutoToggle,   // "Auto" atop the models
+    FastToggle,   // "Fast" in the Grok row's options
     EffortTrack,
     EffortReset,
     ApprovalAllow,  // row: the feed item
@@ -571,7 +574,10 @@ struct Geometry {
     D2D1_RECT_F search{};
     float listTop = 0;
     // Models.
+    D2D1_RECT_F autoRow{};
     float modelsTop = 0;
+    D2D1_RECT_F options{};  // beside the Grok row
+    D2D1_RECT_F fastRow{};
     // Effort.
     D2D1_RECT_F track{};
     D2D1_RECT_F reset{};
@@ -812,6 +818,7 @@ private:
     void PaintInput(const Geometry& g);
     void PaintPanel(const D2D1_RECT_F& rect);
     void PaintModels(const Geometry& g);
+    void PaintSwitch(const D2D1_RECT_F& row, bool on);
     void PaintEffort(const Geometry& g);
     void PaintUsage(const Geometry& g);
 
@@ -1117,7 +1124,11 @@ private:
     std::wstring ModelName() const;
     std::vector<std::string> EffortLevels() const;
     void SetEffortAt(float x);
-    void ChooseModel(size_t index);
+    void ChooseModel(size_t index, bool close = true);
+    size_t RowModel(size_t row) const;  // what a menu row picks: the Grok row, its tier
+    bool OptionsFor(size_t row) const;  // the row has options beside it
+    void ToggleAuto();
+    void ToggleFast();
     void Apply(const Settings& next);
 
     bool StartClaude();
@@ -1285,8 +1296,13 @@ private:
     std::wstring renameText_;
     D2D1_POINT_2F mouse_{-1.f, -1.f};  // the pointer in DIPs; off the window after it leaves
     size_t selected_ = 0;
-    // Models: indexes into models_, those the menu shows.
+    // Models: indexes into models_, those the menu shows; "Auto", the Grok row and its fast tier apart
+    // (npos: none).
     std::vector<size_t> mainModels_;
+    size_t autoIndex_ = std::string::npos;
+    size_t grokBase_ = std::string::npos;
+    size_t grokFast_ = std::string::npos;
+    bool optionsOpen_ = false;  // the Grok row's options beside the menu
     std::string defaultResolved_;  // what the CLI's "default" stands for
     // "Auto" (settings model "auto"): the alias the chat runs on now, and how big the chat is (the last turn's
     // input), as switching down in a big chat would rewrite its whole cache.
@@ -1801,6 +1817,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             hover_ = hit;
             if (hit.target == Target::HistoryRow) {
                 selected_ = hit.row;
+            } else if (hit.target == Target::ModelRow) {
+                optionsOpen_ = OptionsFor(hit.row);
+            } else if (hit.target == Target::AutoToggle) {
+                optionsOpen_ = false;
             }
             Refresh();
         }
@@ -2253,7 +2273,13 @@ void ChatWindow::OnClick(float x, float y) {
     if (popup_ != Popup::None) {
         switch (hit.target) {
         case Target::ModelRow:
-            ChooseModel(mainModels_[hit.row]);
+            ChooseModel(RowModel(hit.row));
+            return;
+        case Target::AutoToggle:
+            ToggleAuto();
+            return;
+        case Target::FastToggle:
+            ToggleFast();
             return;
         case Target::EffortReset:
             pendingEffort_.clear();
@@ -2518,7 +2544,7 @@ void ChatWindow::OnPopupKey(WPARAM key) {
 void ChatWindow::OnPopupChar(wchar_t c) {
     if (popup_ == Popup::Models && c >= L'1' && c <= L'9') {
         if (const auto index = static_cast<size_t>(c - L'1'); index < mainModels_.size()) {
-            ChooseModel(mainModels_[index]);
+            ChooseModel(RowModel(index));
         }
         return;
     }
@@ -2754,10 +2780,25 @@ Geometry ChatWindow::Layout() const {
     switch (popup_) {
     case Popup::Models: {
         const float rows = static_cast<float>(mainModels_.size());
-        const float height = 12 + rows * kMenuRow;
+        const float autoHeight = autoIndex_ == std::string::npos ? 0 : kMenuRow + 9;  // and the line under it
+        const float height = 12 + autoHeight + rows * kMenuRow;
         const float popupLeft = ClampTo(g.model.left, 10.f, g.area - 10 - kModelsWidth);
         g.popup = D2D1::RectF(popupLeft, g.box.top - 6 - height, popupLeft + kModelsWidth, g.box.top - 6);
-        g.modelsTop = g.popup.top + 6;
+        g.autoRow = D2D1::RectF(g.popup.left + 6, g.popup.top + 6, g.popup.right - 6, g.popup.top + 6 + kMenuRow);
+        g.modelsTop = g.popup.top + 6 + autoHeight;
+        for (size_t i = 0; i < mainModels_.size(); ++i) {
+            if (!OptionsFor(i)) {
+                continue;
+            }
+            // Its options beside it, right where there is room (as Cursor has them), its top on the row's.
+            const float row = g.modelsTop + static_cast<float>(i) * kMenuRow;
+            const float optionsHeight = 6 + 24 + kMenuRow + 22 + 6;
+            const bool roomRight = g.popup.right + 4 + kOptionsWidth <= g.area - 10;
+            const float x = roomRight ? g.popup.right + 4 : g.popup.left - 4 - kOptionsWidth;
+            const float top = std::min(row - 6, g.box.top - 6 - optionsHeight);
+            g.options = D2D1::RectF(x, top, x + kOptionsWidth, top + optionsHeight);
+            g.fastRow = D2D1::RectF(x + 6, top + 30, g.options.right - 6, top + 30 + kMenuRow);
+        }
         break;
     }
     case Popup::Effort: {
@@ -2786,7 +2827,13 @@ Hit ChatWindow::HitTest(float x, float y) const {
     const Geometry g = Layout();
     switch (popup_) {
     case Popup::Models:
+        if (optionsOpen_ && Inside(g.options, x, y)) {
+            return Inside(g.fastRow, x, y) ? Hit{Target::FastToggle} : Hit{Target::InsidePopup};
+        }
         if (Inside(g.popup, x, y)) {
+            if (autoIndex_ != std::string::npos && Inside(g.autoRow, x, y)) {
+                return {Target::AutoToggle};
+            }
             if (y >= g.modelsTop) {
                 const auto row = static_cast<size_t>((y - g.modelsTop) / kMenuRow);
                 if (row < mainModels_.size()) {
@@ -6245,35 +6292,72 @@ void ChatWindow::OnSearchChar(wchar_t c) {
     FilterSessions();
 }
 
+// A switch at a row's right end: the accent and the knob right when on.
+void ChatWindow::PaintSwitch(const D2D1_RECT_F& row, bool on) {
+    const float midY = (row.top + row.bottom) / 2;
+    const D2D1_RECT_F track = D2D1::RectF(row.right - 10 - 30, midY - 9, row.right - 10, midY + 9);
+    Fill(track, 9.f, on ? kAccent : kLine);
+    const float knobX = on ? track.right - 9 : track.left + 9;
+    Fill(D2D1::RectF(knobX - 6.5f, midY - 6.5f, knobX + 6.5f, midY + 6.5f), 6.5f, on ? kPrimary : kSecondary);
+}
+
 void ChatWindow::PaintModels(const Geometry& g) {
     const Json* current = CurrentModel();
-    const auto rowFor = [&](size_t modelIndex, const D2D1_RECT_F& r, bool hovered, const std::wstring& key) {
-        const Json& model = models_[modelIndex];
-        if (hovered) {
-            Fill(r, 6.f, kRaised);
-        }
-        const std::wstring name = ToWide(JsonStr(model, "displayName"));
-        Text(name, ui_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 30, r.bottom), kPrimary);
-        if (JsonStr(model, "resolvedModel") == defaultResolved_ && !defaultResolved_.empty()) {
-            const float x = r.left + 10 + TextWidth(name, ui_.get()) + 8;
-            const float width = TextWidth(L"Default", badge_.get()) + 12;
-            const D2D1_RECT_F badge = D2D1::RectF(x, r.top + 7, x + width, r.bottom - 7);
-            Fill(badge, 4.f, kRaised);
-            Text(L"Default", badge_.get(), badge, kSecondary);
-        }
-        if (&model == current) {
-            Check({r.right - 16, (r.top + r.bottom) / 2}, kAccent);
-        } else if (!key.empty()) {
-            Text(key, uiRight_.get(), D2D1::RectF(r.left, r.top, r.right - 10, r.bottom), kSecondary);
-        }
-    };
-
+    const bool autoOn = settings_.model == "auto";
     PaintPanel(g.popup);
+    if (autoIndex_ != std::string::npos) {
+        if (hover_.target == Target::AutoToggle) {
+            Fill(g.autoRow, 6.f, kRaised);
+        }
+        Text(L"Auto", ui_.get(), D2D1::RectF(g.autoRow.left + 10, g.autoRow.top, g.autoRow.right - 50, g.autoRow.bottom),
+             kPrimary);
+        PaintSwitch(g.autoRow, autoOn);
+        brush_->SetColor(Color(kLine));
+        target_->FillRectangle(D2D1::RectF(g.popup.left + 10, g.modelsTop - 5, g.popup.right - 10, g.modelsTop - 4),
+                               brush_.get());
+    }
     for (size_t i = 0; i < mainModels_.size(); ++i) {
         const float top = g.modelsTop + static_cast<float>(i) * kMenuRow;
         const D2D1_RECT_F r = D2D1::RectF(g.popup.left + 6, top, g.popup.right - 6, top + kMenuRow);
-        const bool hovered = hover_.target == Target::ModelRow && hover_.row == i;
-        rowFor(mainModels_[i], r, hovered, i < 9 ? std::to_wstring(i + 1) : L"");
+        const Json& model = models_[mainModels_[i]];
+        if ((hover_.target == Target::ModelRow && hover_.row == i) || (OptionsFor(i) && optionsOpen_)) {
+            Fill(r, 6.f, kRaised);
+        }
+        // Under Auto the models are what it picks from: quieter, a click on one turns it off.
+        const std::wstring name = ToWide(JsonStr(model, "displayName"));
+        Text(name, ui_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 30, r.bottom), autoOn ? kSecondary : kPrimary);
+        float after = r.left + 10 + TextWidth(name, ui_.get()) + 8;
+        if (OptionsFor(i) && settings_.grokFast) {  // the tier the row picks, as Cursor's "High Fast"
+            Text(L"Fast", ui_.get(), D2D1::RectF(after - 2, r.top, r.right - 30, r.bottom), kSecondary);
+            after += TextWidth(L"Fast", ui_.get()) + 6;
+        }
+        if (JsonStr(model, "resolvedModel") == defaultResolved_ && !defaultResolved_.empty()) {
+            const float width = TextWidth(L"Default", badge_.get()) + 12;
+            const D2D1_RECT_F badge = D2D1::RectF(after, r.top + 7, after + width, r.bottom - 7);
+            Fill(badge, 4.f, kRaised);
+            Text(L"Default", badge_.get(), badge, kSecondary);
+        }
+        const bool chosen = &model == current || (OptionsFor(i) && current == &models_[grokFast_]);
+        if (chosen) {
+            Check({r.right - 16, (r.top + r.bottom) / 2}, kAccent);
+        } else if (i < 9) {
+            Text(std::to_wstring(i + 1), uiRight_.get(), D2D1::RectF(r.left, r.top, r.right - 10, r.bottom), kSecondary);
+        }
+    }
+
+    if (optionsOpen_) {  // the Grok row's options
+        PaintPanel(g.options);
+        Text(L"Опции", small_.get(),
+             D2D1::RectF(g.options.left + 16, g.options.top + 8, g.options.right - 16, g.options.top + 28), kSecondary);
+        if (hover_.target == Target::FastToggle) {
+            Fill(g.fastRow, 6.f, kRaised);
+        }
+        Text(L"Fast", ui_.get(), D2D1::RectF(g.fastRow.left + 10, g.fastRow.top, g.fastRow.right - 50, g.fastRow.bottom),
+             kPrimary);
+        PaintSwitch(g.fastRow, settings_.grokFast);
+        Text(L"быстрее, лимит тратится ×2", small_.get(),
+             D2D1::RectF(g.options.left + 16, g.fastRow.bottom + 2, g.options.right - 16, g.options.bottom - 4),
+             kSecondary);
     }
 }
 
@@ -8061,6 +8145,8 @@ void ChatWindow::OpenPopup(Popup popup) {
         pendingEffort_ = settings_.effort;
         break;
     case Popup::Models:
+        optionsOpen_ = false;
+        break;
     case Popup::Usage:
     case Popup::Image:
     case Popup::None:
@@ -8082,6 +8168,7 @@ void ChatWindow::ClosePopup() {
     }
     const Popup was = popup_;
     popup_ = Popup::None;
+    optionsOpen_ = false;
     hover_ = {};
     if (was == Popup::Image) {
         viewer_ = {};
@@ -8231,11 +8318,13 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
 
 // The menu shows the newest models only (27.10.2026, his: are the old ones of any use?). Claude's CLI lists
 // aliases (opus, sonnet…, always the newest) and pinned versions (claude-opus-4-8…): the aliases stay. Grok's
-// lists its generations (grok-4.7, grok-4.7-build-fast, grok-4.6…): the newest one stays, Fast included.
-// "default" itself is shown as a badge on what it means.
+// lists its generations (grok-4.7, grok-4.7-build-fast, grok-4.6…): the newest one stays, one row, its fast tier
+// a switch beside it (28.10.2026, his: as Cursor has it). "Auto" is a switch atop the menu; "default" itself is
+// shown as a badge on what it means.
 void ChatWindow::IndexModels() {
     mainModels_.clear();
     defaultResolved_.clear();
+    autoIndex_ = grokBase_ = grokFast_ = std::string::npos;
     std::pair<int, int> newestGrok{-1, -1};
     for (const Json& model : models_) {
         if (const std::string value = JsonStr(model, "value"); value.starts_with("grok-")) {
@@ -8246,11 +8335,59 @@ void ChatWindow::IndexModels() {
         const std::string value = JsonStr(models_[i], "value");
         if (value == "default") {
             defaultResolved_ = JsonStr(models_[i], "resolvedModel");
-        } else if (value.starts_with("grok-") ? GrokVersion(value) == newestGrok
-                                              : value.find('-') == std::string::npos) {
+        } else if (value == "auto") {
+            autoIndex_ = i;
+        } else if (value.starts_with("grok-")) {
+            if (GrokVersion(value) != newestGrok) {
+                continue;
+            }
+            if (value.find("fast") != std::string::npos) {
+                grokFast_ = i;
+            } else if (grokBase_ == std::string::npos) {
+                grokBase_ = i;
+                mainModels_.push_back(i);
+            }
+        } else if (value.find('-') == std::string::npos) {
             mainModels_.push_back(i);
         }
     }
+    if (grokBase_ == std::string::npos && grokFast_ != std::string::npos) {  // only the fast one: a row as any
+        mainModels_.push_back(std::exchange(grokFast_, std::string::npos));
+    }
+}
+
+size_t ChatWindow::RowModel(size_t row) const {
+    const size_t index = mainModels_[row];
+    return index == grokBase_ && settings_.grokFast && grokFast_ != std::string::npos ? grokFast_ : index;
+}
+
+bool ChatWindow::OptionsFor(size_t row) const {
+    return row < mainModels_.size() && mainModels_[row] == grokBase_ && grokFast_ != std::string::npos;
+}
+
+// Off: the model Auto runs the chat on now goes on by itself.
+void ChatWindow::ToggleAuto() {
+    if (settings_.model != "auto") {
+        ChooseModel(autoIndex_, false);
+        return;
+    }
+    for (size_t i = 0; i < models_.size(); ++i) {
+        if (JsonStr(models_[i], "value") == autoModel_) {
+            ChooseModel(i, false);
+            return;
+        }
+    }
+}
+
+// The tier is kept for the Grok row; a chat on Grok goes on in the other one at once.
+void ChatWindow::ToggleFast() {
+    settings_.grokFast = !settings_.grokFast;
+    SaveSettings(settings_);
+    if (const std::string& model = settings_.model;
+        model == JsonStr(models_[grokBase_], "value") || model == JsonStr(models_[grokFast_], "value")) {
+        ChooseModel(settings_.grokFast ? grokFast_ : grokBase_, false);
+    }
+    Refresh();
 }
 
 void ChatWindow::MergeModels() {
@@ -8325,7 +8462,7 @@ void ChatWindow::SetEffortAt(float x) {
     }
 }
 
-void ChatWindow::ChooseModel(size_t index) {
+void ChatWindow::ChooseModel(size_t index, bool close) {
     Settings next = settings_;
     next.model = JsonStr(models_[index], "value");
     // An effort the new model does not have would be refused: back to its default.
@@ -8336,7 +8473,9 @@ void ChatWindow::ChooseModel(size_t index) {
     if (!supported) {
         next.effort.clear();
     }
-    ClosePopup();
+    if (close) {
+        ClosePopup();
+    }
     Apply(next);
 }
 

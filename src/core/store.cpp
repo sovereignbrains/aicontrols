@@ -440,6 +440,7 @@ Settings LoadSettings() {
     settings.permissions = JsonStr(data, "permissions");
     settings.claudeModels = JsonStr(data, "claudeModels");
     settings.connectors = JsonAt(data, "connectors").is_boolean() && JsonAt(data, "connectors").get<bool>();
+    settings.grokFast = JsonAt(data, "grokFast").is_boolean() && JsonAt(data, "grokFast").get<bool>();
     const auto number = [&](const char* key, long long fallback) {
         const Json& value = JsonAt(data, key);
         return value.is_number() ? value.get<long long>() : fallback;
@@ -504,6 +505,7 @@ void SaveSettings(const Settings& settings) {
                 {"permissions", settings.permissions},
                 {"claudeModels", settings.claudeModels},
                 {"connectors", settings.connectors},
+        {"grokFast", settings.grokFast},
                 {"sessionPercent", settings.sessionPercent},
                 {"sessionResets", settings.sessionResets},
                 {"weekPercent", settings.weekPercent},

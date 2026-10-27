@@ -39,4 +39,13 @@ using InstallProgress = std::function<void(unsigned percent, bool installing)>;
 bool InstallClaude(const std::wstring& proxy, const std::atomic<bool>* cancel, const InstallProgress& progress,
                    std::string& error);
 
+// The Grok CLI as its own install.ps1 puts it: the stable build from x.ai/cli (Google's storage when x.ai does not
+// answer) to %USERPROFILE%\.grok\bin as grok.exe and agent.exe. Its releases carry no checksum: the download must
+// be signed by X Corp. instead. True when grok.exe is there afterwards; otherwise `error` says why.
+bool InstallGrok(const std::wstring& proxy, const std::atomic<bool>* cancel, const InstallProgress& progress,
+                 std::string& error);
+
+// "X Corp." when the file's Authenticode signature holds: the name its signer's certificate carries; empty otherwise.
+std::wstring SignerOf(const std::wstring& path);
+
 }  // namespace aic

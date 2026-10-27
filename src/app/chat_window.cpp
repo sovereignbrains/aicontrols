@@ -89,6 +89,7 @@ struct SetupEvent {
     bool finished = false;
     bool ok = false;
     bool update = false;  // an update, not a first install
+    bool grok = false;    // Grok's CLI, not Claude's; installing then means its sign-in runs
     std::string error;
 };
 
@@ -905,6 +906,7 @@ private:
     // The CLI itself: fetched when it is missing, updated from the account menu.
     bool ClaudeUpdateAvailable() const { return ClaudeVersionLess(claudeVersion_, claudeLatest_); }
     void InstallClaudeCli();
+    void InstallGrokCli();
     void UpdateClaudeCli();
     void CancelSetup() { setupCancel_ = true; }
     void OnSetupEvent(const SetupEvent& event);
@@ -5084,12 +5086,51 @@ void ChatWindow::InstallClaudeCli() {
         const bool ok = InstallClaude(
             PickProxy(), cancel,
             [hwnd](unsigned percent, bool installing) {
-                PostSetup(hwnd, SetupEvent{percent, installing, false, false, false, {}});
+                PostSetup(hwnd, SetupEvent{percent, installing, false, false, false, false, {}});
             },
             error);
-        PostSetup(hwnd, SetupEvent{100, false, true, ok, false, std::move(error)});
+        PostSetup(hwnd, SetupEvent{100, false, true, ok, false, false, std::move(error)});
     });
     Refresh();
+}
+
+// What x.ai's install.ps1 does, its signature checked instead of a checksum it does not publish; then the sign-in.
+void ChatWindow::InstallGrokCli() {
+    if (setupBusy_) {
+        return;
+    }
+    if (setupThread_.joinable()) {
+        setupThread_.join();
+    }
+    setupBusy_ = true;
+    setupPercent_ = 0;
+    setupCancel_ = false;
+    Flash(L"Скачиваю Grok…", 60000);
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &setupCancel_;
+    setupThread_ = std::thread([hwnd, cancel] {
+        std::string error;
+        bool ok = InstallGrok(
+            PickProxy(), cancel,
+            [hwnd](unsigned percent, bool) { PostSetup(hwnd, SetupEvent{percent, false, false, false, false, true, {}}); },
+            error);
+        std::array<wchar_t, 2048> profile{};
+        const DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile.data(), static_cast<DWORD>(profile.size()));
+        const std::wstring auth = std::wstring(profile.data(), length < profile.size() ? length : 0) + L"\\.grok\\auth.json";
+        if (ok && GetFileAttributesW(auth.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            PostSetup(hwnd, SetupEvent{100, true, false, false, false, true, {}});
+            const CliResult run = RunCli(L"\"" + FindGrokExe() + L"\" login --oauth", PickProxy(), 300, cancel);
+            if (run.cancelled || run.timedOut || !run.started || run.exitCode != 0) {
+                ok = false;
+                error = run.timedOut ? "Не дождался входа в Grok"
+                                     : (run.output.size() > 300 ? run.output.substr(run.output.size() - 300) : run.output);
+                if (error.empty()) {
+                    error = "Вход в Grok не удался (код " + std::to_string(run.exitCode) + ")";
+                }
+            }
+        }
+        PostSetup(hwnd, SetupEvent{100, false, true, ok, false, true, std::move(error)});
+    });
 }
 
 // `claude update`, with the running CLI stopped first: it holds its own file.
@@ -5132,12 +5173,34 @@ void ChatWindow::UpdateClaudeCli() {
                 error = "Обновление не удалось (код " + std::to_string(run.exitCode) + ")";
             }
         }
-        PostSetup(hwnd, SetupEvent{100, false, true, error.empty(), true, std::move(error)});
+        PostSetup(hwnd, SetupEvent{100, false, true, error.empty(), true, false, std::move(error)});
     });
     Refresh();
 }
 
 void ChatWindow::OnSetupEvent(const SetupEvent& event) {
+    if (event.grok) {
+        if (!event.finished) {
+            if (event.installing) {
+                Flash(L"Grok скачан. Войдите в аккаунт x.ai в открывшемся браузере", 300000);
+            } else if (event.percent != setupPercent_) {
+                setupPercent_ = event.percent;
+                Flash(L"Скачиваю Grok… " + std::to_wstring(event.percent) + L"%", 60000);
+            }
+            return;
+        }
+        setupBusy_ = false;
+        if (event.ok) {
+            Flash(L"Grok установлен", 5000);
+            StartClaude();
+        } else {
+            Flash(L"", 1);
+            Add(Kind::Error, L"Grok не установился: " +
+                                 (event.error == "Cancelled" ? std::wstring(L"отменено.") : ToWide(event.error)));
+        }
+        Refresh();
+        return;
+    }
     if (!event.finished) {
         setupPercent_ = event.percent;
         setupInstalling_ = event.installing;
@@ -8564,7 +8627,7 @@ bool ChatWindow::StartClaude() {
     options.exe = grok ? FindGrokExe() : FindClaudeExe();
     claudeMissing_ = !grok && options.exe.empty();
     if (grok && options.exe.empty()) {
-        Add(Kind::Error, L"Не нашёл grok.exe ни в %USERPROFILE%\\.grok\\bin, ни в PATH.");
+        InstallGrokCli();  // its own Flash tells how far it is; once in place it starts the chat
         return false;
     }
     if (options.exe.empty()) {

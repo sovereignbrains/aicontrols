@@ -2,12 +2,15 @@
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <softpub.h>
+#include <wintrust.h>
 #include <winhttp.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -15,6 +18,7 @@
 
 #include "core/auth.h"
 #include "core/claude_process.h"
+#include "core/grok_process.h"
 
 namespace aic {
 namespace {
@@ -35,10 +39,10 @@ std::wstring ProxyHostPort(std::wstring proxy) {
     return proxy;
 }
 
-// GET https://downloads.claude.ai<path>; the body goes to `sink` in pieces (false from it stops the download).
+// GET https://<host><path> (downloads.claude.ai unless named); the body goes to `sink` in pieces (false from it stops the download).
 // `total` is the Content-Length, 0 when unknown. Returns the HTTP status, or 0 with `error` set.
 DWORD Get(const std::wstring& proxy, const std::wstring& path, std::string& error,
-          const std::function<bool(const char*, DWORD, unsigned long long total)>& sink) {
+          const std::function<bool(const char*, DWORD, unsigned long long total)>& sink, const wchar_t* host = kHost) {
     const std::wstring hostPort = ProxyHostPort(proxy);
     unique_hinternet session(WinHttpOpen(
         L"AIControls", proxy.empty() ? WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY : WINHTTP_ACCESS_TYPE_NAMED_PROXY,
@@ -48,7 +52,7 @@ DWORD Get(const std::wstring& proxy, const std::wstring& path, std::string& erro
         return 0;
     }
     WinHttpSetTimeouts(session.get(), 15000, 15000, 30000, 60000);
-    unique_hinternet connection(WinHttpConnect(session.get(), kHost, INTERNET_DEFAULT_HTTPS_PORT, 0));
+    unique_hinternet connection(WinHttpConnect(session.get(), host, INTERNET_DEFAULT_HTTPS_PORT, 0));
     unique_hinternet request(connection ? WinHttpOpenRequest(connection.get(), L"GET", path.c_str(), nullptr,
                                                              WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                                              WINHTTP_FLAG_SECURE)
@@ -59,7 +63,7 @@ DWORD Get(const std::wstring& proxy, const std::wstring& path, std::string& erro
     }
     if (!WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request.get(), nullptr)) {
-        error = "No answer from downloads.claude.ai (error " + std::to_string(GetLastError()) + ")";
+        error = "No answer from " + ToUtf8(host) + " (error " + std::to_string(GetLastError()) + ")";
         return 0;
     }
     DWORD status = 0;
@@ -91,19 +95,23 @@ DWORD Get(const std::wstring& proxy, const std::wstring& path, std::string& erro
     return status;
 }
 
-bool GetText(const std::wstring& proxy, const std::wstring& path, std::string& text, std::string& error) {
+bool GetText(const std::wstring& proxy, const std::wstring& path, std::string& text, std::string& error,
+             const wchar_t* host = kHost) {
     text.clear();
-    const DWORD status = Get(proxy, path, error, [&](const char* data, DWORD size, unsigned long long) {
-        if (text.size() < (1u << 20)) {
-            text.append(data, size);
-        }
-        return true;
-    });
+    const DWORD status = Get(
+        proxy, path, error,
+        [&](const char* data, DWORD size, unsigned long long) {
+            if (text.size() < (1u << 20)) {
+                text.append(data, size);
+            }
+            return true;
+        },
+        host);
     if (status == 0) {
         return false;
     }
     if (status != 200) {
-        error = "downloads.claude.ai answered " + std::to_string(status) + " for " + ToUtf8(path);
+        error = ToUtf8(host) + " answered " + std::to_string(status) + " for " + ToUtf8(path);
         return false;
     }
     return true;
@@ -137,6 +145,50 @@ std::wstring TempFile(const std::string& version, const std::string& platform) {
     std::array<wchar_t, MAX_PATH + 1> dir{};
     const DWORD length = GetTempPathW(static_cast<DWORD>(dir.size()), dir.data());
     return std::wstring(dir.data(), length) + L"aic-claude-" + ToWide(version) + L"-" + ToWide(platform) + L".exe";
+}
+
+// https://<host><path> into `file`, its progress told as it comes. False with `error` set otherwise.
+bool Download(const std::wstring& proxy, const wchar_t* host, const std::wstring& path, const std::wstring& file,
+              const std::atomic<bool>* cancel, const InstallProgress& progress, std::string& error) {
+    wil::unique_hfile out(CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                      nullptr));
+    if (!out) {
+        error = "Cannot write " + ToUtf8(file);
+        return false;
+    }
+    unsigned long long received = 0;
+    unsigned lastPercent = 101;
+    const DWORD status = Get(
+        proxy, path, error,
+        [&](const char* data, DWORD size, unsigned long long total) {
+            if (cancel != nullptr && cancel->load()) {
+                return false;
+            }
+            DWORD written = 0;
+            if (!WriteFile(out.get(), data, size, &written, nullptr) || written != size) {
+                return false;
+            }
+            received += size;
+            const auto percent =
+                total > 0 ? static_cast<unsigned>(std::min<unsigned long long>(100, received * 100 / total)) : 0u;
+            if (progress && percent != lastPercent) {
+                lastPercent = percent;
+                progress(percent, false);
+            }
+            return true;
+        },
+        host);
+    if (status == 0) {
+        if (error == "Stopped") {
+            error = cancel != nullptr && cancel->load() ? "Cancelled" : "Cannot write " + ToUtf8(file);
+        }
+        return false;
+    }
+    if (status != 200) {
+        error = ToUtf8(host) + " answered " + std::to_string(status) + " for " + ToUtf8(path);
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -280,43 +332,10 @@ bool InstallClaude(const std::wstring& proxy, const std::atomic<bool>* cancel, c
     const std::string platform = Platform();
     const std::wstring temp = TempFile(release.version, platform);
     const auto removeTemp = wil::scope_exit([&] { DeleteFileW(temp.c_str()); });
-    {
-        wil::unique_hfile out(CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                          FILE_ATTRIBUTE_NORMAL, nullptr));
-        if (!out) {
-            error = "Cannot write " + ToUtf8(temp);
-            return false;
-        }
-        unsigned long long received = 0;
-        unsigned lastPercent = 101;
-        const std::wstring path = std::wstring(kBasePath) + L"/" + ToWide(release.version) + L"/" + ToWide(platform) +
-                                  L"/claude.exe";
-        const DWORD status = Get(proxy, path, error, [&](const char* data, DWORD size, unsigned long long total) {
-            if (cancel != nullptr && cancel->load()) {
-                return false;
-            }
-            DWORD written = 0;
-            if (!WriteFile(out.get(), data, size, &written, nullptr) || written != size) {
-                return false;
-            }
-            received += size;
-            const auto percent = total > 0 ? static_cast<unsigned>(std::min<unsigned long long>(100, received * 100 / total)) : 0u;
-            if (progress && percent != lastPercent) {
-                lastPercent = percent;
-                progress(percent, false);
-            }
-            return true;
-        });
-        if (status == 0) {
-            if (error == "Stopped") {
-                error = cancel != nullptr && cancel->load() ? "Cancelled" : "Cannot write " + ToUtf8(temp);
-            }
-            return false;
-        }
-        if (status != 200) {
-            error = "downloads.claude.ai answered " + std::to_string(status) + " for the build";
-            return false;
-        }
+    const std::wstring path = std::wstring(kBasePath) + L"/" + ToWide(release.version) + L"/" + ToWide(platform) +
+                              L"/claude.exe";
+    if (!Download(proxy, kHost, path, temp, cancel, progress, error)) {
+        return false;
     }
     if (FileSha256(temp) != release.sha256) {
         error = "The checksum of the download does not match the manifest; nothing was installed";
@@ -333,6 +352,119 @@ bool InstallClaude(const std::wstring& proxy, const std::atomic<bool>* cancel, c
     }
     if (FindClaudeExe().empty()) {
         error = "The installer finished but claude.exe is not in place";
+        return false;
+    }
+    return true;
+}
+
+std::wstring SignerOf(const std::wstring& path) {
+    WINTRUST_FILE_INFO file{};
+    file.cbStruct = sizeof(file);
+    file.pcwszFilePath = path.c_str();
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &file;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    std::wstring name;
+    if (WinVerifyTrust(nullptr, &action, &data) == ERROR_SUCCESS) {
+        const CRYPT_PROVIDER_DATA* provider = WTHelperProvDataFromStateData(data.hWVTStateData);
+        const CRYPT_PROVIDER_SGNR* signer =
+            provider != nullptr ? WTHelperGetProvSignerFromChain(const_cast<CRYPT_PROVIDER_DATA*>(provider), 0, FALSE, 0)
+                                : nullptr;
+        if (signer != nullptr && signer->csCertChain > 0 && signer->pasCertChain[0].pCert != nullptr) {
+            std::array<wchar_t, 256> buffer{};
+            CertGetNameStringW(signer->pasCertChain[0].pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, buffer.data(),
+                               static_cast<DWORD>(buffer.size()));
+            name = buffer.data();
+        }
+    }
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &data);
+    return name;
+}
+
+bool InstallGrok(const std::wstring& proxy, const std::atomic<bool>* cancel, const InstallProgress& progress,
+                 std::string& error) {
+    struct Source {
+        const wchar_t* host;
+        const wchar_t* base;
+    };
+    constexpr std::array<Source, 2> kSources = {{{L"x.ai", L"/cli"},
+                                                 {L"storage.googleapis.com", L"/grok-build-public-artifacts/cli"}}};
+    const Source* source = nullptr;
+    std::string version;
+    for (const Source& candidate : kSources) {
+        std::string text;
+        if (!GetText(proxy, std::wstring(candidate.base) + L"/stable", text, error, candidate.host)) {
+            continue;
+        }
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+            text.pop_back();
+        }
+        if (IsVersion(text)) {
+            source = &candidate;
+            version = text;
+            break;
+        }
+        error = ToUtf8(candidate.host) + " did not answer with a version";
+    }
+    if (source == nullptr) {
+        return false;
+    }
+    std::array<wchar_t, MAX_PATH + 1> dir{};
+    const DWORD tempLength = GetTempPathW(static_cast<DWORD>(dir.size()), dir.data());
+    const std::wstring temp = std::wstring(dir.data(), tempLength) + L"aic-grok-" + ToWide(version) + L".exe";
+    const auto removeTemp = wil::scope_exit([&] { DeleteFileW(temp.c_str()); });
+    const std::wstring arch = Platform() == "win32-arm64" ? L"windows-aarch64" : L"windows-x86_64";
+    if (!Download(proxy, source->host, std::wstring(source->base) + L"/grok-" + ToWide(version) + L"-" + arch + L".exe",
+                  temp, cancel, progress, error)) {
+        return false;
+    }
+    if (SignerOf(temp) != L"X Corp.") {
+        error = "The download is not signed by X Corp.; nothing was installed";
+        return false;
+    }
+    if (progress) {
+        progress(100, true);
+    }
+    std::array<wchar_t, 2048> profile{};
+    const DWORD profileLength = GetEnvironmentVariableW(L"USERPROFILE", profile.data(), static_cast<DWORD>(profile.size()));
+    if (profileLength == 0 || profileLength >= profile.size()) {
+        error = "No USERPROFILE";
+        return false;
+    }
+    const std::filesystem::path home = std::filesystem::path(std::wstring(profile.data(), profileLength)) / L".grok";
+    std::error_code failed;
+    std::filesystem::create_directories(home / L"bin", failed);
+    for (const wchar_t* name : {L"grok.exe", L"agent.exe"}) {
+        // A running exe cannot be overwritten but can be moved aside, as its installer does.
+        const std::filesystem::path target = home / L"bin" / name;
+        const std::filesystem::path aside = target.wstring() + L".old";
+        std::filesystem::remove(aside, failed);
+        if (!CopyFileW(temp.c_str(), target.c_str(), FALSE)) {
+            MoveFileExW(target.c_str(), aside.c_str(), MOVEFILE_REPLACE_EXISTING);
+            if (!CopyFileW(temp.c_str(), target.c_str(), FALSE)) {
+                error = "Cannot write " + ToUtf8(target.wstring()) + " (error " + std::to_string(GetLastError()) + ")";
+                return false;
+            }
+        }
+    }
+    // What its installer leaves for `grok update`: the CLI was put in place by hand, not by a package manager.
+    if (const std::filesystem::path config = home / L"config.toml"; !std::filesystem::exists(config, failed)) {
+        wil::unique_hfile out(CreateFileW(config.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                                          nullptr));
+        constexpr char kConfig[] = "[cli]\r\ninstaller = \"internal\"\r\n";
+        DWORD written = 0;
+        if (out) {
+            WriteFile(out.get(), kConfig, sizeof(kConfig) - 1, &written, nullptr);
+        }
+    }
+    if (FindGrokExe().empty()) {
+        error = "The download is in place but grok.exe is not found";
         return false;
     }
     return true;

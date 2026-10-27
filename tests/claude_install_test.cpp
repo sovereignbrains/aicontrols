@@ -1,5 +1,5 @@
 // The installer's pieces, without any UI. Exit code 0: all passed.
-// AIC_TEST_NET=1 also asks downloads.claude.ai for the newest release (nothing is installed).
+// AIC_TEST_NET=1 also asks downloads.claude.ai for the newest release and installs Grok's CLI into a temporary profile.
 #include <windows.h>
 
 #include <filesystem>
@@ -52,7 +52,13 @@ int main() {
     }
     Expect(FileSha256(file.wstring()) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 of abc");
     Expect(FileSha256((fs::temp_directory_path() / "aic-no-such-file").wstring()).empty(), "sha256 of a missing file");
+    Expect(SignerOf(file.wstring()).empty(), "an unsigned file has no signer");
     fs::remove(file);
+    char profile[MAX_PATH] = {};
+    GetEnvironmentVariableA("USERPROFILE", profile, sizeof(profile));
+    if (const fs::path grok = fs::path(profile) / ".grok" / "bin" / "grok.exe"; fs::exists(grok)) {
+        Expect(SignerOf(grok.wstring()) == L"X Corp.", "the installed grok.exe is signed by X Corp.");
+    }
 
     char net[8] = {};
     if (GetEnvironmentVariableA("AIC_TEST_NET", net, sizeof(net)) > 0) {
@@ -69,6 +75,20 @@ int main() {
                 Expect(!installed.empty(), "installed version");
             }
         }
+        // Grok's CLI into a profile of its own, so the real ~/.grok is left alone.
+        const fs::path home = fs::temp_directory_path() / "aic-grok-home";
+        fs::remove_all(home);
+        fs::create_directories(home);
+        SetEnvironmentVariableW(L"USERPROFILE", home.c_str());
+        std::string error;
+        const bool ok = InstallGrok(PickProxy(), nullptr, {}, error);
+        SetEnvironmentVariableA("USERPROFILE", profile);
+        std::cout << "grok: " << (ok ? "installed" : error) << "\n";
+        Expect(ok, "Grok's CLI installs", error);
+        Expect(fs::exists(home / ".grok" / "bin" / "grok.exe") && fs::exists(home / ".grok" / "bin" / "agent.exe") &&
+                   fs::exists(home / ".grok" / "config.toml"),
+               "grok.exe, agent.exe and config.toml in place");
+        fs::remove_all(home);
     }
 
     std::cout << (failures == 0 ? "all passed\n" : "FAILED\n");

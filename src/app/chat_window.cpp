@@ -141,6 +141,8 @@ constexpr float kPuffCalm = 0.10f;       // ... and while idle
 // The middle button's scrolling, as browsers have it: a frame of it, the still zone round where it was pressed,
 // and held this long (or moved) it ends on release.
 constexpr UINT_PTR kPanTimer = 9;
+constexpr UINT_PTR kParkedTimer = 10;  // a chat answers in the background: its dot in the sidebar breathes
+constexpr UINT kParkedFrame = 80;      // ms
 constexpr UINT kPanFrame = 16;           // ms
 constexpr float kPanStill = 10.f;
 constexpr ULONGLONG kPanHold = 300;      // ms
@@ -261,6 +263,7 @@ constexpr uint32_t kSecondary = 0x9c9ea4;
 constexpr uint32_t kTitle = 0xc4c6cc;  // the chat's title in the header: quieter than the messages
 constexpr uint32_t kAccent = 0x4c92ff;
 constexpr uint32_t kDanger = 0xf06060;
+constexpr uint32_t kWaiting = 0xe8b04c;  // a chat in the background waits for the user's word
 
 constexpr COLORREF ToColorRef(uint32_t rgb) {
     return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
@@ -891,7 +894,10 @@ private:
     bool SignedOut() const { return auth_.known && !auth_.loggedIn && !GrokSelected(); }
     // Grok's models are all "grok-…"; choosing one moves the chat to grok.exe, any other to claude.exe.
     bool GrokSelected() const { return settings_.model.starts_with("grok-"); }
-    std::wstring AgentName() const { return GrokSelected() ? L"Grok" : L"Claude"; }  // who answers, in the words
+    bool GrokRunning() const { return runner_->agent == &runner_->grok; }  // the CLI the chat runs on now
+    std::wstring AgentName() const {  // who answers, in the words
+        return (running_ ? GrokRunning() : GrokSelected()) ? L"Grok" : L"Claude";
+    }
     void MergeModels();
     void RefreshAuth();
     void SignIn();
@@ -1142,6 +1148,17 @@ private:
     void Restart();
     void ResetChat();
     void NewChat();
+    // Chats in the background: one that is answering when another opens keeps its process (ParkChat), its posts
+    // are handled as if it were open (OnParked swaps it in for that long), and opening it swaps it back.
+    struct Parked;
+    void SwapChat(Parked& chat);
+    void LeaveChat();  // before another chat takes the window: parked when it answers, else ended
+    void OnParked(Parked& chat, const std::function<void()>& handle);
+    Parked* ParkedAt(WPARAM generation);
+    const Parked* ParkedChat(const std::wstring& folder, const std::string& key) const;
+    static std::string ParkedKey(const Parked& chat);  // its id in the sidebar (a new one may have none yet)
+    void DropParked(const std::wstring& folder, const std::string& key);
+    bool AnyBusy() const;
     void Submit();
     void OnClaude(const Json& message);
     void OnClaudeExit(const ExitInfo& exit);
@@ -1150,6 +1167,43 @@ private:
     bool HasConversation() const;
     bool hasContent() const { return hasText_ || !attachments_.empty(); }
     bool SendShown() const { return hasContent() || busy_; }
+
+    // The processes behind one chat and the tools they call, on the heap: a chat can go on while another is open.
+    struct Runner {
+        explicit Runner(SecretStore& secrets) : tools(secrets, {}) {}
+        ClaudeProcess claude;
+        GrokProcess grok;
+        AgentProcess* agent = &claude;  // the one the chat runs on: Grok when a Grok model is chosen
+        // After the processes: the tool threads answer through them, so they are joined first.
+        Tools tools;
+        ToolHost host{tools, [this](const std::string& id, Json response) { agent->Respond(id, std::move(response)); }};
+    };
+    // A chat put aside while it answers: what is a chat's own, swapped out of the window's members.
+    struct Parked {
+        std::unique_ptr<Runner> runner;
+        std::vector<FeedItem> feed;
+        float scroll = 0;
+        float maxScroll = 0;
+        bool stick = true;
+        WPARAM generation = 0;
+        bool running = false;
+        bool busy = false;
+        bool stateEvents = false;
+        std::string sessionId;
+        std::wstring title;
+        std::string currentMessageId;
+        std::set<std::string> streamed;
+        std::string handoff;
+        std::wstring workspace;
+        std::wstring folderName;
+        std::string autoModel = "sonnet";
+        long long lastContext = 0;
+        std::wstring route;
+        std::optional<FeedPoint> feedAnchor;
+        std::optional<FeedPoint> feedFocus;
+        std::string model;  // what it runs on: the window's model again when it is opened
+        std::string effort;
+    };
 
     HINSTANCE instance_;
     HWND hwnd_ = nullptr;
@@ -1325,15 +1379,15 @@ private:
     Json grokModels_ = Json::array();
     std::string userName_;
 
-    ClaudeProcess claude_;
-    GrokProcess grok_;
-    AgentProcess* agent_ = &claude_;  // the one the chat runs on: Grok when a Grok model is chosen
     std::string handoff_;  // the chat so far, for the other CLI's first message after a switch to it
-    // Declared after the processes: the tool threads answer through them, so they are joined first.
     SecretStore secrets_{SecretStore::DefaultPath()};
-    Tools tools_{secrets_, {}};
-    ToolHost host_{tools_, [this](const std::string& id, Json response) { agent_->Respond(id, std::move(response)); }};
-    WPARAM generation_ = 0;  // bumped per process; stale posts are dropped
+    std::unique_ptr<Runner> runner_ = std::make_unique<Runner>(secrets_);  // the open chat's
+    // The chats that go on while another one is open (28.10.2026, his: Grok sits idle while Claude works in another
+    // chat): one that answers when the user leaves it keeps its process, and opened again it is as it was.
+    std::vector<std::unique_ptr<Parked>> parked_;
+    bool inBackground_ = false;  // a parked chat's post is being handled: the window's own reactions wait
+    WPARAM generations_ = 0;     // the last one given out: no two processes of any chats share one
+    WPARAM generation_ = 0;      // the open chat's process; stale posts are dropped, a parked chat's go to it
     bool running_ = false;
     bool busy_ = false;
     bool stateEvents_ = false;  // the CLI reports its session state; else a result ends the turn
@@ -1380,7 +1434,7 @@ int ChatWindow::Run(int show) {
         workspace_ = settings_.workspace;  // the project chosen last time
     }
     folderName_ = ProjectName(workspace_);
-    tools_.SetCwd(workspace_);
+    runner_->tools.SetCwd(workspace_);
     if (settings_.sidebarWidth > 0) {
         sidebarWidth_ = std::clamp(settings_.sidebarWidth, kMinSidebar, kMaxSidebar);
     }
@@ -2176,6 +2230,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             StartPuff();
         } else if (wParam == kPanTimer) {
             PanStep();
+        } else if (wParam == kParkedTimer) {
+            if (!std::ranges::any_of(parked_, [](const std::unique_ptr<Parked>& chat) { return chat->busy; })) {
+                KillTimer(hwnd_, kParkedTimer);
+            }
+            Refresh();
         } else if (wParam == kTipTimer) {
             KillTimer(hwnd_, kTipTimer);
             if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
@@ -2207,12 +2266,17 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case kClaudeMessage: {
         const std::unique_ptr<Json> payload(reinterpret_cast<Json*>(lParam));
-        if (wParam == generation_) {
+        const auto handle = [&] {
             try {
                 OnClaude(*payload);
             } catch (const std::exception& e) {
                 Add(Kind::Error, L"Не разобрал сообщение CLI: " + ToWide(e.what()));
             }
+        };
+        if (wParam == generation_) {
+            handle();
+        } else if (Parked* chat = ParkedAt(wParam)) {
+            OnParked(*chat, handle);
         }
         return 0;
     }
@@ -2220,6 +2284,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         const std::unique_ptr<ExitInfo> payload(reinterpret_cast<ExitInfo*>(lParam));
         if (wParam == generation_) {
             OnClaudeExit(*payload);
+        } else if (Parked* chat = ParkedAt(wParam)) {
+            OnParked(*chat, [&] { OnClaudeExit(*payload); });
         }
         return 0;
     }
@@ -2257,10 +2323,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (reposThread_.joinable()) {
             reposThread_.join();
         }
-        ++generation_;
+        generation_ = ++generations_;
         tabs_.clear();  // every shell ends
-        host_.CancelAll();
-        agent_->Stop();
+        runner_->host.CancelAll();
+        runner_->agent->Stop();
+        for (const std::unique_ptr<Parked>& chat : parked_) {  // so do the chats in the background
+            chat->runner->host.CancelAll();
+            chat->runner->agent->Stop();
+        }
         PostQuitMessage(0);
         return 0;
     default:
@@ -5014,10 +5084,18 @@ void ChatWindow::SignOut() {
 
 void ChatWindow::OnLogoutDone() {
     authWorking_ = false;
-    ++generation_;  // the running CLI still holds the old account: it goes
-    agent_->Stop();
+    generation_ = ++generations_;  // the running CLI still holds the old account: it goes
+    runner_->agent->Stop();
     running_ = false;
     busy_ = false;
+    for (const std::unique_ptr<Parked>& chat : parked_) {
+        if (chat->runner->agent == &chat->runner->claude) {
+            chat->generation = 0;
+            chat->runner->host.CancelAll();
+            chat->runner->agent->Stop();
+            chat->running = chat->busy = false;
+        }
+    }
     RefreshAuth();
 }
 
@@ -5146,14 +5224,14 @@ void ChatWindow::UpdateClaudeCli() {
     if (setupThread_.joinable()) {
         setupThread_.join();
     }
-    ++generation_;
-    host_.CancelAll();
+    generation_ = ++generations_;
+    runner_->host.CancelAll();
     for (FeedItem& item : feed_) {
         if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
             item.verdict = Verdict::Cancelled;
         }
     }
-    agent_->Stop();
+    runner_->agent->Stop();
     running_ = false;
     busy_ = false;
     setupBusy_ = true;
@@ -5483,7 +5561,7 @@ void ChatWindow::LoadRepos() {
 void ChatWindow::SetWorkspace(const std::wstring& folder) {
     workspace_ = folder;
     folderName_ = ProjectName(folder);
-    tools_.SetCwd(folder);
+    runner_->tools.SetCwd(folder);
     const bool general = folder == DefaultWorkspace();
     settings_.workspace = general ? std::wstring() : folder;
     if (!general && std::ranges::find(settings_.projects, folder) == settings_.projects.end()) {
@@ -5498,13 +5576,8 @@ void ChatWindow::SwitchWorkspace(const std::wstring& folder) {
     if (folder.empty() || folder == workspace_) {
         return;
     }
-    const std::wstring question = AgentName() + L" сейчас отвечает. Перейти в другой проект и начать новый чат?";
-    if (busy_ && MessageBoxW(hwnd_, question.c_str(), L"AIControls",
-                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
-        return;
-    }
+    LeaveChat();
     SetWorkspace(folder);
-    ResetChat();
     StartClaude();
     RefreshSessions();
     PlaceChildren();
@@ -5918,8 +5991,26 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             Fill(lit(chat), 8.f, kRaised);
         }
         const bool current = session.id == sessionId_ && project.folder == workspace_;
+        float titleRight = chat.right - 8;
+        if (const Parked* parked = ParkedChat(project.folder, session.id)) {
+            const bool waiting = std::ranges::any_of(parked->feed, [](const FeedItem& item) {
+                return item.kind == Kind::Approval && item.verdict == Verdict::Pending;
+            });
+            float alpha = 1.f;
+            if (parked->busy && !waiting) {
+                const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+                alpha = 0.35f + 0.65f * (0.5f + 0.5f * std::sin(static_cast<float>(ticks % 1200) / 1200.f * 2.f *
+                                                                 std::numbers::pi_v<float>));
+            }
+            brush_->SetColor(Color(waiting ? kWaiting : kAccent, alpha));
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(chat.right - 14.f, (chat.top + chat.bottom) / 2), 3.5f, 3.5f),
+                                 brush_.get());
+            titleRight = chat.right - 24;
+        }
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
-             D2D1::RectF(chat.left + 10, chat.top, chat.right - 8, chat.bottom), current ? kAccent : kPrimary);
+             D2D1::RectF(chat.left + 10, chat.top, titleRight, chat.bottom), current ? kAccent : kPrimary);
     }
     PaintBar(g, Scroller::Sidebar);
 }
@@ -6332,6 +6423,19 @@ void ChatWindow::RefreshSessions() {
     projects_.clear();
     for (const std::wstring& folder : folders) {
         projects_.push_back({folder, ProjectName(folder), ListSessions(folder)});
+    }
+    for (const std::unique_ptr<Parked>& chat : parked_) {
+        const auto project = std::ranges::find(projects_, chat->workspace, &Project::folder);
+        if (project == projects_.end() ||
+            std::ranges::find(project->sessions, ParkedKey(*chat), &SessionInfo::id) != project->sessions.end()) {
+            continue;
+        }
+        std::wstring title = chat->title;
+        if (title.empty()) {  // a chat with no title yet: its first words
+            const auto said = std::ranges::find(chat->feed, Kind::User, &FeedItem::kind);
+            title = said == chat->feed.end() ? L"Новый чат" : said->text.substr(0, said->text.find(L'\n'));
+        }
+        project->sessions.insert(project->sessions.begin(), SessionInfo{ParkedKey(*chat), std::move(title), {}});
     }
     FilterSessions();
     const size_t most = rows_.empty() ? 0 : rows_.size() - 1;
@@ -6780,6 +6884,7 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
     if (current) {  // the CLI holds the file open: it goes first
         ResetChat();
     }
+    DropParked(folder, session.id);
     if (DeleteSession(folder, session.id)) {
         Flash(L"Чат удалён");
     } else {
@@ -6797,14 +6902,16 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
 // holds its file) and opened again there.
 void ChatWindow::MoveChat(std::wstring from, SessionInfo session, std::wstring to) {
     const bool current = session.id == sessionId_ && from == workspace_;
-    if (current && busy_ &&
-        MessageBoxW(hwnd_, (AgentName() + L" сейчас отвечает. Остановить и перенести чат?").c_str(), L"AIControls",
+    const Parked* parked = ParkedChat(from, session.id);
+    if (((current && busy_) || (parked != nullptr && parked->busy)) &&
+        MessageBoxW(hwnd_, L"Этот чат сейчас отвечает. Остановить и перенести его?", L"AIControls",
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
     if (current) {
         ResetChat();
     }
+    DropParked(from, session.id);
     const bool moved = MoveSession(from, to, session.id);
     if (moved) {
         Flash(L"Чат перенесён в «" + ProjectName(to) + L"»", 3000);
@@ -7366,9 +7473,10 @@ void ChatWindow::StartUpdate() {
     if (!update_) {
         return;
     }
-    if (busy_) {  // the answer would be cut off: the update waits for the turn's end
+    if (AnyBusy()) {  // an answer would be cut off: the update waits for the turn's end
         updatePending_ = true;
-        Flash(L"Обновлю, как только Claude закончит ответ", 4000);
+        Flash(busy_ ? L"Обновлю, как только " + AgentName() + L" закончит ответ"
+                    : std::wstring(L"Обновлю, как только закончатся ответы в фоне"), 4000);
         return;
     }
     updatePending_ = false;
@@ -8346,7 +8454,23 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     if (session.id == sessionId_ && folder == workspace_) {
         return;
     }
-    ResetChat();
+    LeaveChat();
+    if (const auto found = std::ranges::find_if(parked_, [&](const std::unique_ptr<Parked>& chat) {
+            return chat->workspace == folder && ParkedKey(*chat) == session.id;
+        });
+        found != parked_.end()) {
+        const std::unique_ptr<Parked> chat = std::move(*found);
+        parked_.erase(found);
+        SwapChat(*chat);  // the chat is open again as it is now; the empty one it held goes
+        settings_.model = chat->model;
+        settings_.effort = chat->effort;
+        SetWorkspace(workspace_);  // saved as the open project, with the model
+        hover_ = {};
+        PlaceChildren();
+        RefreshSessions();
+        Refresh();
+        return;
+    }
     if (folder != workspace_) {
         SetWorkspace(folder);
         PlaceChildren();  // the folder's chip under the input
@@ -8597,14 +8721,14 @@ void ChatWindow::Apply(const Settings& next) {
         handoff_ = "<earlier_chat>\nThis chat began with " + ToUtf8(before) +
                    ", another assistant of this client; the user switched it to you. What was said so far:" +
                    ToUtf8(said) + "\n</earlier_chat>";
-        ++generation_;
-        host_.CancelAll();
+        generation_ = ++generations_;
+        runner_->host.CancelAll();
         for (FeedItem& item : feed_) {  // the process that asked is gone
             if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
                 item.verdict = Verdict::Cancelled;
             }
         }
-        agent_->Stop();
+        runner_->agent->Stop();
         running_ = false;
         busy_ = false;
         sessionId_.clear();
@@ -8652,7 +8776,7 @@ bool ChatWindow::StartClaude() {
     options.resume = sessionId_;  // a chat from the history, a restart, a crash: the same conversation
     route_ = options.proxy.empty() ? L"напрямую" : L"через " + options.proxy.substr(options.proxy.rfind(L'/') + 1);
 
-    const WPARAM generation = ++generation_;
+    const WPARAM generation = generation_ = ++generations_;
     const HWND hwnd = hwnd_;
     const auto onMessage = [hwnd, generation](Json message) {
         auto payload = std::make_unique<Json>(std::move(message));
@@ -8674,11 +8798,11 @@ bool ChatWindow::StartClaude() {
             options.autocompact.clear();
             options.appendSystemPrompt += MemoryPrompt();
             options.model = settings_.model;
-            agent_ = &grok_;
-            grok_.Start(options, onMessage, onExit);
+            runner_->agent = &runner_->grok;
+            runner_->grok.Start(options, onMessage, onExit);
         } else {
-            agent_ = &claude_;
-            claude_.Start(options, onMessage, onExit);
+            runner_->agent = &runner_->claude;
+            runner_->claude.Start(options, onMessage, onExit);
         }
     } catch (const std::exception& e) {
         Add(Kind::Error, (grok ? L"Не запустился grok.exe: " : L"Не запустился claude.exe: ") + ToWide(e.what()));
@@ -8691,23 +8815,23 @@ bool ChatWindow::StartClaude() {
 }
 
 void ChatWindow::Restart() {
-    ++generation_;
-    host_.CancelAll();
+    generation_ = ++generations_;
+    runner_->host.CancelAll();
     for (FeedItem& item : feed_) {  // the process that asked is gone
         if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
             item.verdict = Verdict::Cancelled;
         }
     }
-    agent_->Stop();
+    runner_->agent->Stop();
     running_ = false;
     busy_ = false;
     StartClaude();
 }
 
 void ChatWindow::ResetChat() {
-    ++generation_;
-    host_.CancelAll();
-    agent_->Stop();
+    generation_ = ++generations_;
+    runner_->host.CancelAll();
+    runner_->agent->Stop();
     running_ = false;
     busy_ = false;
     sessionId_.clear();
@@ -8722,9 +8846,125 @@ void ChatWindow::ResetChat() {
     stick_ = true;
 }
 
+void ChatWindow::SwapChat(Parked& chat) {
+    using std::swap;
+    swap(runner_, chat.runner);
+    swap(feed_, chat.feed);
+    swap(scroll_, chat.scroll);
+    swap(maxScroll_, chat.maxScroll);
+    swap(stick_, chat.stick);
+    swap(generation_, chat.generation);
+    swap(running_, chat.running);
+    swap(busy_, chat.busy);
+    swap(stateEvents_, chat.stateEvents);
+    swap(sessionId_, chat.sessionId);
+    swap(title_, chat.title);
+    swap(currentMessageId_, chat.currentMessageId);
+    swap(streamed_, chat.streamed);
+    swap(handoff_, chat.handoff);
+    swap(workspace_, chat.workspace);
+    swap(folderName_, chat.folderName);
+    swap(autoModel_, chat.autoModel);
+    swap(lastContext_, chat.lastContext);
+    swap(route_, chat.route);
+    swap(feedAnchor_, chat.feedAnchor);
+    swap(feedFocus_, chat.feedFocus);
+}
+
+void ChatWindow::LeaveChat() {
+    if (!running_ || !busy_) {
+        ResetChat();
+        return;
+    }
+    auto chat = std::make_unique<Parked>();
+    chat->runner = std::make_unique<Runner>(secrets_);
+    chat->runner->tools.SetCwd(workspace_);
+    chat->workspace = workspace_;  // the next chat starts in the same project
+    chat->folderName = folderName_;
+    chat->autoModel = autoModel_;
+    SwapChat(*chat);
+    feedSelecting_ = false;
+    chat->model = settings_.model;
+    chat->effort = settings_.effort;
+    parked_.push_back(std::move(chat));
+    SetTimer(hwnd_, kParkedTimer, kParkedFrame, nullptr);
+    Flash(L"Тот чат отвечает дальше в фоне: точка слева", 4000);
+    ResetChat();
+    RefreshSessions();
+}
+
+void ChatWindow::OnParked(Parked& chat, const std::function<void()>& handle) {
+    const auto pending = [this] {
+        return std::ranges::count_if(feed_, [](const FeedItem& item) {
+            return item.kind == Kind::Approval && item.verdict == Verdict::Pending;
+        });
+    };
+    const bool selecting = std::exchange(feedSelecting_, false);
+    SwapChat(chat);
+    inBackground_ = true;
+    const bool wasBusy = busy_;
+    const auto waited = pending();
+    const std::string id = sessionId_;
+    const std::wstring title = title_;
+    handle();
+    const bool done = wasBusy && !busy_;
+    const bool asks = pending() > waited;
+    const bool renamed = id != sessionId_ || title != title_;
+    inBackground_ = false;
+    SwapChat(chat);
+    feedSelecting_ = selecting;
+    if (done || asks || renamed) {
+        RefreshSessions();
+    }
+    const std::wstring name = chat.title.empty() ? std::wstring(L"чат в фоне") : L"«" + chat.title + L"»";
+    if (asks) {
+        Flash(L"Ждёт разрешения: " + name, 6000);
+    } else if (done) {
+        Flash(L"Ответ готов: " + name, 5000);
+    }
+    if (updatePending_ && !AnyBusy()) {
+        StartUpdate();
+    }
+    Refresh();
+}
+
+ChatWindow::Parked* ChatWindow::ParkedAt(WPARAM generation) {
+    const auto found = std::ranges::find_if(parked_, [generation](const std::unique_ptr<Parked>& chat) {
+        return chat->generation != 0 && chat->generation == generation;
+    });
+    return found != parked_.end() ? found->get() : nullptr;
+}
+
+const ChatWindow::Parked* ChatWindow::ParkedChat(const std::wstring& folder, const std::string& key) const {
+    const auto found = std::ranges::find_if(parked_, [&](const std::unique_ptr<Parked>& chat) {
+        return chat->workspace == folder && ParkedKey(*chat) == key;
+    });
+    return found != parked_.end() ? found->get() : nullptr;
+}
+
+std::string ChatWindow::ParkedKey(const Parked& chat) {
+    return chat.sessionId.empty() ? "aic-parked-" + std::to_string(chat.generation) : chat.sessionId;
+}
+
+void ChatWindow::DropParked(const std::wstring& folder, const std::string& key) {
+    const auto gone = std::ranges::remove_if(parked_, [&](const std::unique_ptr<Parked>& chat) {
+        if (chat->workspace != folder || ParkedKey(*chat) != key) {
+            return false;
+        }
+        chat->runner->host.CancelAll();
+        chat->runner->agent->Stop();
+        return true;
+    });
+    parked_.erase(gone.begin(), gone.end());
+}
+
+bool ChatWindow::AnyBusy() const {
+    return busy_ || std::ranges::any_of(parked_, [](const std::unique_ptr<Parked>& chat) { return chat->busy; });
+}
+
 void ChatWindow::NewChat() {
     ClosePopup();
-    ResetChat();
+    LeaveChat();
     StartClaude();
     if (ProjectFolded(workspace_)) {  // the new chat shows under its project
         std::erase(settings_.closedProjects, workspace_);
@@ -8771,15 +9011,15 @@ void ChatWindow::Submit() {
         content.insert(content.begin(), Json{{"type", "text"}, {"text", std::exchange(handoff_, {})}});
     }
     // "Auto": the model for this task, chosen before it goes (a message during a turn joins that turn: no switch).
-    if (settings_.model == "auto" && !busy_ && agent_ == &claude_) {
+    if (settings_.model == "auto" && !busy_ && !GrokRunning()) {
         const bool opening = std::ranges::none_of(feed_, [](const FeedItem& item) { return item.kind == Kind::User; });
         const std::string pick = RouteModel({text, attachments_.size(), opening, autoModel_, lastContext_});
         if (pick != autoModel_) {
             autoModel_ = pick;
-            agent_->SetModel(pick);
+            runner_->agent->SetModel(pick);
         }
     }
-    agent_->SendUserContent(std::move(content));
+    runner_->agent->SendUserContent(std::move(content));
     Add(Kind::User, std::move(shown));
     feed_.back().images = std::move(images);
     attachments_.clear();
@@ -8870,7 +9110,7 @@ void ChatWindow::OnClaude(const Json& message) {
         if (!stateEvents_) {
             busy_ = false;
         }
-        if (!GrokSelected()) {
+        if (!GrokRunning()) {
             FetchUsage();  // a turn spent some: the ring follows
         }
         {  // how big the chat is now, for "Auto": its last request (the turn's sum counts the chat once per call)
@@ -8900,7 +9140,7 @@ void ChatWindow::OnClaude(const Json& message) {
                 Add(Kind::Error, wide);
             }
         }
-        if (!sessionId_.empty() && !GrokSelected()) {  // Grok keeps no transcript the history could list
+        if (!sessionId_.empty() && !GrokRunning()) {  // Grok keeps no transcript the history could list
             if (std::wstring title = SessionTitle(workspace_, sessionId_); !title.empty()) {
                 title_ = std::move(title);
             }
@@ -8938,7 +9178,7 @@ void ChatWindow::OnClaude(const Json& message) {
         const Json& response = JsonAt(message, "response");
         if (JsonStr(response, "request_id") == "aic_init") {
             const Json& answer = JsonAt(response, "response");
-            if (JsonAt(answer, "models").is_array() && agent_ == &grok_) {
+            if (JsonAt(answer, "models").is_array() && GrokRunning()) {
                 grokModels_ = JsonAt(answer, "models");
                 MergeModels();
             } else if (JsonAt(answer, "models").is_array()) {
@@ -8982,18 +9222,18 @@ void ChatWindow::OnClaude(const Json& message) {
         if (subtype == "can_use_tool") {
             AskApproval(id, request);
         } else if (subtype == "mcp_message") {
-            host_.HandleMcp(id, request);
+            runner_->host.HandleMcp(id, request);
         } else {
-            agent_->RespondError(id, "Not supported in this build yet.");
+            runner_->agent->RespondError(id, "Not supported in this build yet.");
         }
     } else if (type == "aic_raw") {
         Add(Kind::Notice, ToWide(JsonStr(message, "text")));
     }
-    if (updatePending_ && !busy_) {  // the turn the update waited for has ended
+    if (updatePending_ && !inBackground_ && !AnyBusy()) {  // the turn the update waited for has ended
         StartUpdate();
         return;
     }
-    if (busy_) {
+    if (busy_ && !inBackground_) {
         StartPuff();
     }
     Refresh();
@@ -9005,13 +9245,13 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     const std::string name = OwnToolName(JsonStr(request, "tool_name"));
     const Json& input = JsonAt(request, "input");
     if (name.empty()) {
-        agent_->Respond(requestId, Json{{"behavior", "deny"}, {"message", "Only AIControls tools are available here."}});
+        runner_->agent->Respond(requestId, Json{{"behavior", "deny"}, {"message", "Only AIControls tools are available here."}});
         return;
     }
     ToolSummary summary = SummarizeTool(name, input);
     if (settings_.permissions == "plan" && name != "read_file" && name != "list_directory") {
         Add(Kind::Notice, L"План: не выполнено — " + summary.title + L": " + summary.detail);
-        agent_->Respond(requestId, Json{{"behavior", "deny"},
+        runner_->agent->Respond(requestId, Json{{"behavior", "deny"},
                                         {"message", "Plan mode is on: nothing may be changed or run. Read what you "
                                                     "need, then give the user a plan; they will switch the mode to "
                                                     "carry it out."}});
@@ -9019,7 +9259,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     }
     if (!ToolNeedsApproval(name, input)) {
         Add(Kind::Notice, summary.title + L": " + summary.detail, true);
-        agent_->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
+        runner_->agent->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
         return;
     }
     FeedItem item;
@@ -9032,7 +9272,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     item.input = input;
     if (AllowedUnasked(name, input)) {  // the card still shows the call and its output, already allowed
         item.verdict = Verdict::Allowed;
-        agent_->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
+        runner_->agent->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
     }
     feed_.push_back(std::move(item));
     stick_ = true;
@@ -9076,9 +9316,9 @@ void ChatWindow::Decide(size_t index, bool allow) {
     FeedItem& item = feed_[index];
     item.verdict = allow ? Verdict::Allowed : Verdict::Denied;
     if (allow) {
-        agent_->Respond(item.requestId, Json{{"behavior", "allow"}, {"updatedInput", item.input}});
+        runner_->agent->Respond(item.requestId, Json{{"behavior", "allow"}, {"updatedInput", item.input}});
     } else {
-        agent_->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The user declined this call."}});
+        runner_->agent->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The user declined this call."}});
     }
     hover_ = {};
     Refresh();
@@ -9087,7 +9327,7 @@ void ChatWindow::Decide(size_t index, bool allow) {
 void ChatWindow::CancelApprovals() {
     for (FeedItem& item : feed_) {
         if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
-            agent_->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The turn was stopped."}});
+            runner_->agent->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The turn was stopped."}});
             item.verdict = Verdict::Cancelled;
         }
     }
@@ -9095,14 +9335,14 @@ void ChatWindow::CancelApprovals() {
 
 void ChatWindow::StopTurn() {
     CancelApprovals();
-    host_.CancelAll();
-    agent_->Interrupt();
+    runner_->host.CancelAll();
+    runner_->agent->Interrupt();
 }
 
 void ChatWindow::OnClaudeExit(const ExitInfo& exit) {
     running_ = false;
     busy_ = false;
-    std::wstring text = std::format(L"{} завершился (код {}).", GrokSelected() ? L"grok.exe" : L"claude.exe", exit.code);
+    std::wstring text = std::format(L"{} завершился (код {}).", GrokRunning() ? L"grok.exe" : L"claude.exe", exit.code);
     if (const std::wstring tail = LastLines(exit.stderrTail, 6); !tail.empty()) {
         text += L"\n" + tail;
     }
@@ -9188,6 +9428,23 @@ void ChatWindow::FillGallery() {
     card("read_file", Json{{"path", ToUtf8(longPath)}}, Verdict::Allowed, true, L"содержимое файла\nвторая строка", false);
     Add(Kind::Assistant, L"Скриншот: `C:\\Users\\user\\gallery1.png` и PDF `C:\\Users\\user\\a.pdf`, страница `C:\\Users\\user\\a.html`.");
     Add(Kind::Assistant, L"Финальный короткий ответ.");
+    // Two chats answering in the background: one working (its dot breathes), one waiting for a permission.
+    for (const bool waiting : {false, true}) {
+        auto chat = std::make_unique<Parked>();
+        chat->runner = std::make_unique<Runner>(secrets_);
+        chat->workspace = workspace_;
+        chat->generation = ++generations_;
+        chat->running = chat->busy = true;
+        chat->title = waiting ? L"Фоновый чат ждёт разрешения" : L"Фоновый чат отвечает";
+        if (waiting) {
+            chat->feed.push_back(*std::ranges::find_if(feed_, [](const FeedItem& item) {
+                return item.kind == Kind::Approval && item.verdict == Verdict::Pending;
+            }));
+        }
+        parked_.push_back(std::move(chat));
+    }
+    SetTimer(hwnd_, kParkedTimer, kParkedFrame, nullptr);
+    RefreshSessions();
     stick_ = true;
     Refresh();
 }

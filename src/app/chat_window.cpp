@@ -157,6 +157,7 @@ constexpr float kColumnMax = 720.f;
 constexpr float kSide = 24.f;
 constexpr float kGap = 14.f;
 constexpr float kBubblePad = 10.f;
+constexpr float kWhoRow = 20.f;  // over an answer: who gives it
 constexpr float kBoxPadY = 5.f;       // inside the input box, above and below its row
 constexpr float kChipRow = 24.f;      // under the box: model, effort, usage ring
 constexpr float kChipsBottom = 6.f;
@@ -323,6 +324,9 @@ struct FeedItem {
     float height = 0;
     float top = 0;  // where it was last painted, for hit tests
     std::vector<MdSpan> spans;  // Kind::Assistant: how the layout's runs are styled (the text is markdown)
+    // Kind::Assistant, the first text of a turn: who gives it ("Grok 4.7", "Claude Opus 5.5"), a line over the text.
+    std::wstring who;
+    float whoHeight = 0;
     std::wstring shown;         // the text the layout was made of (markdown without its markup ...): selections index it
     // Kind::User: the pictures above the bubble, and where the bubble starts below them.
     std::vector<FeedImage> images;
@@ -500,6 +504,7 @@ enum class Target {
     ProjectRow,   // row: the same: a project's head (folds it or opens it)
     ProjectNew,   // row: the same: "+" on the head, a new chat in that project
     AddProject,   // "+" beside the projects' label: a folder or a GitHub repository
+    ProjectsLabel,  // the "projects" label: how that list is ordered
     ModelRow,     // row: an index into the models
     AutoToggle,   // "Auto" atop the models
     FastToggle,   // "Fast" in the Grok row's options
@@ -557,6 +562,7 @@ struct Geometry {
     float secretsTop = 0;  // the first secret's row
     D2D1_RECT_F newItem{};  // the sidebar's "new chat" row
     D2D1_RECT_F addProject{};  // "+" at the right of the projects' label
+    D2D1_RECT_F projectsLabel{};  // "Проекты" and the order: click to choose it
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
     D2D1_RECT_F computer{}; // under the input, at the left: where Claude works (this computer)
     D2D1_RECT_F folder{};   // ... and in which folder there
@@ -682,6 +688,10 @@ std::wstring ClipboardText(HWND owner) {
     }
     CloseClipboard();
     return text;
+}
+
+uint64_t FileTicks(const FILETIME& time) {
+    return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
 }
 
 std::wstring Age(const FILETIME& time) {
@@ -898,6 +908,9 @@ private:
     std::wstring AgentName() const {  // who answers, in the words
         return (running_ ? GrokRunning() : GrokSelected()) ? L"Grok" : L"Claude";
     }
+    // Over the first answer of a turn, "Grok 4.7" or "Claude Opus 5.5" (27.10.2026, his: after a switch he could
+    // take Grok's answer for Claude's); empty for the rest of the turn.
+    std::wstring TurnWho() const;
     void MergeModels();
     void RefreshAuth();
     void SignIn();
@@ -1002,7 +1015,7 @@ private:
     float MinChat() const { return PreviewShown() ? kMinChatPreview : kMinChat; }
 
     // The sidebar: search, the way to the secrets, the projects with their chats (or the secrets view in their
-    // place). A project is a folder its chats work in; the general one (DefaultWorkspace) is always first.
+    // place). A project is a folder its chats work in; the general chats are always last, under the projects.
     struct Project {
         std::wstring folder;
         std::wstring name;
@@ -1125,10 +1138,21 @@ private:
 
     void OpenPopup(Popup popup);
     void ClosePopup();
-    void FilterSessions();
+    void FilterSessions(bool pickFirst = false);  // true: the search lands on its first chat
     void MoveSelection(int delta);
+    void NudgeSelection(int dir);  // left: to the project, or fold it; right: unfold, then its first chat
+    void JumpProject(int delta);
+    void ShowSideRow(size_t row);
+    bool RowSelectable(size_t row) const;  // a project head or a saved chat; not the section label, not the new chat
     void OpenSession(size_t row);
     void OpenChat(std::wstring folder, SessionInfo session);  // copies: the lists are made again on the way
+    void StepChat(int delta);     // Alt+Up/Down: the newer or older chat of this project
+    void StepProject(int delta);  // Alt+Left/Right: the project above or below, its newest chat
+    void RevealOpened();
+    void ShowProjectOrderMenu();
+    void SetProjectOrder(ProjectOrder order);
+    void MoveProject(const std::wstring& folder, int delta);
+    const wchar_t* ProjectOrderWord() const;
 
     void IndexModels();
     const Json* CurrentModel() const;
@@ -2139,6 +2163,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             case Target::ProjectNew:
                 ShowProjectMenu(hit.row, screen);
                 return 0;
+            case Target::ProjectsLabel:
+                ShowProjectOrderMenu();
+                return 0;
             case Target::TermTab:
             case Target::TermTabClose:
                 ShowTabMenu(hit.row, screen);
@@ -2469,6 +2496,10 @@ void ChatWindow::OnClick(float x, float y) {
         keepFocus = true;
         break;
     }
+    case Target::ProjectsLabel:
+        ShowProjectOrderMenu();
+        keepFocus = true;
+        break;
     case Target::ModelChip:
         OpenPopup(Popup::Models);
         break;
@@ -2657,7 +2688,17 @@ void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
 LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
     const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
     if (filter.msg == WM_KEYDOWN) {
+        // The list, without leaving the line: Alt+Up/Down the chats of this project, Alt+Left/Right the projects.
+        if (alt && !control && (filter.wParam == VK_UP || filter.wParam == VK_DOWN)) {
+            StepChat(filter.wParam == VK_DOWN ? 1 : -1);
+            return 1;
+        }
+        if (alt && !control && (filter.wParam == VK_LEFT || filter.wParam == VK_RIGHT)) {
+            StepProject(filter.wParam == VK_RIGHT ? 1 : -1);
+            return 1;
+        }
         if (filter.wParam == VK_RETURN && !shift) {
             Submit();
             return 1;
@@ -2812,6 +2853,7 @@ Geometry ChatWindow::Layout() const {
         g.secrets = D2D1::RectF(sidebarWidth - 6 - 34, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
         g.account = D2D1::RectF(6, g.secrets.top, g.secrets.left - 2, g.secrets.bottom);
         g.addProject = D2D1::RectF(sidebarWidth - 10 - 24, g.newItem.bottom + 7, sidebarWidth - 10, g.newItem.bottom + 31);
+        g.projectsLabel = D2D1::RectF(6, g.newItem.bottom + 4, g.addProject.left - 4, g.newItem.bottom + 32);
         g.listTop = g.newItem.bottom + 8 + 26;  // under the "projects" label
         g.listBottom = g.account.top - 10;
         if (update_) {
@@ -2996,6 +3038,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
         }
         if (Inside(g.addProject, x, y)) {
             return {Target::AddProject};
+        }
+        if (Inside(g.projectsLabel, x, y)) {
+            return {Target::ProjectsLabel};
         }
         if (y >= g.listTop && y < g.listBottom) {
             const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
@@ -3284,6 +3329,10 @@ void ChatWindow::MeasureFeed(float column) {
         item.textWidth = metrics.widthIncludingTrailingWhitespace;
         item.layoutHeight = metrics.height;
         item.height = item.kind == Kind::Approval ? ApprovalHeight(item) : metrics.height;
+        if (item.kind == Kind::Assistant) {
+            item.whoHeight = item.who.empty() ? 0.f : kWhoRow;
+            item.height += item.whoHeight;
+        }
         if (item.kind == Kind::User) {  // the pictures, then the bubble (none for pictures alone)
             const float pictures = LayoutImages(item, column);
             item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
@@ -3471,7 +3520,14 @@ void ChatWindow::PaintFeed(const Geometry& g) {
                 color = kDanger;
             }
             if (item.kind == Kind::Assistant) {
-                PaintMarkdown(item, x, y, left, g.column);
+                if (item.whoHeight > 0) {  // a dot of the agent's colour, then the model
+                    const bool grok = item.who.starts_with(L"Grok");
+                    brush_->SetColor(Color(grok ? 0xc8ccd4 : 0xd97757));
+                    target_->FillEllipse(D2D1::Ellipse({x + 3.5f, y + 8.f}, 3.5f, 3.5f), brush_.get());
+                    Text(item.who, small_.get(), D2D1::RectF(x + 13.f, y, left + g.column, y + kWhoRow), kSecondary);
+                    textY = y + item.whoHeight;
+                }
+                PaintMarkdown(item, x, textY, left, g.column);
             }
             PaintFeedSelection(static_cast<size_t>(&item - feed_.data()), {x, textY});
             brush_->SetColor(Color(color));
@@ -5392,7 +5448,7 @@ D2D1_POINT_2F ChatWindow::ItemOrigin(const Geometry& g, const FeedItem& item) co
     case Kind::Approval:
         return {g.left + kCardPad, item.top + kCardPad + kCardTitle + 4.f};
     default:
-        return {g.left, item.top};
+        return {g.left, item.top + item.whoHeight};
     }
 }
 
@@ -5911,10 +5967,24 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Line({c.x, c.y + 2.f}, {c.x, c.y + 4.f}, color, 1.5f);
     }
 
-    {  // the projects' label, and "+" for another one
-        Text(L"Проекты", ui_.get(),
-             D2D1::RectF(g.sidebar.left + 16, g.newItem.bottom + 8, g.addProject.left - 4, g.newItem.bottom + 8 + 22),
-             kSecondary);
+    {  // the projects' label (click: how they are ordered), and "+" for another one
+        const bool onLabel = hover_.target == Target::ProjectsLabel;
+        if (onLabel) {
+            Fill(g.projectsLabel, 6.f, kRaised);
+        }
+        const uint32_t labelColor = onLabel ? kPrimary : kSecondary;
+        const float textLeft = g.sidebar.left + 16;
+        const float textTop = g.newItem.bottom + 8;
+        const float textBottom = textTop + 22;
+        const float textRight = g.addProject.left - 4;
+        Text(L"Проекты", ui_.get(), D2D1::RectF(textLeft, textTop, textRight, textBottom), labelColor);
+        const std::wstring mode = std::wstring(L" · ") + ProjectOrderWord();
+        const float nameWidth = TextWidth(L"Проекты", ui_.get());
+        const float modeWidth = TextWidth(mode, ui_.get());
+        if (nameWidth + modeWidth <= textRight - textLeft) {
+            Text(mode, ui_.get(),
+                 D2D1::RectF(textLeft + nameWidth, textTop, textLeft + nameWidth + modeWidth + 4, textBottom), labelColor);
+        }
         const bool active = hover_.target == Target::AddProject;
         if (active) {
             Fill(g.addProject, 6.f, kRaised);
@@ -5946,8 +6016,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         }
         if (rows_[row].session == kHead) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
-            // chat in it under the pointer, else how many chats it has.
-            if (hovered) {
+            // chat in it under the pointer, else how many chats it has. The keyboard's row lights up too.
+            if (hovered || (searchFocus_ && row == selected_)) {
                 Fill(lit(r), 8.f, kRaised);
             }
             const D2D1_POINT_2F c{r.left + 14.f, (r.top + r.bottom) / 2};
@@ -5991,7 +6061,17 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             Fill(lit(chat), 8.f, kRaised);
         }
         const bool current = session.id == sessionId_ && project.folder == workspace_;
-        float titleRight = chat.right - 8;
+        const bool parkedHere = ParkedChat(project.folder, session.id) != nullptr;
+        float titleRight = chat.right - (parkedHere ? 24.f : 8.f);
+        if (FileTicks(session.modified) != 0) {  // how old the chat is, so the newest-first order can be read
+            const std::wstring age = Age(session.modified);
+            const float ageWidth = TextWidth(age, uiRight_.get());
+            const float ageLeft = titleRight - ageWidth;
+            if (ageLeft > chat.left + 36.f) {
+                Text(age, uiRight_.get(), D2D1::RectF(ageLeft, chat.top, titleRight, chat.bottom), kSecondary);
+                titleRight = ageLeft - 8.f;
+            }
+        }
         if (const Parked* parked = ParkedChat(project.folder, session.id)) {
             const bool waiting = std::ranges::any_of(parked->feed, [](const FeedItem& item) {
                 return item.kind == Kind::Approval && item.verdict == Verdict::Pending;
@@ -6007,7 +6087,6 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             brush_->SetColor(Color(waiting ? kWaiting : kAccent, alpha));
             target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(chat.right - 14.f, (chat.top + chat.bottom) / 2), 3.5f, 3.5f),
                                  brush_.get());
-            titleRight = chat.right - 24;
         }
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
              D2D1::RectF(chat.left + 10, chat.top, titleRight, chat.bottom), current ? kAccent : kPrimary);
@@ -6110,7 +6189,7 @@ void ChatWindow::ShowProjectMenu(size_t row, POINT screen) {
     }
     const std::wstring folder = project->folder;
     const bool general = folder == DefaultWorkspace();
-    constexpr UINT kNew = 1, kFold = 2, kOpen = 3, kRemove = 4;
+    constexpr UINT kNew = 1, kFold = 2, kOpen = 3, kRemove = 4, kUp = 5, kDown = 6;
     wil::unique_hmenu menu(CreatePopupMenu());
     if (!general) {  // the general one's is the top "new chat"
         AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат в проекте");
@@ -6118,6 +6197,14 @@ void ChatWindow::ShowProjectMenu(size_t row, POINT screen) {
     AppendMenuW(menu.get(), MF_STRING | (searchText_.empty() ? 0 : MF_GRAYED), kFold,
                 ProjectFolded(folder) ? L"Развернуть" : L"Свернуть");
     AppendMenuW(menu.get(), MF_STRING, kOpen, L"Открыть папку");
+    if (!general && settings_.projectOrder == ProjectOrder::Added) {  // the other orders arrange themselves
+        const auto it = std::ranges::find(settings_.projects, folder);
+        const bool known = it != settings_.projects.end();
+        const bool first = !known || it == settings_.projects.begin();
+        const bool last = !known || it + 1 == settings_.projects.end();
+        AppendMenuW(menu.get(), MF_STRING | (first ? MF_GRAYED : 0), kUp, L"Выше");
+        AppendMenuW(menu.get(), MF_STRING | (last ? MF_GRAYED : 0), kDown, L"Ниже");
+    }
     if (!general) {
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, kRemove, L"Убрать из списка");
@@ -6131,6 +6218,12 @@ void ChatWindow::ShowProjectMenu(size_t row, POINT screen) {
         break;
     case kOpen:
         ShellExecuteW(hwnd_, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        break;
+    case kUp:
+        MoveProject(folder, -1);
+        break;
+    case kDown:
+        MoveProject(folder, 1);
         break;
     case kRemove:
         RemoveProject(folder);
@@ -6420,13 +6513,14 @@ void ChatWindow::RefreshSessions() {
         folders.push_back(workspace_);
     }
     folders.push_back(general);
-    projects_.clear();
+    std::vector<Project> built;
+    built.reserve(folders.size());
     for (const std::wstring& folder : folders) {
-        projects_.push_back({folder, ProjectName(folder), ListSessions(folder)});
+        built.push_back({folder, ProjectName(folder), ListSessions(folder)});
     }
     for (const std::unique_ptr<Parked>& chat : parked_) {
-        const auto project = std::ranges::find(projects_, chat->workspace, &Project::folder);
-        if (project == projects_.end() ||
+        const auto project = std::ranges::find(built, chat->workspace, &Project::folder);
+        if (project == built.end() ||
             std::ranges::find(project->sessions, ParkedKey(*chat), &SessionInfo::id) != project->sessions.end()) {
             continue;
         }
@@ -6436,6 +6530,36 @@ void ChatWindow::RefreshSessions() {
             title = said == chat->feed.end() ? L"Новый чат" : said->text.substr(0, said->text.find(L'\n'));
         }
         project->sessions.insert(project->sessions.begin(), SessionInfo{ParkedKey(*chat), std::move(title), {}});
+    }
+    // A chat that is answering, or a new one with no file yet, is newer than any saved chat.
+    constexpr uint64_t kLive = ~uint64_t{0} - 1;
+    std::vector<ProjectPlace> places;
+    places.reserve(built.size());
+    for (const Project& project : built) {
+        uint64_t activity = 0;
+        bool live = project.folder == workspace_ && sessionId_.empty();
+        for (const SessionInfo& session : project.sessions) {
+            const uint64_t ticks = FileTicks(session.modified);
+            if (ticks == 0) {
+                live = true;
+            } else {
+                activity = std::max(activity, ticks);
+            }
+        }
+        if (std::ranges::any_of(parked_, [&](const std::unique_ptr<Parked>& chat) {
+                return chat->workspace == project.folder && chat->busy;
+            })) {
+            live = true;
+        }
+        places.push_back({project.folder, project.name, live ? kLive : activity});
+    }
+    const std::wstring open = workspace_ == general ? std::wstring() : workspace_;
+    projects_.clear();
+    for (const ProjectPlace& place : OrderProjects(std::move(places), general, open, settings_.projectOrder)) {
+        const auto found = std::ranges::find(built, place.folder, &Project::folder);
+        if (found != built.end()) {
+            projects_.push_back(std::move(*found));
+        }
     }
     FilterSessions();
     const size_t most = rows_.empty() ? 0 : rows_.size() - 1;
@@ -6449,7 +6573,7 @@ void ChatWindow::OnSearchKey(WPARAM key) {
         searchFocus_ = false;
         if (!searchText_.empty()) {
             searchText_.clear();
-            FilterSessions();
+            FilterSessions(true);
         }
         SetFocus(input_);
         Refresh();
@@ -6458,13 +6582,48 @@ void ChatWindow::OnSearchKey(WPARAM key) {
             searchFocus_ = false;
             OpenSession(selected_);
             SetFocus(input_);
+        } else if (const Project* project = RowProject(selected_);
+                   project != nullptr && project->folder != DefaultWorkspace()) {
+            if (searchText_.empty()) {
+                ToggleProject(selected_);  // fold or open; the search stays, so the next key still moves
+            } else {
+                const std::wstring folder = project->folder;
+                std::optional<SessionInfo> pick;
+                for (size_t row = selected_ + 1; row < rows_.size() && rows_[row].project == rows_[selected_].project;
+                     ++row) {
+                    if (const SessionInfo* session = RowSession(row)) {
+                        pick = *session;  // the first chat the search is showing under this project
+                        break;
+                    }
+                }
+                if (pick) {
+                    searchFocus_ = false;
+                    OpenChat(folder, *pick);
+                    SetFocus(input_);
+                }
+            }
         }
     } else if (key == VK_DOWN || key == VK_UP) {
-        MoveSelection(key == VK_DOWN ? 1 : -1);
+        if (control) {
+            JumpProject(key == VK_DOWN ? 1 : -1);
+        } else {
+            MoveSelection(key == VK_DOWN ? 1 : -1);
+        }
+    } else if (key == VK_RIGHT || key == VK_LEFT) {
+        NudgeSelection(key == VK_RIGHT ? 1 : -1);
+    } else if (key == VK_HOME || key == VK_END) {
+        const int direction = key == VK_END ? -1 : 1;
+        const long long start = key == VK_END ? static_cast<long long>(rows_.size()) - 1 : 0;
+        for (long long at = start; at >= 0 && at < static_cast<long long>(rows_.size()); at += direction) {
+            if (RowSelectable(static_cast<size_t>(at))) {
+                ShowSideRow(static_cast<size_t>(at));
+                break;
+            }
+        }
     } else if (key == 'V' && control) {
         searchText_ += ClipboardText(hwnd_);
         std::erase_if(searchText_, [](wchar_t c) { return c == L'\r' || c == L'\n'; });
-        FilterSessions();
+        FilterSessions(true);
     }
 }
 
@@ -6480,7 +6639,7 @@ void ChatWindow::OnSearchChar(wchar_t c) {
     } else {
         return;
     }
-    FilterSessions();
+    FilterSessions(true);
 }
 
 // A switch at a row's right end: the accent and the knob right when on.
@@ -7728,7 +7887,7 @@ std::wstring ChatWindow::TooltipText() {
     case Target::WinClose:
         return L"Закрыть";
     case Target::SidebarSearch:
-        return L"Поиск по чатам (Ctrl+H)";
+        return L"Поиск (Ctrl+H): стрелки, Enter, влево свернуть. Alt+↑↓ чаты, Alt+←→ проекты";
     case Target::FolderChip:
         return L"Папка чата: " + workspace_;
     case Target::ComputerChip:
@@ -7796,7 +7955,7 @@ std::wstring ChatWindow::TooltipText() {
             return {};
         }
         const Geometry g = Layout();
-        const float room = (g.sidebar.right - 14.f) - (g.sidebar.left + 16.f + kProjectIndent);
+        const float room = (g.sidebar.right - 14.f) - (g.sidebar.left + 16.f + kProjectIndent) - 64.f;
         return !session->title.empty() && TextWidth(session->title, ui_.get()) > room ? session->title : std::wstring();
     }
     case Target::ProjectRow:
@@ -7804,6 +7963,8 @@ std::wstring ChatWindow::TooltipText() {
     case Target::ProjectNew:
         return RowProject(hover_.row) != nullptr ? L"Новый чат в проекте «" + RowProject(hover_.row)->name + L"»"
                                                  : std::wstring();
+    case Target::ProjectsLabel:
+        return std::wstring(L"Порядок: ") + ProjectOrderWord() + L". Нажать, чтобы сменить";
     case Target::AddProject:
         return L"Добавить проект: папку на этом компьютере или репозиторий GitHub";
     case Target::NewChat:
@@ -8065,6 +8226,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         break;
     case Target::AddProject:
         return g.addProject;
+    case Target::ProjectsLabel:
+        return g.projectsLabel;
     case Target::NewChat:
         return g.newItem;
     default:
@@ -8381,7 +8544,7 @@ void ChatWindow::ClosePopup() {
 
 // The rows: each project's head, and under it its chats unless it is folded. A search shows the projects whose
 // name has it (all their chats) and the chats whose title has it, under their heads.
-void ChatWindow::FilterSessions() {
+void ChatWindow::FilterSessions(bool pickFirst) {
     const std::wstring query = Lowercase(searchText_);
     rows_.clear();
     for (size_t p = 0; p < projects_.size(); ++p) {
@@ -8409,10 +8572,18 @@ void ChatWindow::FilterSessions() {
             rows_.push_back({p, i});
         }
     }
-    firstRow_ = 0;
-    selected_ = 0;  // the keys go through the chats: the first one is picked
-    while (selected_ < rows_.size() && RowSession(selected_) == nullptr) {
-        ++selected_;
+    if (pickFirst) {
+        firstRow_ = 0;
+        selected_ = 0;  // the keys go through the chats: the first one is picked
+        while (selected_ < rows_.size() && RowSession(selected_) == nullptr) {
+            ++selected_;
+        }
+        if (selected_ >= rows_.size()) {  // a project matched and none of its chats did: land on the project
+            selected_ = 0;
+            while (selected_ < rows_.size() && !RowSelectable(selected_)) {
+                ++selected_;
+            }
+        }
     }
     Refresh();
 }
@@ -8426,26 +8597,224 @@ void ChatWindow::RebuildRows() {
 }
 
 void ChatWindow::MoveSelection(int delta) {
-    auto next = static_cast<long long>(selected_);
-    for (long long at = next + delta; at >= 0 && at < static_cast<long long>(rows_.size()); at += delta) {
-        if (RowSession(static_cast<size_t>(at)) != nullptr) {  // the heads and the new chat are passed over
-            next = at;
-            break;
+    if (rows_.empty()) {
+        return;
+    }
+    const long long start =
+        selected_ < rows_.size() ? static_cast<long long>(selected_) : (delta > 0 ? -1 : static_cast<long long>(rows_.size()));
+    for (long long at = start + delta; at >= 0 && at < static_cast<long long>(rows_.size()); at += delta) {
+        if (RowSelectable(static_cast<size_t>(at))) {
+            ShowSideRow(static_cast<size_t>(at));
+            return;
         }
     }
-    selected_ = static_cast<size_t>(next);
+}
+
+void ChatWindow::ShowSideRow(size_t row) {
+    selected_ = row;
+    const size_t fit = std::max<size_t>(1, SidebarRows(Layout()));
     if (selected_ < firstRow_) {
         firstRow_ = selected_;
-    } else if (const size_t rows = std::max<size_t>(1, SidebarRows(Layout())); selected_ >= firstRow_ + rows) {
-        firstRow_ = selected_ + 1 - rows;
+    } else if (selected_ >= firstRow_ + fit) {
+        firstRow_ = selected_ + 1 - fit;
     }
     Refresh();
+}
+
+bool ChatWindow::RowSelectable(size_t row) const {
+    if (row >= rows_.size() || rows_[row].session == kDraft) {
+        return false;  // the new chat is the one already open
+    }
+    return !(rows_[row].session == kHead && projects_[rows_[row].project].folder == DefaultWorkspace());
+}
+
+void ChatWindow::NudgeSelection(int dir) {
+    if (rows_.empty() || selected_ >= rows_.size()) {
+        return;
+    }
+    const size_t project = rows_[selected_].project;
+    const std::wstring folder = projects_[project].folder;
+    if (dir > 0) {
+        if (rows_[selected_].session == kHead && searchText_.empty() && ProjectFolded(folder)) {
+            ToggleProject(selected_);
+        }
+        if (selected_ + 1 < rows_.size() && rows_[selected_ + 1].project == project && RowSelectable(selected_ + 1)) {
+            ShowSideRow(selected_ + 1);
+        }
+        return;
+    }
+    if (rows_[selected_].session != kHead) {
+        for (size_t i = selected_; i-- > 0;) {
+            if (rows_[i].project == project && rows_[i].session == kHead && RowSelectable(i)) {
+                ShowSideRow(i);
+                return;
+            }
+        }
+        return;
+    }
+    if (searchText_.empty() && folder != DefaultWorkspace() && !ProjectFolded(folder)) {
+        ToggleProject(selected_);
+    }
+}
+
+void ChatWindow::JumpProject(int delta) {
+    if (rows_.empty()) {
+        return;
+    }
+    const long long start = selected_ < rows_.size() ? static_cast<long long>(selected_) : -1;
+    for (long long at = start + delta; at >= 0 && at < static_cast<long long>(rows_.size()); at += delta) {
+        if (rows_[static_cast<size_t>(at)].session == kHead && RowSelectable(static_cast<size_t>(at))) {
+            ShowSideRow(static_cast<size_t>(at));
+            return;
+        }
+    }
 }
 
 void ChatWindow::OpenSession(size_t row) {
     if (const SessionInfo* session = RowSession(row)) {
         OpenChat(projects_[rows_[row].project].folder, *session);
     }
+}
+
+void ChatWindow::RevealOpened() {
+    if (!searchText_.empty()) {
+        searchText_.clear();
+        searchFocus_ = false;
+    }
+    if (ProjectFolded(workspace_)) {
+        std::erase(settings_.closedProjects, workspace_);
+        SaveSettings(settings_);
+    }
+    RefreshSessions();
+    for (size_t row = 0; row < rows_.size(); ++row) {
+        const bool draft = rows_[row].session == kDraft && projects_[rows_[row].project].folder == workspace_ &&
+                           sessionId_.empty();
+        const SessionInfo* session = RowSession(row);
+        if (draft || (session != nullptr && session->id == sessionId_ &&
+                      projects_[rows_[row].project].folder == workspace_)) {
+            ShowSideRow(row);
+            return;
+        }
+    }
+    Refresh();
+}
+
+void ChatWindow::StepChat(int delta) {
+    const auto found = std::ranges::find(projects_, workspace_, &Project::folder);
+    if (found == projects_.end()) {
+        return;
+    }
+    int index = -1;  // the new chat sits ahead of every saved one
+    if (!sessionId_.empty()) {
+        for (size_t i = 0; i < found->sessions.size(); ++i) {
+            if (found->sessions[i].id == sessionId_) {
+                index = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    const int next = index + delta;
+    if (next < 0) {
+        Flash(L"Выше чатов нет");
+        return;
+    }
+    if (next >= static_cast<int>(found->sessions.size())) {
+        Flash(L"Ниже чатов нет");
+        return;
+    }
+    const std::wstring folder = found->folder;
+    const SessionInfo session = found->sessions[static_cast<size_t>(next)];
+    OpenChat(folder, session);
+    RevealOpened();
+}
+
+void ChatWindow::StepProject(int delta) {
+    const auto found = std::ranges::find(projects_, workspace_, &Project::folder);
+    if (found == projects_.end()) {
+        return;
+    }
+    const long long next = (found - projects_.begin()) + delta;
+    if (next < 0) {
+        Flash(L"Выше проектов нет");
+        return;
+    }
+    if (next >= static_cast<long long>(projects_.size())) {
+        Flash(L"Ниже проектов нет");
+        return;
+    }
+    const std::wstring folder = projects_[static_cast<size_t>(next)].folder;
+    if (projects_[static_cast<size_t>(next)].sessions.empty()) {
+        NewChatIn(folder);
+        RevealOpened();
+        return;
+    }
+    const SessionInfo session = projects_[static_cast<size_t>(next)].sessions.front();
+    OpenChat(folder, session);
+    RevealOpened();
+}
+
+const wchar_t* ChatWindow::ProjectOrderWord() const {
+    switch (settings_.projectOrder) {
+    case ProjectOrder::Name:
+        return L"имя";
+    case ProjectOrder::Added:
+        return L"свои";
+    case ProjectOrder::Recent:
+        return L"недавние";
+    }
+    return L"недавние";
+}
+
+void ChatWindow::SetProjectOrder(ProjectOrder order) {
+    if (settings_.projectOrder == order) {
+        return;
+    }
+    settings_.projectOrder = order;
+    SaveSettings(settings_);
+    RefreshSessions();
+    Refresh();
+}
+
+void ChatWindow::ShowProjectOrderMenu() {
+    constexpr UINT kRecent = 1, kName = 2, kAdded = 3;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    const auto mark = [&](ProjectOrder order) { return settings_.projectOrder == order ? MF_CHECKED : 0; };
+    AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Recent), kRecent, L"Сначала недавние	открытый сверху");
+    AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Name), kName, L"По имени");
+    AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Added), kAdded,
+                L"Как добавлены	правый клик — выше и ниже");
+    const Geometry g = Layout();
+    POINT screen{ToPx(g.projectsLabel.left), ToPx(g.projectsLabel.bottom)};
+    ClientToScreen(hwnd_, &screen);
+    switch (Menu(menu.get(), screen)) {
+    case kRecent:
+        SetProjectOrder(ProjectOrder::Recent);
+        break;
+    case kName:
+        SetProjectOrder(ProjectOrder::Name);
+        break;
+    case kAdded:
+        SetProjectOrder(ProjectOrder::Added);
+        break;
+    default:
+        break;
+    }
+    SetFocus(input_);
+}
+
+void ChatWindow::MoveProject(const std::wstring& folder, int delta) {
+    const auto it = std::ranges::find(settings_.projects, folder);
+    if (it == settings_.projects.end()) {
+        return;
+    }
+    const auto next = it + delta;
+    if (next < settings_.projects.begin() || next >= settings_.projects.end()) {
+        return;
+    }
+    std::iter_swap(it, next);
+    SaveSettings(settings_);
+    RefreshSessions();
+    Refresh();
 }
 
 // A chat of any project: its project becomes the chat's folder, and the CLI resumes it there.
@@ -8490,9 +8859,14 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
                 }
             }
             break;
-        case EntryKind::Assistant:
+        case EntryKind::Assistant: {  // the history is Claude's transcript, without the models
+            const bool first = !TurnWho().empty();
             Add(Kind::Assistant, entry.text);
+            if (first) {
+                feed_.back().who = L"Claude";
+            }
             break;
+        }
         case EntryKind::Compacted:
             Add(Kind::Notice, L"Чат сжат: дальше Claude помнит начало по сводке");
             break;
@@ -8638,6 +9012,23 @@ std::wstring ChatWindow::ModelName() const {
         return ToWide(JsonStr(*model, "displayName"));
     }
     return settings_.model.empty() ? L"Модель" : ToWide(settings_.model);
+}
+
+std::wstring ChatWindow::TurnWho() const {
+    for (auto it = feed_.rbegin(); it != feed_.rend() && it->kind != Kind::User; ++it) {
+        if (it->kind == Kind::Assistant) {
+            return {};
+        }
+    }
+    std::wstring name = ModelName();
+    if (name.starts_with(L"Auto · ")) {
+        name = name.substr(7);
+    }
+    const std::wstring agent = AgentName();
+    if (name == L"Auto" || name == L"Модель" || name.starts_with(L"Grok") != (agent == L"Grok")) {
+        return agent;  // the model unknown, or the menu's already the other CLI's
+    }
+    return name.starts_with(agent) ? name : agent + L" " + name;
 }
 
 std::vector<std::string> ChatWindow::EffortLevels() const {
@@ -9062,6 +9453,7 @@ void ChatWindow::OnClaude(const Json& message) {
         } else if (eventType == "content_block_start" && JsonStr(JsonAt(event, "content_block"), "type") == "text") {
             FeedItem item;
             item.kind = Kind::Assistant;
+            item.who = TurnWho();
             item.messageId = currentMessageId_;
             item.block = block;
             feed_.push_back(std::move(item));
@@ -9086,7 +9478,9 @@ void ChatWindow::OnClaude(const Json& message) {
             for (const Json& block : content) {
                 const std::string blockType = JsonStr(block, "type");
                 if (blockType == "text" && !streamed_.contains(id)) {
+                    std::wstring who = TurnWho();
                     Add(Kind::Assistant, ToWide(JsonStr(block, "text")));
+                    feed_.back().who = std::move(who);
                 } else if (blockType == "tool_use" && OwnToolName(JsonStr(block, "name")).empty()) {
                     Add(Kind::Notice, L"инструмент: " + ToWide(JsonStr(block, "name")), true);
                 }
@@ -9428,6 +9822,10 @@ void ChatWindow::FillGallery() {
     card("read_file", Json{{"path", ToUtf8(longPath)}}, Verdict::Allowed, true, L"содержимое файла\nвторая строка", false);
     Add(Kind::Assistant, L"Скриншот: `C:\\Users\\user\\gallery1.png` и PDF `C:\\Users\\user\\a.pdf`, страница `C:\\Users\\user\\a.html`.");
     Add(Kind::Assistant, L"Финальный короткий ответ.");
+    feed_[2].who = L"Claude Opus 5.5";  // the first answer of a turn is signed: one of each agent
+    Add(Kind::User, L"А у тебя так же?");
+    Add(Kind::Assistant, L"Ответ после переключения на Grok.");
+    feed_.back().who = L"Grok 4.7";
     // Two chats answering in the background: one working (its dot breathes), one waiting for a permission.
     for (const bool waiting : {false, true}) {
         auto chat = std::make_unique<Parked>();

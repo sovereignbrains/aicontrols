@@ -428,6 +428,69 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
     return entries;
 }
 
+std::vector<ProjectPlace> OrderProjects(std::vector<ProjectPlace> projects, const std::wstring& general,
+                                        const std::wstring& open, ProjectOrder order) {
+    const size_t count = projects.size();
+    std::vector<size_t> index(count);
+    for (size_t i = 0; i < count; ++i) {
+        index[i] = i;
+    }
+    std::ranges::stable_sort(index, [&](size_t a, size_t b) {
+        const bool aGeneral = !general.empty() && projects[a].folder == general;
+        const bool bGeneral = !general.empty() && projects[b].folder == general;
+        if (aGeneral != bGeneral) {
+            return bGeneral;  // the general chats stay a section under the projects
+        }
+        if (aGeneral) {
+            return false;
+        }
+        if (order == ProjectOrder::Name) {
+            const int compared = CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE, projects[a].name.c_str(), -1,
+                                                 projects[b].name.c_str(), -1);
+            return compared == CSTR_LESS_THAN;
+        }
+        if (order == ProjectOrder::Recent) {
+            const bool aOpen = !open.empty() && projects[a].folder == open;
+            const bool bOpen = !open.empty() && projects[b].folder == open;
+            if (aOpen != bOpen) {
+                return aOpen;  // the project on screen stays where the eye already is
+            }
+            if (projects[a].activity != projects[b].activity) {
+                return projects[a].activity > projects[b].activity;
+            }
+        }
+        return false;  // Added, and any tie: the order they were given
+    });
+    std::vector<ProjectPlace> ordered;
+    ordered.reserve(count);
+    for (const size_t i : index) {
+        ordered.push_back(std::move(projects[i]));
+    }
+    return ordered;
+}
+
+ProjectOrder ParseProjectOrder(const std::string& text) {
+    if (text == "added") {
+        return ProjectOrder::Added;
+    }
+    if (text == "name") {
+        return ProjectOrder::Name;
+    }
+    return ProjectOrder::Recent;
+}
+
+const char* ProjectOrderId(ProjectOrder order) {
+    switch (order) {
+    case ProjectOrder::Added:
+        return "added";
+    case ProjectOrder::Name:
+        return "name";
+    case ProjectOrder::Recent:
+        return "recent";
+    }
+    return "recent";
+}
+
 Settings LoadSettings() {
     Settings settings;
     std::ifstream in(SettingsFile(), std::ios::binary);
@@ -474,6 +537,7 @@ Settings LoadSettings() {
         std::ranges::reverse(settings.projects);
     }
     settings.closedProjects = folders("closedProjects");
+    settings.projectOrder = ParseProjectOrder(JsonStr(data, "projectOrder"));
     return settings;
 }
 
@@ -515,6 +579,7 @@ void SaveSettings(const Settings& settings) {
                 {"workspace", ToUtf8(settings.workspace)},
                 {"projects", folders(settings.projects)},
                 {"closedProjects", folders(settings.closedProjects)},
+                {"projectOrder", ProjectOrderId(settings.projectOrder)},
                 {"reopen", settings.reopen}}
                .dump(2)
         << "\n";

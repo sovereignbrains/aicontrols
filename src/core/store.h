@@ -33,6 +33,23 @@ struct TranscriptEntry {
     bool toolAnswered = false;
 };
 
+// How the sidebar lists projects. Recent: the one open now first, then by the newest chat.
+// Name: A to Z. Added: the order they were put on the list.
+enum class ProjectOrder { Recent, Name, Added };
+
+struct ProjectPlace {
+    std::wstring folder;
+    std::wstring name;
+    uint64_t activity = 0;  // newest chat, FILETIME ticks; a live unsaved chat sits above any file
+};
+
+// `general` stays last (its own section, not a project among the others). Recent keeps `open` first, then the
+// newest activity, and breaks ties by the order given. Name is the user's language, ignoring case.
+std::vector<ProjectPlace> OrderProjects(std::vector<ProjectPlace> projects, const std::wstring& general,
+                                        const std::wstring& open, ProjectOrder order);
+ProjectOrder ParseProjectOrder(const std::string& text);  // unknown, and empty: Recent
+const char* ProjectOrderId(ProjectOrder order);
+
 struct Settings {
     std::string model;   // a value from the CLI's model list; empty: its default
     std::string effort;  // low … max; empty: the model's default
@@ -61,6 +78,8 @@ struct Settings {
     // DefaultWorkspace, is always there and not among them), and the ones folded there.
     std::vector<std::wstring> projects;
     std::vector<std::wstring> closedProjects;
+    // Which of those orders the sidebar shows. The list above stays the added order, so "added" can come back.
+    ProjectOrder projectOrder = ProjectOrder::Recent;
     // A chat to open again at the next start (set by an update, which restarts the client); cleared once opened.
     std::string reopen;
 };

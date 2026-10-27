@@ -61,6 +61,40 @@ int main() {
                entries[2].kind == aic::EntryKind::User && entries[2].text == L"which word?",
            "a compacted chat: the mark, no summary");
 
+    // The sidebar's order: the open project first when sorting by recent, the general chats always last.
+    const std::wstring general = L"general";
+    const std::vector<aic::ProjectPlace> places = {
+        {L"sov", L"Sovereign", 10},
+        {general, L"Obshchee", 100},
+        {L"dpi", L"dpiprobe", 50},
+        {L"aic", L"aicontrols", 50},
+        {L"old", L"Windows", 0},
+    };
+    const auto foldersOf = [](const std::vector<aic::ProjectPlace>& list) {
+        std::vector<std::wstring> names;
+        for (const aic::ProjectPlace& place : list) {
+            names.push_back(place.folder);
+        }
+        return names;
+    };
+    Expect(foldersOf(aic::OrderProjects(places, general, L"sov", aic::ProjectOrder::Recent)) ==
+               std::vector<std::wstring>{L"sov", L"dpi", L"aic", L"old", general},
+           "recent: the open project, then the newest, ties keep the added order, general last");
+    Expect(foldersOf(aic::OrderProjects(places, general, L"aic", aic::ProjectOrder::Name)) ==
+               std::vector<std::wstring>{L"aic", L"dpi", L"sov", L"old", general},
+           "name: A to Z, ignoring case, general still last");
+    Expect(foldersOf(aic::OrderProjects(places, general, L"sov", aic::ProjectOrder::Added)) ==
+               std::vector<std::wstring>{L"sov", L"dpi", L"aic", L"old", general},
+           "added: the given order, general pulled out to the end");
+    Expect(aic::ParseProjectOrder("") == aic::ProjectOrder::Recent &&
+               aic::ParseProjectOrder("nope") == aic::ProjectOrder::Recent &&
+               aic::ParseProjectOrder("added") == aic::ProjectOrder::Added &&
+               aic::ParseProjectOrder("name") == aic::ProjectOrder::Name,
+           "an unknown order is recent");
+    Expect(std::string(aic::ProjectOrderId(aic::ProjectOrder::Added)) == "added" &&
+               std::string(aic::ProjectOrderId(aic::ProjectOrder::Name)) == "name",
+           "the order is stored by those names");
+
     fs::remove_all(historyA, error);
     fs::remove_all(historyB, error);
     if (failures == 0) {

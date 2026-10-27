@@ -1,9 +1,11 @@
 // Chats moved between projects (their history folders under ~\.claude\projects, made for two scratch
 // workspaces and removed after). Exit code 0: all passed.
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "core/store.h"
 
@@ -60,6 +62,44 @@ int main() {
     Expect(entries.size() == 3 && entries[0].kind == aic::EntryKind::User && entries[1].kind == aic::EntryKind::Compacted &&
                entries[2].kind == aic::EntryKind::User && entries[2].text == L"which word?",
            "a compacted chat: the mark, no summary");
+
+    // Grok's chats: a folder each under ~\.grok\sessions\<workspace, %-encoded>, listed beside Claude's.
+    const fs::path grokA = aic::GrokHistoryFolder(a);
+    Expect(grokA.filename().wstring().ends_with(L"%5Caic_store_test_a"), "grok's folder name: the path %-encoded");
+    fs::remove_all(grokA, error);
+    fs::create_directories(grokA / L"g-1", error);
+    fs::create_directories(grokA / L"g-empty", error);
+    std::ofstream(grokA / L"g-1" / L"chat_history.jsonl")
+        << R"({"type":"user","content":[{"type":"text","text":"<rules>be brief</rules>"}]})" << "\n"
+        << R"({"type":"user","content":[{"type":"text","text":"<image_files>\n1.png\n</image_files>\n\n<user_query>\n)"
+        << R"(сделай навигацию\nи логику\n</user_query>"},{"type":"image","url":"data:image/png;base64,iVBO"}],"prompt_index":0})" << "\n"
+        << R"({"type":"reasoning","content":"thinking"})" << "\n"
+        << R"({"type":"assistant","content":"","tool_calls":[{"id":"c1","name":"search_tool","arguments":"{}"},)"
+        << R"({"id":"c2","name":"use_tool","arguments":"{\"tool_name\":\"aic__read_file\",\"tool_input\":{\"path\":\"a.txt\"}}"}]})" << "\n"
+        << R"({"type":"tool_result","tool_call_id":"c2","content":"hello\n"})" << "\n"
+        << R"({"type":"user","content":[{"type":"text","text":"<system-reminder>x</system-reminder>"}],"synthetic_reason":"r"})" << "\n"
+        << R"({"type":"assistant","content":"done"})" << "\n";
+    std::ofstream(grokA / L"g-empty" / L"chat_history.jsonl")
+        << R"({"type":"user","content":[{"type":"text","text":"<rules>be brief</rules>"}]})" << "\n";
+    std::vector<aic::SessionInfo> listed = aic::ListSessions(a);
+    const auto grokChat = std::ranges::find(listed, std::string("g-1"), &aic::SessionInfo::id);
+    Expect(grokChat != listed.end() && grokChat->grok && grokChat->title == L"сделай навигацию",
+           "a grok chat: listed, named after its first message");
+    Expect(std::ranges::find(listed, std::string("g-empty"), &aic::SessionInfo::id) == listed.end(),
+           "a grok session nothing was said in is not listed");
+    const std::vector<aic::TranscriptEntry> said = aic::LoadTranscript(a, "g-1", 100, truncated);
+    Expect(said.size() == 3 && said[0].kind == aic::EntryKind::User && said[0].text == L"сделай навигацию\nи логику" &&
+               said[0].images.size() == 1 && said[0].images[0].mediaType == "image/png",
+           "a grok transcript: the words as typed, the picture");
+    Expect(said.size() == 3 && said[1].kind == aic::EntryKind::Tool && said[1].text == L"mcp__aic__read_file" &&
+               said[1].toolInput == R"({"path":"a.txt"})" && said[1].toolOutput == L"hello" && said[1].toolAnswered,
+           "a grok tool call as it comes live, with its answer; its tool lookups left out");
+    Expect(said.size() == 3 && said[2].kind == aic::EntryKind::Assistant && said[2].text == L"done", "the answer");
+    Expect(aic::RenameSession(a, "g-1", L"Навигация") && aic::SessionTitle(a, "g-1") == L"Навигация" &&
+               fs::exists(grokA / L"g-1" / L"chat_history.jsonl"),
+           "a grok chat renamed, its history left as it is");
+    Expect(!aic::RenameSession(a, "..\\g-1", L"x") && !aic::MoveSession(a, b, "g-1"), "no paths; grok's are not moved");
+    fs::remove_all(grokA, error);
 
     // The sidebar's order: the open project first when sorting by recent, the general chats always last.
     const std::wstring general = L"general";

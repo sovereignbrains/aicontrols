@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -73,6 +74,31 @@ void ForEachLine(std::string_view text, Fn&& fn) {
 
 std::wstring TextOf(const Json& content, bool images = true);  // images: a line for each picture
 
+// A message as a title: the first line of the words; a picture or file mark (an attachment's line) only if there are
+// none, and then without the mark, which a font may draw as a squiggle. Shortened.
+std::wstring PromptTitle(const std::wstring& prompt) {
+    const std::wstring_view mark = L"📎 ";
+    std::wstring titled;
+    std::wstring attached;
+    for (size_t at = std::min(prompt.find_first_not_of(L" \t\r\n"), prompt.size()); at < prompt.size();) {
+        const size_t end = std::min(prompt.find_first_of(L"\r\n", at), prompt.size());
+        const std::wstring_view row = std::wstring_view(prompt).substr(at, end - at);
+        if (row.starts_with(mark)) {
+            attached = attached.empty() ? std::wstring(row.substr(mark.size())) : attached;
+        } else if (!row.empty()) {
+            titled = row;
+            break;
+        }
+        at = end + 1;
+    }
+    std::wstring title = titled.empty() ? attached : titled;
+    constexpr size_t kLongest = 70;
+    if (title.size() > kLongest) {
+        title = title.substr(0, kLongest) + L"…";
+    }
+    return title;
+}
+
 // A chat the CLI never titled is named after its first message: its first line, shortened.
 std::wstring FirstPrompt(std::string_view text) {
     std::wstring found;
@@ -84,36 +110,12 @@ std::wstring FirstPrompt(std::string_view text) {
         if (JsonStr(entry, "type") != "user" || (JsonAt(entry, "isMeta").is_boolean() && JsonAt(entry, "isMeta").get<bool>())) {
             return;
         }
-        std::wstring prompt = TextOf(JsonAt(JsonAt(entry, "message"), "content"));
+        const std::wstring prompt = TextOf(JsonAt(JsonAt(entry, "message"), "content"));
         const size_t first = prompt.find_first_not_of(L" \t\r\n");
         if (first == std::wstring::npos || prompt[first] == L'<') {  // tool results, command and system insertions
             return;
         }
-        // The title is the first line of the words; a picture or file mark (an attachment's line) only if there are
-        // none, and then without the mark, which a font may draw as a squiggle.
-        const std::wstring_view mark = L"📎 ";
-        std::wstring titled;
-        std::wstring attached;
-        for (size_t at = first; at < prompt.size();) {
-            const size_t end = std::min(prompt.find_first_of(L"\r\n", at), prompt.size());
-            const std::wstring_view row = std::wstring_view(prompt).substr(at, end - at);
-            if (row.starts_with(mark)) {
-                attached = attached.empty() ? std::wstring(row.substr(mark.size())) : attached;
-            } else if (!row.empty()) {
-                titled = row;
-                break;
-            }
-            at = end + 1;
-        }
-        prompt = titled.empty() ? attached : titled;
-        if (prompt.empty()) {
-            return;
-        }
-        constexpr size_t kLongest = 70;
-        if (prompt.size() > kLongest) {
-            prompt = prompt.substr(0, kLongest) + L"…";
-        }
-        found = std::move(prompt);
+        found = PromptTitle(prompt);
     });
     return found;
 }
@@ -203,6 +205,245 @@ bool IsTrue(const Json& value) {
     return value.is_boolean() && value.get<bool>();
 }
 
+// The last `limit` entries; `truncated` says there were more.
+void KeepLatest(std::vector<TranscriptEntry>& entries, size_t limit, bool& truncated) {
+    truncated = entries.size() > limit;
+    if (truncated) {
+        entries.erase(entries.begin(), entries.end() - static_cast<std::ptrdiff_t>(limit));
+    }
+}
+
+// ---- Grok's chats (grok 1.0.62, 27.10.2026): a folder each, its messages a line each in chat_history.jsonl:
+// {"type":"user","content":[blocks],"prompt_index":N} what the user sent (without prompt_index: Grok's rules and
+// reminders), {"type":"assistant","content":"…","tool_calls":[{id,name,arguments}]}, {"type":"tool_result",
+// "tool_call_id":…,"content":"…"}.
+
+constexpr const wchar_t* kGrokHistory = L"chat_history.jsonl";
+constexpr const wchar_t* kGrokTitle = L"aicontrols-title.txt";  // a title given here; Grok's own files stay as they are
+
+// The folder's name as Grok makes it: the path in UTF-8, all but [A-Za-z0-9-._~] as %XX.
+std::wstring PercentEncode(const std::wstring& text) {
+    constexpr char kHex[] = "0123456789ABCDEF";
+    std::wstring encoded;
+    for (const char c : ToUtf8(text)) {
+        const auto byte = static_cast<unsigned char>(c);
+        const bool keep = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') ||
+                          byte == '-' || byte == '.' || byte == '_' || byte == '~';
+        if (keep) {
+            encoded += static_cast<wchar_t>(byte);
+        } else {
+            encoded += L'%';
+            encoded += static_cast<wchar_t>(kHex[byte >> 4]);
+            encoded += static_cast<wchar_t>(kHex[byte & 0xF]);
+        }
+    }
+    return encoded;
+}
+
+std::wstring PercentDecode(const std::wstring& name) {
+    const auto hex = [](char c) {
+        return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+    };
+    const std::string text = ToUtf8(name);
+    std::string decoded;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '%' && i + 2 < text.size() && hex(text[i + 1]) >= 0 && hex(text[i + 2]) >= 0) {
+            decoded += static_cast<char>(hex(text[i + 1]) * 16 + hex(text[i + 2]));
+            i += 2;
+        } else {
+            decoded += text[i];
+        }
+    }
+    return ToWide(decoded);
+}
+
+fs::path GrokProjectDir(const std::wstring& workspace) {
+    const fs::path root = fs::path(KnownFolder(FOLDERID_Profile)) / L".grok" / L"sessions";
+    const fs::path named = root / PercentEncode(workspace);
+    std::error_code error;
+    if (fs::is_directory(named, error)) {
+        return named;
+    }
+    for (const fs::directory_entry& item : fs::directory_iterator(root, error)) {  // the path written in another case
+        const std::wstring path = PercentDecode(item.path().filename().wstring());
+        if (CompareStringOrdinal(path.c_str(), -1, workspace.c_str(), -1, TRUE) == CSTR_EQUAL) {
+            return item.path();
+        }
+    }
+    return named;
+}
+
+fs::path GrokSessionDir(const std::wstring& workspace, const std::string& id) {
+    if (id.empty() || id.find_first_of("/\\.:") != std::string::npos) {
+        return {};  // an id is a plain name; anything else could reach outside the chats' folder
+    }
+    return GrokProjectDir(workspace) / ToWide(id);
+}
+
+bool IsGrokPrompt(const Json& entry) {
+    return JsonStr(entry, "type") == "user" && JsonAt(entry, "prompt_index").is_number() &&
+           !entry.contains("synthetic_reason");
+}
+
+// The words as they were typed: Grok puts them in <user_query>, after its list of the pictures it saved; a switch's
+// handoff (<earlier_chat>) comes first among them.
+std::wstring GrokPromptText(const Json& content) {
+    std::string text = content.is_string() ? content.get<std::string>() : std::string();
+    if (content.is_array()) {
+        for (const Json& block : content) {
+            if (JsonStr(block, "type") == "text") {
+                text += JsonStr(block, "text");
+            }
+        }
+    }
+    constexpr std::string_view kOpen = "<user_query>";
+    constexpr std::string_view kClose = "</user_query>";
+    const size_t open = text.find(kOpen);
+    const size_t close = text.rfind(kClose);
+    if (open != std::string::npos && close != std::string::npos && close > open) {
+        text = text.substr(open + kOpen.size(), close - open - kOpen.size());
+    }
+    constexpr std::string_view kHandoffEnd = "</earlier_chat>";
+    if (const size_t start = text.find_first_not_of(" \t\r\n");
+        start != std::string::npos && std::string_view(text).substr(start).starts_with("<earlier_chat>")) {
+        const size_t end = text.find(kHandoffEnd);
+        text.erase(0, end == std::string::npos ? text.size() : end + kHandoffEnd.size());
+    }
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    const size_t last = text.find_last_not_of(" \t\r\n");
+    return first == std::string::npos ? std::wstring() : ToWide(std::string_view(text).substr(first, last - first + 1));
+}
+
+// The pictures sent with it: {"type":"image","url":"data:image/png;base64,…"}.
+std::vector<TranscriptImage> GrokPromptImages(const Json& content) {
+    std::vector<TranscriptImage> images;
+    if (!content.is_array()) {
+        return images;
+    }
+    for (const Json& block : content) {
+        if (JsonStr(block, "type") != "image") {
+            continue;
+        }
+        const std::string url = JsonStr(block, "url");
+        const size_t data = url.find(";base64,");
+        if (url.starts_with("data:") && data != std::string::npos) {
+            images.push_back({url.substr(5, data - 5), url.substr(data + 8)});
+        }
+    }
+    return images;
+}
+
+// A Grok chat is named after its first message (Grok's own titles come in English). nullopt: nothing was sent, the
+// session is a start of grok.exe and no chat. The lines before it are Grok's rules, a few.
+std::optional<std::wstring> ReadGrokTitle(const fs::path& history) {
+    std::ifstream in(history, std::ios::binary);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find("\"prompt_index\"") == std::string::npos) {
+            continue;
+        }
+        const Json entry = Json::parse(line, nullptr, false);
+        if (!IsGrokPrompt(entry)) {
+            continue;
+        }
+        const Json& content = JsonAt(entry, "content");
+        std::wstring words = GrokPromptText(content);
+        const bool pictures = content.is_array() && std::ranges::any_of(content, [](const Json& block) {
+            return JsonStr(block, "type") == "image";
+        });
+        if (pictures) {
+            words += (words.empty() ? L"" : L"\n\n") + std::wstring(L"📎 фото");
+        }
+        return PromptTitle(words);
+    }
+    return std::nullopt;
+}
+
+struct CachedGrokTitle {
+    uint64_t modified = 0;
+    uint64_t size = 0;
+    std::optional<std::wstring> title;
+};
+
+// UI thread only.
+std::optional<std::wstring> GrokTitle(const fs::path& history, const WIN32_FILE_ATTRIBUTE_DATA& data) {
+    static std::map<std::wstring, CachedGrokTitle> cache;
+    const uint64_t modified = ToTicks(data.ftLastWriteTime);
+    const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    CachedGrokTitle& entry = cache[history.wstring()];
+    if (entry.modified != modified || entry.size != size) {
+        entry = {modified, size, ReadGrokTitle(history)};
+    }
+    return entry.title;
+}
+
+// The title given in the sidebar, if one was.
+std::wstring GrokOwnTitle(const fs::path& folder) {
+    std::ifstream in(folder / kGrokTitle, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    return ToWide(text);
+}
+
+std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& history) {
+    std::vector<TranscriptEntry> entries;
+    std::ifstream in(history, std::ios::binary);
+    std::string line;
+    while (std::getline(in, line)) {
+        const Json entry = Json::parse(line, nullptr, false);
+        const std::string type = JsonStr(entry, "type");
+        if (type == "user" && IsGrokPrompt(entry)) {
+            const Json& content = JsonAt(entry, "content");
+            TranscriptEntry said{EntryKind::User, GrokPromptText(content), GrokPromptImages(content)};
+            if (!said.text.empty() || !said.images.empty()) {
+                entries.push_back(std::move(said));
+            }
+        } else if (type == "assistant") {
+            if (std::wstring text = ToWide(JsonStr(entry, "content")); !text.empty()) {
+                entries.push_back({EntryKind::Assistant, std::move(text)});
+            }
+            const Json& calls = JsonAt(entry, "tool_calls");
+            if (!calls.is_array()) {
+                continue;
+            }
+            for (const Json& call : calls) {
+                std::string name = JsonStr(call, "name");
+                if (name == "search_tool") {
+                    continue;  // Grok looking up our tools' descriptions: nothing was done
+                }
+                Json input = Json::parse(JsonStr(call, "arguments"), nullptr, false);
+                if (name == "use_tool" && JsonAt(input, "tool_input").is_object()) {
+                    name = "mcp__" + JsonStr(input, "tool_name");  // as it comes live: aic__read_file -> mcp__aic__read_file
+                    Json inner = JsonAt(input, "tool_input");
+                    input = std::move(inner);
+                }
+                TranscriptEntry tool{EntryKind::Tool, ToWide(name)};
+                tool.toolId = JsonStr(call, "id");
+                if (!input.is_discarded()) {
+                    tool.toolInput = input.dump(-1, ' ', false, Json::error_handler_t::replace);
+                }
+                entries.push_back(std::move(tool));
+            }
+        } else if (type == "tool_result") {
+            const std::string id = JsonStr(entry, "tool_call_id");
+            for (auto call = entries.rbegin(); call != entries.rend(); ++call) {
+                if (call->kind != EntryKind::Tool || call->toolId != id) {
+                    continue;
+                }
+                std::wstring output = ToWide(JsonStr(entry, "content"));
+                const size_t end = output.find_last_not_of(L" \t\r\n");
+                output.resize(end == std::wstring::npos ? 0 : end + 1);
+                call->toolOutput = std::move(output);
+                call->toolAnswered = true;
+                break;
+            }
+        }
+    }
+    return entries;
+}
+
 fs::path SettingsFile() {
     return fs::path(KnownFolder(FOLDERID_RoamingAppData)) / L"AIControls" / L"settings.json";
 }
@@ -243,6 +484,26 @@ std::vector<SessionInfo> ListSessions(const std::wstring& workspace) {
         session.modified = data.ftLastWriteTime;
         sessions.push_back(std::move(session));
     }
+    for (const fs::directory_entry& item : fs::directory_iterator(GrokProjectDir(workspace), error)) {
+        const fs::path history = item.path() / kGrokHistory;
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (!item.is_directory(error) || !GetFileAttributesExW(history.c_str(), GetFileExInfoStandard, &data)) {
+            continue;
+        }
+        const std::optional<std::wstring> prompt = GrokTitle(history, data);
+        if (!prompt) {
+            continue;
+        }
+        SessionInfo session;
+        session.id = ToUtf8(item.path().filename().wstring());
+        session.title = GrokOwnTitle(item.path());
+        if (session.title.empty()) {
+            session.title = *prompt;
+        }
+        session.modified = data.ftLastWriteTime;
+        session.grok = true;
+        sessions.push_back(std::move(session));
+    }
     std::ranges::sort(sessions, [](const SessionInfo& a, const SessionInfo& b) {
         return ToTicks(a.modified) > ToTicks(b.modified);
     });
@@ -255,9 +516,10 @@ bool DeleteSession(const std::wstring& workspace, const std::string& id) {
     }
     const fs::path file = SessionFile(workspace, id);
     const fs::path folder = ProjectDir(workspace) / ToWide(id);
+    const fs::path grok = GrokSessionDir(workspace, id);
     std::error_code error;
     std::wstring paths;  // SHFileOperation's list: each path ends in \0, the list in one more
-    for (const fs::path& path : {file, folder}) {
+    for (const fs::path& path : {file, folder, grok}) {
         if (fs::exists(path, error)) {
             paths += path.wstring();
             paths += L'\0';
@@ -271,7 +533,8 @@ bool DeleteSession(const std::wstring& workspace, const std::string& id) {
     operation.wFunc = FO_DELETE;
     operation.pFrom = paths.c_str();
     operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
-    return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted && !fs::exists(file, error);
+    return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted && !fs::exists(file, error) &&
+           !fs::exists(grok, error);
 }
 
 bool MoveSession(const std::wstring& from, const std::wstring& to, const std::string& id) {
@@ -304,7 +567,14 @@ bool RenameSession(const std::wstring& workspace, const std::string& id, const s
     const fs::path file = SessionFile(workspace, id);
     std::error_code error;
     if (!fs::exists(file, error)) {
-        return false;
+        const fs::path grok = GrokSessionDir(workspace, id);
+        if (!fs::exists(grok / kGrokHistory, error)) {
+            return false;
+        }
+        const std::string text = ToUtf8(title);
+        std::ofstream out(grok / kGrokTitle, std::ios::binary | std::ios::trunc);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        return out.good();
     }
     std::string line = Json{{"type", "custom-title"}, {"customTitle", ToUtf8(title)}, {"sessionId", id}}.dump(
         -1, ' ', false, Json::error_handler_t::replace);
@@ -317,10 +587,19 @@ bool RenameSession(const std::wstring& workspace, const std::string& id, const s
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id) {
     const fs::path file = SessionFile(workspace, id);
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data)) {
+    if (GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data)) {
+        return CachedReadTitle(file, data);
+    }
+    const fs::path grok = GrokSessionDir(workspace, id);
+    if (grok.empty() || !GetFileAttributesExW((grok / kGrokHistory).c_str(), GetFileExInfoStandard, &data)) {
         return {};
     }
-    return CachedReadTitle(file, data);
+    std::wstring title = GrokOwnTitle(grok);
+    return !title.empty() ? title : GrokTitle(grok / kGrokHistory, data).value_or(std::wstring());
+}
+
+std::wstring GrokHistoryFolder(const std::wstring& workspace) {
+    return GrokProjectDir(workspace).wstring();
 }
 
 std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
@@ -330,7 +609,10 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
     std::error_code error;
     const uint64_t size = fs::file_size(file, error);
     if (error) {
-        truncated = false;
+        if (const fs::path grok = GrokSessionDir(workspace, id); !grok.empty()) {
+            entries = LoadGrokTranscript(grok / kGrokHistory);
+        }
+        KeepLatest(entries, limit, truncated);
         return entries;
     }
     std::string lastAssistant;  // one API message arrives as a line per content block
@@ -421,10 +703,7 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
             }
         }
     });
-    truncated = entries.size() > limit;
-    if (truncated) {
-        entries.erase(entries.begin(), entries.end() - static_cast<std::ptrdiff_t>(limit));
-    }
+    KeepLatest(entries, limit, truncated);
     return entries;
 }
 
@@ -502,6 +781,7 @@ Settings LoadSettings() {
     settings.effort = JsonStr(data, "effort");
     settings.permissions = JsonStr(data, "permissions");
     settings.claudeModels = JsonStr(data, "claudeModels");
+    settings.claudeModel = JsonStr(data, "claudeModel");
     settings.connectors = JsonAt(data, "connectors").is_boolean() && JsonAt(data, "connectors").get<bool>();
     settings.grokFast = JsonAt(data, "grokFast").is_boolean() && JsonAt(data, "grokFast").get<bool>();
     const auto number = [&](const char* key, long long fallback) {
@@ -568,8 +848,9 @@ void SaveSettings(const Settings& settings) {
                 {"effort", settings.effort},
                 {"permissions", settings.permissions},
                 {"claudeModels", settings.claudeModels},
+                {"claudeModel", settings.claudeModel},
                 {"connectors", settings.connectors},
-        {"grokFast", settings.grokFast},
+                {"grokFast", settings.grokFast},
                 {"sessionPercent", settings.sessionPercent},
                 {"sessionResets", settings.sessionResets},
                 {"weekPercent", settings.weekPercent},

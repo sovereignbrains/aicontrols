@@ -905,6 +905,7 @@ private:
     // Grok's models are all "grok-…"; choosing one moves the chat to grok.exe, any other to claude.exe.
     bool GrokSelected() const { return settings_.model.starts_with("grok-"); }
     bool GrokRunning() const { return runner_->agent == &runner_->grok; }  // the CLI the chat runs on now
+    std::string GrokModel() const;  // the Grok row's model as the menu would pick it
     std::wstring AgentName() const {  // who answers, in the words
         return (running_ ? GrokRunning() : GrokSelected()) ? L"Grok" : L"Claude";
     }
@@ -7003,7 +7004,9 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
     constexpr UINT kMoveTo = 100;  // + an index into projects_
     AppendMenuW(menu.get(), MF_STRING, 1, L"Открыть");
     AppendMenuW(menu.get(), MF_STRING, 3, L"Переименовать");
-    {  // to another project: the chat goes on there
+    if (session.grok) {  // grok.exe keeps its chats by folder: one moved elsewhere is not known to go on
+        AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 0, L"Перенести в проект (у Grok пока нет)");
+    } else {  // to another project: the chat goes on there
         wil::unique_hmenu projects(CreatePopupMenu());
         for (size_t i = 0; i < projects_.size(); ++i) {
             if (projects_[i].folder != folder) {
@@ -8859,11 +8862,11 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
                 }
             }
             break;
-        case EntryKind::Assistant: {  // the history is Claude's transcript, without the models
+        case EntryKind::Assistant: {  // the history keeps no models: the CLI's name only
             const bool first = !TurnWho().empty();
             Add(Kind::Assistant, entry.text);
             if (first) {
-                feed_.back().who = L"Claude";
+                feed_.back().who = session.grok ? L"Grok" : L"Claude";
             }
             break;
         }
@@ -8895,10 +8898,32 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
         }
         }
     }
+    if (session.grok != GrokSelected()) {  // only the CLI that keeps the chat can go on with it
+        if (!GrokSelected()) {
+            settings_.claudeModel = settings_.model;
+        }
+        settings_.model = session.grok ? GrokModel() : settings_.claudeModel;
+        bool supported = false;
+        if (const Json* model = CurrentModel(); model != nullptr) {
+            for (const Json& level : JsonAt(*model, "supportedEffortLevels")) {
+                supported = supported || (level.is_string() && level.get<std::string>() == settings_.effort);
+            }
+        }
+        if (!supported) {
+            settings_.effort.clear();
+        }
+        SaveSettings(settings_);
+        PlaceChildren();
+    }
     sessionId_ = session.id;
     title_ = session.title;
     StartClaude();
     RebuildRows();  // no new chat under the project any more
+}
+
+std::string ChatWindow::GrokModel() const {
+    const size_t index = settings_.grokFast && grokFast_ != std::string::npos ? grokFast_ : grokBase_;
+    return index < models_.size() ? JsonStr(models_[index], "value") : "grok-4.7";
 }
 
 // The menu shows the newest models only (27.10.2026, his: are the old ones of any use?). Claude's CLI lists
@@ -9086,7 +9111,9 @@ void ChatWindow::Apply(const Settings& next) {
         return;
     }
     const bool otherCli = next.model.starts_with("grok-") != GrokSelected();
+    const std::string claude = GrokSelected() ? settings_.claudeModel : settings_.model;
     settings_ = next;
+    settings_.claudeModel = GrokSelected() ? claude : settings_.model;  // the way back from a Grok chat
     SaveSettings(settings_);
     PlaceChildren();
     if (otherCli && !HasConversation()) {
@@ -9534,7 +9561,7 @@ void ChatWindow::OnClaude(const Json& message) {
                 Add(Kind::Error, wide);
             }
         }
-        if (!sessionId_.empty() && !GrokRunning()) {  // Grok keeps no transcript the history could list
+        if (!sessionId_.empty()) {
             if (std::wstring title = SessionTitle(workspace_, sessionId_); !title.empty()) {
                 title_ = std::move(title);
             }

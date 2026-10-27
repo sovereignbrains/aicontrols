@@ -7,11 +7,13 @@
 
 namespace aic {
 
-// A chat as claude.exe keeps it: ~\.claude\projects\<workspace>\<id>.jsonl.
+// A chat as claude.exe keeps it: ~\.claude\projects\<workspace>\<id>.jsonl; or as grok.exe does:
+// ~\.grok\sessions\<workspace, %-encoded>\<id>\chat_history.jsonl.
 struct SessionInfo {
     std::string id;
     std::wstring title;  // the CLI's own title (custom, else the generated one); may be empty
     FILETIME modified{};
+    bool grok = false;  // Grok's: only grok.exe can go on with it
 };
 
 enum class EntryKind { User, Assistant, Tool, Compacted };  // Compacted: the CLI summed up what came before
@@ -80,6 +82,9 @@ struct Settings {
     std::vector<std::wstring> closedProjects;
     // Which of those orders the sidebar shows. The list above stays the added order, so "added" can come back.
     ProjectOrder projectOrder = ProjectOrder::Recent;
+    // The Claude model before the last move to Grok: a Claude chat opened from the history goes on in it.
+    // Empty: the CLI's default.
+    std::string claudeModel;
     // A chat to open again at the next start (set by an update, which restarts the client); cleared once opened.
     std::string reopen;
 };
@@ -94,15 +99,21 @@ std::wstring MemoryFolder(const std::wstring& workspace);
 // workspace's, which is kept in its own repository.
 std::wstring SharedMemoryFolder();
 
-std::vector<SessionInfo> ListSessions(const std::wstring& workspace);  // newest first
+// Where grok.exe keeps a workspace's chats, a folder each: the one there, else the one it would make.
+std::wstring GrokHistoryFolder(const std::wstring& workspace);
+
+// Claude's chats and Grok's, newest first. A Grok session nothing was said in is left out: each start opens one.
+std::vector<SessionInfo> ListSessions(const std::wstring& workspace);
 std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);
-// Moves a chat to the Recycle Bin: its transcript and the folder the CLI keeps beside it. False if it could not.
+// Moves a chat to the Recycle Bin: its transcript and the folder the CLI keeps beside it (Grok's: its folder).
+// False if it could not.
 bool DeleteSession(const std::wstring& workspace, const std::string& id);
 // Moves a chat to another project: its transcript and its folder go to that workspace's history, where the CLI
 // resumes it (checked 22.10.2026: the whole conversation comes back). False if it could not; nothing is lost then.
+// Grok's chats are not moved (false): grok.exe keeps them by folder, and its resume elsewhere is not checked.
 bool MoveSession(const std::wstring& from, const std::wstring& to, const std::string& id);
 // Gives a chat its own title the way the CLI's /rename does: a custom-title entry appended to its file
-// (the newest one wins, over the generated title too).
+// (the newest one wins, over the generated title too). Grok's: a file of ours in its folder, its own left as they are.
 bool RenameSession(const std::wstring& workspace, const std::string& id, const std::wstring& title);
 // The last `limit` entries of a chat, for showing it again before it is resumed.
 std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,

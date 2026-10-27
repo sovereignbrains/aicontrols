@@ -130,15 +130,12 @@ constexpr UINT kUpdateCheck = 30'000;  // ms
 constexpr UINT_PTR kVoiceTimer = 8;    // while recording: the seconds and the pulse move
 constexpr UINT_PTR kUsageTimer = 7;    // the plan's limits asked again
 constexpr UINT kUsageCheck = 60'000;   // ms
-// The mascot puffs up and back: in rhythm while Claude answers, now and then while idle. The window is drawn
-// again only during a puff.
+// The mascot, in the status line while the agent answers, puffs up and back in rhythm. The window is drawn again
+// only during a puff.
 constexpr UINT_PTR kPuffTimer = 5;       // a frame of a puff
-constexpr UINT_PTR kPuffIdleTimer = 6;   // the next puff while idle
 constexpr UINT kPuffFrame = 33;          // ms
-constexpr UINT kPuffIdle = 7'000;        // ms between puffs while idle
 constexpr float kPuffSeconds = 1.2f;     // one puff, up and back
-constexpr float kPuffBusy = 0.18f;       // how much bigger at its fullest, while answering
-constexpr float kPuffCalm = 0.10f;       // ... and while idle
+constexpr float kPuff = 0.18f;           // how much bigger at its fullest
 // The middle button's scrolling, as browsers have it: a frame of it, the still zone round where it was pressed,
 // and held this long (or moved) it ends on release.
 constexpr UINT_PTR kPanTimer = 9;
@@ -240,6 +237,7 @@ constexpr float kCardPad = 12.f;
 constexpr float kCardTitle = 22.f;
 constexpr float kCardButton = 30.f;
 constexpr float kCardButtonWidth = 112.f;
+constexpr float kCardSmallButton = 66.f;  // "open" and "in folder" of a card that wrote a file
 constexpr float kStatusRow = 24.f;  // under the last message: what Claude is doing
 constexpr float kTipPadX = 8.f;  // a hint's text inside its box
 constexpr float kTipPadY = 4.f;
@@ -524,6 +522,7 @@ struct Hit {
     Target target = Target::None;
     size_t row = 0;
     size_t sub = 0;
+    bool card = false;  // None on a card with file buttons (row: it): they show while the pointer is there
     bool operator==(const Hit&) const = default;
 };
 
@@ -1339,6 +1338,7 @@ private:
     wil::com_ptr<IDWriteTextFormat> small_;  // wrapping, left-aligned notes
     wil::com_ptr<IDWriteTextFormat> mono_;
     wil::com_ptr<IDWriteTextFormat> button_;
+    wil::com_ptr<IDWriteTextFormat> cardButton_;  // the small ones of a card that wrote a file
 
     std::vector<FeedItem> feed_;
     float scroll_ = 0;
@@ -1357,7 +1357,7 @@ private:
     size_t viewerImage_ = 0;
     bool viewerAttachment_ = false;  // one of the attachments over the input, not a picture of the feed
     FeedImage viewer_;
-    FeedImage mascot_;  // sits on the input box, as the one in Claude's app
+    FeedImage mascot_;  // in the status line while the agent answers, where a dot was
     bool puffing_ = false;
     std::chrono::steady_clock::time_point puffStart_{};
     Hit hover_;
@@ -1505,6 +1505,7 @@ int ChatWindow::Run(int show) {
     small_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     mono_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     button_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+    cardButton_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, true);
     termFont_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     termBold_ = MakeFormat(kMonoFont, 12.5f, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     cellW_ = TextWidth(L"MMMMMMMMMM", termFont_.get()) / 10.f;
@@ -1558,7 +1559,6 @@ int ChatWindow::Run(int show) {
     }
     CheckAppUpdate();
     SetTimer(hwnd_, kUpdateTimer, kUpdateCheck, nullptr);
-    SetTimer(hwnd_, kPuffIdleTimer, kPuffIdle, nullptr);
     FetchUsage();  // the ring is right before the first message, not only after it
     SetTimer(hwnd_, kUsageTimer, kUsageCheck, nullptr);
 
@@ -2256,8 +2256,6 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             CheckAppUpdate();
         } else if (wParam == kPuffTimer) {
             OnPuffFrame();
-        } else if (wParam == kPuffIdleTimer) {
-            StartPuff();
         } else if (wParam == kPanTimer) {
             PanStep();
         } else if (wParam == kParkedTimer) {
@@ -3135,6 +3133,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 if (Inside(reveal, x, y)) {
                     return {Target::CardReveal, i};
                 }
+                if (x >= g.left && x < g.left + g.column) {
+                    return {Target::None, i, 0, true};
+                }
             }
             if (item.kind != Kind::Approval || item.verdict != Verdict::Pending) {
                 continue;
@@ -3540,17 +3541,30 @@ void ChatWindow::PaintFeed(const Geometry& g) {
     }
     if (const std::wstring line = StatusLine(); !line.empty()) {  // under the last message, dots running while busy
         std::wstring shown = line;
-        if (busy_ || recorder_.Recording() || transcribing_) {
-            const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
-                                   .count();
+        const bool moving = busy_ || recorder_.Recording() || transcribing_;
+        const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        if (moving) {
             shown += std::wstring(static_cast<size_t>(ticks / 400 % 4), L'.');
+        }
+        float textLeft = left;
+        if (ID2D1Bitmap* mascot = Bitmap(mascot_); busy_ && mascot != nullptr) {  // the mascot puffs while it answers
+            constexpr float kMascot = 20.f;
+            const float size = kMascot * PuffScale();
+            const D2D1_POINT_2F middle{left + kMascot / 2, y + kStatusRow / 2};
+            target_->DrawBitmap(mascot, D2D1::RectF(middle.x - size / 2, middle.y - size / 2, middle.x + size / 2,
+                                                    middle.y + size / 2),
+                                1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            textLeft = left + kMascot + 8.f;
+        } else if (moving) {
             const D2D1_POINT_2F dot{left + 5.f, y + kStatusRow / 2};
             const float pulse = 0.55f + 0.45f * std::sin(static_cast<float>(ticks % 1200) / 1200.f * 2.f * std::numbers::pi_v<float>);
             brush_->SetColor(Color(kAccent, pulse));
             target_->FillEllipse(D2D1::Ellipse(dot, 4.f, 4.f), brush_.get());
+            textLeft = left + 18.f;
         }
-        Text(shown, ui_.get(), D2D1::RectF(left + (busy_ || recorder_.Recording() || transcribing_ ? 18.f : 0.f), y, left + g.column, y + kStatusRow), kSecondary);
+        Text(shown, ui_.get(), D2D1::RectF(textLeft, y, left + g.column, y + kStatusRow), kSecondary);
     }
     PaintBar(g, Scroller::Feed);
     target_->PopAxisAlignedClip();
@@ -3648,7 +3662,7 @@ float ChatWindow::ApprovalHeight(const FeedItem& item) {
     }
     DWRITE_TEXT_METRICS metrics{};
     item.layout->GetMetrics(&metrics);
-    const float buttons = item.verdict == Verdict::Pending || HasFileActions(item) ? kCardPad + kCardButton : 0.f;
+    const float buttons = item.verdict == Verdict::Pending ? kCardPad + kCardButton : 0.f;
     return kCardPad + kCardTitle + 4.f + metrics.height + buttons + kCardPad;
 }
 
@@ -3659,20 +3673,16 @@ void ChatWindow::ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_R
     deny = D2D1::RectF(allow.right + 8.f, allow.top, allow.right + 8.f + kCardButtonWidth, bottom);
 }
 
+// Small, in the title row's right end where "done" is; drawn only while the pointer is on the card.
 void ChatWindow::ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& preview, D2D1_RECT_F& open,
                                      D2D1_RECT_F& reveal) {
-    D2D1_RECT_F first{}, second{};
-    ApprovalButtons(g, item, first, second);  // where "allow" and "deny" were
-    if (!IsPreviewable(ToWide(JsonStr(item.input, "path")))) {
-        preview = {};
-        open = first;
-        reveal = second;
-        return;
-    }
-    const float step = second.left - first.left;
-    preview = first;
-    open = second;
-    reveal = D2D1::RectF(second.left + step, second.top, second.right + step, second.bottom);
+    const float top = item.top + kCardPad;
+    const float right = g.left + g.column - kCardPad + 4.f;
+    reveal = D2D1::RectF(right - kCardSmallButton, top, right, top + kCardTitle);
+    open = D2D1::RectF(reveal.left - 4.f - kCardSmallButton, top, reveal.left - 4.f, top + kCardTitle);
+    preview = IsPreviewable(ToWide(JsonStr(item.input, "path")))
+                  ? D2D1::RectF(open.left - 4.f - kCardSmallButton, top, open.left - 4.f, top + kCardTitle)
+                  : D2D1_RECT_F{};
 }
 
 void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float left) {
@@ -3684,8 +3694,18 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
 
     const float inner = left + kCardPad;
     const float top = item.top + kCardPad;
-    Text(item.title, uiBold_.get(), D2D1::RectF(inner, top, card.right - kCardPad - 110.f, top + kCardTitle), kPrimary);
-    if (!pending) {
+    const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
+    const bool fileButtons = onItem && HasFileActions(item) &&
+                             (hover_.card || hover_.target == Target::CardPreview || hover_.target == Target::CardOpen ||
+                              hover_.target == Target::CardReveal);
+    D2D1_RECT_F preview{}, open{}, reveal{};
+    if (fileButtons) {
+        ApprovalFileButtons(g, item, preview, open, reveal);
+    }
+    const float titleRight = fileButtons ? (preview.right > preview.left ? preview.left : open.left) - 8.f
+                                         : card.right - kCardPad - 110.f;
+    Text(item.title, uiBold_.get(), D2D1::RectF(inner, top, titleRight, top + kCardTitle), kPrimary);
+    if (!pending && !fileButtons) {
         std::wstring label;
         uint32_t labelColor = kDanger;
         if (item.verdict == Verdict::Allowed) {
@@ -3709,23 +3729,21 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
     if (pending) {
         D2D1_RECT_F allow{}, deny{};
         ApprovalButtons(g, item, allow, deny);
-        const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
         Fill(allow, 7.f, kAccent, onItem && hover_.target == Target::ApprovalAllow ? 0.85f : 1.f);
         Text(L"Разрешить", button_.get(), allow, kPrimary);
         Fill(deny, 7.f, onItem && hover_.target == Target::ApprovalDeny ? kLine : kRaised);
         Text(L"Отклонить", button_.get(), deny, kPrimary);
-    } else if (HasFileActions(item)) {
-        D2D1_RECT_F preview{}, open{}, reveal{};
-        ApprovalFileButtons(g, item, preview, open, reveal);
-        const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
+    } else if (fileButtons) {
+        const auto chip = [&](const D2D1_RECT_F& rect, const wchar_t* label, Target target) {
+            const bool hot = hover_.target == target;
+            Fill(rect, 6.f, hot ? kLine : kRaised);
+            Text(label, cardButton_.get(), rect, hot ? kPrimary : kSecondary);
+        };
         if (preview.right > preview.left) {
-            Fill(preview, 7.f, kAccent, onItem && hover_.target == Target::CardPreview ? 0.85f : 1.f);
-            Text(L"Превью", button_.get(), preview, kPrimary);
+            chip(preview, L"Превью", Target::CardPreview);
         }
-        Fill(open, 7.f, onItem && hover_.target == Target::CardOpen ? kLine : kRaised);
-        Text(L"Открыть", button_.get(), open, kPrimary);
-        Fill(reveal, 7.f, onItem && hover_.target == Target::CardReveal ? kLine : kRaised);
-        Text(L"В папке", button_.get(), reveal, kPrimary);
+        chip(open, L"Открыть", Target::CardOpen);
+        chip(reveal, L"В папке", Target::CardReveal);
     }
 }
 
@@ -3854,13 +3872,6 @@ void ChatWindow::PaintInput(const Geometry& g) {
     Fill(g.box, 12.f, kCard);
     brush_->SetColor(Color(inputFocused_ ? 0x45454c : kLine));  // focus: a lighter grey edge, not the accent
     target_->DrawRoundedRectangle(D2D1::RoundedRect(g.box, 12.f, 12.f), brush_.get(), 1.f);
-    if (ID2D1Bitmap* mascot = Bitmap(mascot_); mascot != nullptr && g.box.right - g.box.left > 200.f) {
-        constexpr float kMascot = 32.f;  // on the box's top edge, near its right end; a puff grows it from there
-        const float size = kMascot * PuffScale();
-        const float middle = g.box.right - 24.f - kMascot / 2;
-        const D2D1_RECT_F at = D2D1::RectF(middle - size / 2, g.box.top + 3.f - size, middle + size / 2, g.box.top + 3.f);
-        target_->DrawBitmap(mascot, at, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-    }
 
     PaintAttachments(g);
     {  // "+": attach files or photos
@@ -7619,7 +7630,6 @@ void ChatWindow::StartPuff() {
     if (puffing_ || !mascot_.preview) {
         return;
     }
-    KillTimer(hwnd_, kPuffIdleTimer);
     puffing_ = true;
     puffStart_ = std::chrono::steady_clock::now();
     SetTimer(hwnd_, kPuffTimer, kPuffFrame, nullptr);
@@ -7633,20 +7643,19 @@ void ChatWindow::OnPuffFrame() {
         } else {
             puffing_ = false;
             KillTimer(hwnd_, kPuffTimer);
-            SetTimer(hwnd_, kPuffIdleTimer, kPuffIdle, nullptr);
         }
     }
     Refresh();
 }
 
-// 1 at rest; up to 1 + kPuffBusy (or kPuffCalm) halfway through a puff, eased in and out.
+// 1 at rest; up to 1 + kPuff halfway through a puff, eased in and out.
 float ChatWindow::PuffScale() const {
     if (!puffing_) {
         return 1.f;
     }
     const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - puffStart_).count() / kPuffSeconds;
     const float wave = std::sin(std::numbers::pi_v<float> * std::clamp(t, 0.f, 1.f));
-    return 1.f + (busy_ ? kPuffBusy : kPuffCalm) * wave * wave;
+    return 1.f + kPuff * wave * wave;
 }
 
 void ChatWindow::CheckAppUpdate() {

@@ -184,7 +184,7 @@ std::wstring TextOf(const Json& content, bool images) {
         for (const Json& block : content) {
             const std::string type = JsonStr(block, "type");
             std::wstring part;
-            if (type == "text") {
+            if (type == "text" && !JsonStr(block, "text").starts_with("<earlier_chat>")) {  // a switch's handoff
                 part = ToWide(JsonStr(block, "text"));
             } else if (type == "image" && images) {
                 part = L"📎 фото";

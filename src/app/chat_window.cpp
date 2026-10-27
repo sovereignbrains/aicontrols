@@ -27,6 +27,7 @@
 #include <exception>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <ctime>
 #include <memory>
 #include <numbers>
@@ -889,6 +890,7 @@ private:
     bool SignedOut() const { return auth_.known && !auth_.loggedIn && !GrokSelected(); }
     // Grok's models are all "grok-…"; choosing one moves the chat to grok.exe, any other to claude.exe.
     bool GrokSelected() const { return settings_.model.starts_with("grok-"); }
+    std::wstring AgentName() const { return GrokSelected() ? L"Grok" : L"Claude"; }  // who answers, in the words
     void MergeModels();
     void RefreshAuth();
     void SignIn();
@@ -1025,6 +1027,7 @@ private:
     void RemoveProject(const std::wstring& folder);
     static std::wstring ProjectName(const std::wstring& folder);
     std::string ProjectPrompt() const;  // tells Claude which project the chat is about
+    std::string MemoryPrompt() const;   // Grok: the shared memory, which Claude's CLI reads itself
 
     // Scrollbars: every list's thumb is taken and dragged (a press beside it brings it there), and the middle
     // button scrolls whichever list it went down on.
@@ -1323,6 +1326,7 @@ private:
     ClaudeProcess claude_;
     GrokProcess grok_;
     AgentProcess* agent_ = &claude_;  // the one the chat runs on: Grok when a Grok model is chosen
+    std::string handoff_;  // the chat so far, for the other CLI's first message after a switch to it
     // Declared after the processes: the tool threads answer through them, so they are joined first.
     SecretStore secrets_{SecretStore::DefaultPath()};
     Tools tools_{secrets_, {}};
@@ -3289,7 +3293,7 @@ std::wstring ChatWindow::StatusLine() const {
             }
             break;
         }
-        return status_.empty() ? L"Claude отвечает" : status_;
+        return status_.empty() ? AgentName() + L" отвечает" : status_;
     }
     return status_;
 }
@@ -5431,7 +5435,8 @@ void ChatWindow::SwitchWorkspace(const std::wstring& folder) {
     if (folder.empty() || folder == workspace_) {
         return;
     }
-    if (busy_ && MessageBoxW(hwnd_, L"Claude сейчас отвечает. Перейти в другой проект и начать новый чат?", L"AIControls",
+    const std::wstring question = AgentName() + L" сейчас отвечает. Перейти в другой проект и начать новый чат?";
+    if (busy_ && MessageBoxW(hwnd_, question.c_str(), L"AIControls",
                              MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
@@ -5903,6 +5908,25 @@ std::string ChatWindow::ProjectPrompt() const {
            "), which is also its working directory: a bug, a task or a change the user mentions is about this "
            "project unless they name another. Your memory is shared by all the user's projects: before working, "
            "read this project's note if the memory index has one.";
+}
+
+// Claude's CLI loads the shared memory's index itself (autoMemoryDirectory); Grok gets it here, and the same
+// rules, so the two agents know one user (28.10.2026, his: do something about the memory).
+std::string ChatWindow::MemoryPrompt() const {
+    const std::filesystem::path folder = SharedMemoryFolder();
+    std::ifstream in(folder / L"MEMORY.md", std::ios::binary);
+    const std::string index((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return "\n\n# Memory\nYou share a persistent memory with Claude, the other assistant of this client: the folder " +
+           ToUtf8(folder.wstring()) +
+           ". Use it, not a memory of your own. Each memory is one Markdown file holding one fact, with frontmatter "
+           "(name: a kebab-case slug, description: one line, metadata: type: user | feedback | project | "
+           "reference); feedback and project notes go on with **Why:** and **How to apply:** lines. MEMORY.md is "
+           "the index, one line per memory: - [Title](file.md) — hook. Read the notes that bear on the task with "
+           "read_file before working. When you learn something worth keeping across chats (who the user is, how "
+           "they want the work done, a project's state or constraint, with dates made absolute), update the note "
+           "that covers it or write a new one with write_file, and add its line to MEMORY.md. Do not save what the "
+           "code or git already records or what matters to this chat only. The index now:\n" +
+           (index.empty() ? std::string("(empty)") : index);
 }
 
 void ChatWindow::ToggleProject(size_t row) {
@@ -6711,7 +6735,7 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
 void ChatWindow::MoveChat(std::wstring from, SessionInfo session, std::wstring to) {
     const bool current = session.id == sessionId_ && from == workspace_;
     if (current && busy_ &&
-        MessageBoxW(hwnd_, L"Claude сейчас отвечает. Остановить и перенести чат?", L"AIControls",
+        MessageBoxW(hwnd_, (AgentName() + L" сейчас отвечает. Остановить и перенести чат?").c_str(), L"AIControls",
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
@@ -7537,7 +7561,7 @@ std::wstring ChatWindow::TooltipText() {
     case Target::FolderChip:
         return L"Папка чата: " + workspace_;
     case Target::ComputerChip:
-        return L"Claude работает здесь: " + workspace_;
+        return AgentName() + L" работает здесь: " + workspace_;
     case Target::Account:
         return ClaudeUpdateAvailable() ? L"Аккаунт · вышел Claude " + ToWide(claudeLatest_)
                                        : std::wstring(L"Аккаунт, версия Claude, выход");
@@ -7577,7 +7601,7 @@ std::wstring ChatWindow::TooltipText() {
     case Target::ModelChip:
         return L"Модель";
     case Target::EffortChip:
-        return L"Усилие: насколько глубоко Claude думает";
+        return L"Усилие: насколько глубоко " + AgentName() + L" думает";
     case Target::UsageChip:
         return L"Лимиты использования";
     case Target::Secrets:
@@ -7594,7 +7618,7 @@ std::wstring ChatWindow::TooltipText() {
         if (busy_ && !hasContent()) {
             return L"Остановить ответ (Esc)";
         }
-        return busy_ ? L"Отправить сейчас: Claude учтёт по ходу (Enter)" : L"Отправить (Enter)";
+        return busy_ ? L"Отправить сейчас: " + AgentName() + L" учтёт по ходу (Enter)" : L"Отправить (Enter)";
     case Target::HistoryRow: {  // the whole title, when the row cuts it
         const SessionInfo* session = RowSession(hover_.row);
         if (session == nullptr) {
@@ -8487,10 +8511,45 @@ void ChatWindow::Apply(const Settings& next) {
     settings_ = next;
     SaveSettings(settings_);
     PlaceChildren();
-    if (otherCli) {  // a conversation is the CLI's own: the chat goes on in a new one, the old stays in the history
+    if (otherCli && !HasConversation()) {
         ResetChat();
         StartClaude();
-        Flash(GrokSelected() ? L"Новый чат на Grok" : L"Новый чат на Claude", 3000);
+        Flash(L"Дальше отвечает " + AgentName(), 3000);
+        return;
+    }
+    if (otherCli) {
+        // A conversation is the CLI's own: the other one starts its own, and the chat so far goes with the first
+        // message (28.10.2026, his: a switch opened a new chat). The words stay in the feed.
+        const std::wstring before = GrokSelected() ? L"Claude" : L"Grok";
+        std::wstring said;
+        for (const FeedItem& item : feed_) {
+            if (item.kind == Kind::User || item.kind == Kind::Assistant) {
+                said += (item.kind == Kind::User ? L"\n\nUser: " : L"\n\n" + before + L": ") + item.text;
+            }
+        }
+        constexpr size_t kLongest = 80'000;  // the latest of a long chat
+        if (said.size() > kLongest) {
+            said = L"…" + said.substr(said.size() - kLongest);
+        }
+        handoff_ = "<earlier_chat>\nThis chat began with " + ToUtf8(before) +
+                   ", another assistant of this client; the user switched it to you. What was said so far:" +
+                   ToUtf8(said) + "\n</earlier_chat>";
+        ++generation_;
+        host_.CancelAll();
+        for (FeedItem& item : feed_) {  // the process that asked is gone
+            if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
+                item.verdict = Verdict::Cancelled;
+            }
+        }
+        agent_->Stop();
+        running_ = false;
+        busy_ = false;
+        sessionId_.clear();
+        lastContext_ = 0;
+        currentMessageId_.clear();
+        streamed_.clear();
+        StartClaude();
+        Add(Kind::Notice, L"Дальше отвечает " + AgentName() + L": переписку выше он получит с вашим сообщением");
         return;
     }
     Restart();  // the same conversation goes on with the new model
@@ -8550,6 +8609,7 @@ bool ChatWindow::StartClaude() {
             options.settings.clear();
             options.connectors = false;
             options.autocompact.clear();
+            options.appendSystemPrompt += MemoryPrompt();
             options.model = settings_.model;
             agent_ = &grok_;
             grok_.Start(options, onMessage, onExit);
@@ -8588,6 +8648,7 @@ void ChatWindow::ResetChat() {
     running_ = false;
     busy_ = false;
     sessionId_.clear();
+    handoff_.clear();
     title_.clear();
     lastContext_ = 0;
     currentMessageId_.clear();
@@ -8643,6 +8704,9 @@ void ChatWindow::Submit() {
         content.push_back(Json{{"type", "text"}, {"text", ToUtf8(text)}});
         shown += (shown.empty() ? L"" : L"\n\n") + text;
     }
+    if (!handoff_.empty()) {  // the chat before a switch of CLI, ahead of the first message to the new one
+        content.insert(content.begin(), Json{{"type", "text"}, {"text", std::exchange(handoff_, {})}});
+    }
     // "Auto": the model for this task, chosen before it goes (a message during a turn joins that turn: no switch).
     if (settings_.model == "auto" && !busy_ && agent_ == &claude_) {
         const bool opening = std::ranges::none_of(feed_, [](const FeedItem& item) { return item.kind == Kind::User; });
@@ -8681,9 +8745,9 @@ void ChatWindow::OnClaude(const Json& message) {
             const Json& before = JsonAt(meta, "pre_tokens");
             const Json& after = JsonAt(meta, "post_tokens");
             Add(Kind::Notice, before.is_number_integer() && after.is_number_integer()
-                                  ? std::format(L"Чат сжат: {} тыс. токенов → {} тыс.; дальше Claude помнит начало по сводке",
-                                                before.get<long long>() / 1000, std::max(1LL, after.get<long long>() / 1000))
-                                  : std::wstring(L"Чат сжат: дальше Claude помнит начало по сводке"));
+                                  ? std::format(L"Чат сжат: {} тыс. токенов → {} тыс.; дальше {} помнит начало по сводке",
+                                                before.get<long long>() / 1000, std::max(1LL, after.get<long long>() / 1000), AgentName())
+                                  : L"Чат сжат: дальше " + AgentName() + L" помнит начало по сводке");
         }
     } else if (type == "stream_event") {
         const Json& event = JsonAt(message, "event");
@@ -8975,7 +9039,7 @@ void ChatWindow::StopTurn() {
 void ChatWindow::OnClaudeExit(const ExitInfo& exit) {
     running_ = false;
     busy_ = false;
-    std::wstring text = std::format(L"claude.exe завершился (код {}).", exit.code);
+    std::wstring text = std::format(L"{} завершился (код {}).", GrokSelected() ? L"grok.exe" : L"claude.exe", exit.code);
     if (const std::wstring tail = LastLines(exit.stderrTail, 6); !tail.empty()) {
         text += L"\n" + tail;
     }

@@ -463,8 +463,6 @@ enum class Target {
     SaveMemoryBtn,  // the header's "save the memory" (to its GitHub repository)
     Update,  // the header's "update to ..." (only while there is one)
     SidebarSearch,
-    FolderChip,     // the chat's folder, under the input: a menu to change it
-    ComputerChip,   // ... and left of it, where Claude works: this computer
     SplitSidebar,   // the edge between the sidebar and the chat: drag to resize
     SplitTerminal,  // ... and between the chat and the terminal
     WinMin,    // the window's own buttons, drawn in the header (the system caption is gone)
@@ -564,8 +562,6 @@ struct Geometry {
     D2D1_RECT_F addProject{};  // "+" at the right of the projects' label
     D2D1_RECT_F projectsLabel{};  // "Проекты" and the order: click to choose it
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
-    D2D1_RECT_F computer{}; // under the input, at the left: where Claude works (this computer)
-    D2D1_RECT_F folder{};   // ... and in which folder there
     D2D1_RECT_F signIn{};   // the sign-in screen's buttons (in the middle of an empty chat)
     D2D1_RECT_F signAlt{};
     float listBottom = 0;
@@ -891,14 +887,10 @@ private:
     void PickWorkspace();
     void OpenRepo(size_t index);
     void OnCloneDone(const CloneDone& done);
-    void ShowFolderMenu(POINT screen, bool above);
+    void ShowFolderMenu(POINT screen);
     void ShowPermissionMenu();
     std::wstring PermissionName() const;
     bool AllowedUnasked(const std::string& tool, const Json& input) const;
-    std::wstring ComputerLabel() const { return cloning_ ? FolderLabel() : std::wstring(L"Этот компьютер"); }
-    std::wstring FolderLabel() const {
-        return cloning_ ? L"Клонирую " + cloningName_ + L"…" : folderName_;
-    }
 
     // The account: `claude auth status / login / logout`, each on its own thread.
     bool SignedOut() const { return auth_.known && !auth_.loggedIn && !GrokSelected(); }
@@ -1400,7 +1392,7 @@ private:
     bool draggingEffort_ = false;
 
     std::wstring workspace_;
-    std::wstring folderName_;  // its project's name, for the chip under the input
+    std::wstring folderName_;  // its project's name, for the header
     Settings settings_;
     Json models_ = Json::array();  // claudeModels_ (with "Auto"), then grokModels_
     Json claudeModels_ = Json::array();
@@ -2496,7 +2488,7 @@ void ChatWindow::OnClick(float x, float y) {
         const Geometry g = Layout();
         POINT screen{ToPx(g.addProject.left), ToPx(g.addProject.bottom + 4.f)};
         ClientToScreen(hwnd_, &screen);
-        ShowFolderMenu(screen, false);
+        ShowFolderMenu(screen);
         keepFocus = true;
         break;
     }
@@ -2516,15 +2508,6 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::UsageChip:
         OpenPopup(Popup::Usage);
         break;
-    case Target::FolderChip:
-    case Target::ComputerChip: {  // the only place for now; servers will join it
-        const Geometry g = Layout();
-        POINT screen{ToPx(g.computer.left), ToPx(g.computer.top - 4.f)};
-        ClientToScreen(hwnd_, &screen);
-        ShowFolderMenu(screen, true);
-        keepFocus = true;
-        break;
-    }
     case Target::Secrets:
         SetSecretsOpen(true);
         keepFocus = true;
@@ -2835,11 +2818,6 @@ Geometry ChatWindow::Layout() const {
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
     const float permissionWidth = TextWidth(PermissionName(), ui_.get()) + 18;
     g.permission = D2D1::RectF(g.model.left - 2 - permissionWidth, chipTop, g.model.left - 2, chipBottom);
-    // Where Claude works: this computer; the folder there is chosen in its menu (as environments are in
-    // Claude's app). While a repository is being cloned, that shows here.
-    const float computerWidth =
-        std::min(TextWidth(ComputerLabel(), ui_.get()) + 37.f, std::max(0.f, g.permission.left - left - 12.f));
-    g.computer = D2D1::RectF(left + 4, chipTop, left + 4 + computerWidth, chipBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
         const float centerX = left + g.column / 2;
@@ -3170,12 +3148,6 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.model, x, y)) {
         return {Target::ModelChip};
-    }
-    if (Inside(g.folder, x, y)) {
-        return {Target::FolderChip};
-    }
-    if (Inside(g.computer, x, y)) {
-        return {Target::ComputerChip};
     }
     if (Inside(g.effort, x, y)) {
         return {Target::EffortChip};
@@ -3888,42 +3860,7 @@ void ChatWindow::PaintInput(const Geometry& g) {
         Line({c.x, c.y - 6.f}, {c.x, c.y + 6.f}, color, 1.6f);
     }
 
-    if (g.computer.right > g.computer.left) {  // a laptop: where Claude works
-        const bool active = hover_.target == Target::ComputerChip;
-        if (active) {
-            Fill(g.computer, 6.f, kRaised);
-        }
-        const uint32_t color = active ? kPrimary : kSecondary;
-        const D2D1_POINT_2F c{g.computer.left + 13.f, (g.computer.top + g.computer.bottom) / 2 - 0.5f};
-        brush_->SetColor(Color(color));
-        // A desk computer (this one is not a laptop): a monitor with sharp corners on its neck and foot, a keyboard
-        // under it and a mouse beside it. Outlines, as the rest of the icons.
-        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y - 7.f, c.x + 6.f, c.y + 0.5f), 0.6f, 0.6f),
-                                      brush_.get(), 1.2f);
-        Line({c.x, c.y + 0.5f}, {c.x, c.y + 2.f}, color, 1.2f);
-        Line({c.x - 2.5f, c.y + 2.2f}, {c.x + 2.5f, c.y + 2.2f}, color, 1.2f);
-        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y + 4.f, c.x + 2.5f, c.y + 7.f), 0.6f, 0.6f),
-                                      brush_.get(), 1.1f);
-        target_->DrawEllipse(D2D1::Ellipse({c.x + 5.5f, c.y + 5.5f}, 1.7f, 2.3f), brush_.get(), 1.1f);
-        Text(ComputerLabel(), ui_.get(),
-             D2D1::RectF(g.computer.left + 29, g.computer.top, g.computer.right - 6, g.computer.bottom), color);
-    }
     // The model, then its effort in a box of its own, as in Claude's app.
-    if (g.folder.right > g.folder.left) {  // the folder the chat works in: a menu to change it
-        const bool active = hover_.target == Target::FolderChip;
-        if (active) {
-            Fill(g.folder, 6.f, kRaised);
-        }
-        const uint32_t color = active ? kPrimary : kSecondary;
-        const D2D1_POINT_2F c{g.folder.left + 12.f, (g.folder.top + g.folder.bottom) / 2};
-        brush_->SetColor(Color(color));
-        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 5.5f, c.y - 3.5f, c.x + 5.5f, c.y + 4.5f), 1.5f, 1.5f),
-                                      brush_.get(), 1.2f);
-        Line({c.x - 5.5f, c.y - 3.5f}, {c.x - 3.5f, c.y - 5.5f}, color, 1.2f);
-        Line({c.x - 3.5f, c.y - 5.5f}, {c.x - 1.f, c.y - 5.5f}, color, 1.2f);
-        Text(FolderLabel(), ui_.get(), D2D1::RectF(g.folder.left + 26, g.folder.top, g.folder.right - 6, g.folder.bottom),
-             color);
-    }
     const bool modelActive = hover_.target == Target::ModelChip || popup_ == Popup::Models;
     if (modelActive) {
         Fill(g.model, 6.f, kRaised);
@@ -5723,6 +5660,7 @@ void ChatWindow::OpenRepo(size_t index) {
             done.release();
         }
     });
+    Flash(L"Клонирую " + cloningName_ + L"…", 4000);
     Refresh();
 }
 
@@ -5740,7 +5678,7 @@ void ChatWindow::OnCloneDone(const CloneDone& done) {
 
 // The projects (a folder on this computer each) to work in, and the ways to add one: any folder, or a GitHub
 // repository (cloned first).
-void ChatWindow::ShowFolderMenu(POINT screen, bool above) {
+void ChatWindow::ShowFolderMenu(POINT screen) {
     constexpr UINT kDefault = 2;
     constexpr UINT kPick = 3;
     constexpr UINT kReload = 4;
@@ -5787,7 +5725,7 @@ void ChatWindow::ShowFolderMenu(POINT screen, bool above) {
     AppendMenuW(menu.get(), MF_POPUP | (cloning_ ? MF_GRAYED : 0), reinterpret_cast<UINT_PTR>(repoMenu.release()),
                 cloning_ ? (L"Клонирую " + cloningName_ + L"…").c_str() : L"Репозитории GitHub");
 
-    const auto chosen = static_cast<UINT>(Menu(menu.get(), screen, above));
+    const auto chosen = static_cast<UINT>(Menu(menu.get(), screen));
     if (chosen == kDefault) {
         SwitchWorkspace(standard);
     } else if (chosen == kPick) {
@@ -7932,10 +7870,6 @@ std::wstring ChatWindow::TooltipText() {
         return L"Закрыть";
     case Target::SidebarSearch:
         return L"Поиск (Ctrl+H): стрелки, Enter, влево свернуть. Alt+↑↓ чаты, Alt+←→ проекты";
-    case Target::FolderChip:
-        return L"Папка чата: " + workspace_;
-    case Target::ComputerChip:
-        return AgentName() + L" работает здесь: " + workspace_;
     case Target::Account:
         return ClaudeUpdateAvailable() ? L"Аккаунт · вышел Claude " + ToWide(claudeLatest_)
                                        : std::wstring(L"Аккаунт, версия Claude, выход");
@@ -8201,10 +8135,6 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.winClose;
     case Target::SidebarSearch:
         return g.search;
-    case Target::FolderChip:
-        return g.folder;
-    case Target::ComputerChip:
-        return g.computer;
     case Target::ModelChip:
         return g.model;
     case Target::EffortChip:

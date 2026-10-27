@@ -22,31 +22,6 @@ constexpr size_t kStderrTail = 8192;
     throw std::runtime_error(std::string(what) + " failed, error " + std::to_string(error));
 }
 
-// One argument for CommandLineToArgvW / the CRT's parser.
-std::wstring QuoteArg(std::wstring_view arg) {
-    if (!arg.empty() && arg.find_first_of(L" \t\"") == std::wstring_view::npos) {
-        return std::wstring(arg);
-    }
-    std::wstring out = L"\"";
-    size_t backslashes = 0;
-    for (const wchar_t c : arg) {
-        if (c == L'\\') {
-            ++backslashes;
-            continue;
-        }
-        if (c == L'"') {
-            out.append(backslashes * 2 + 1, L'\\');
-        } else {
-            out.append(backslashes, L'\\');
-        }
-        out += c;
-        backslashes = 0;
-    }
-    out.append(backslashes * 2, L'\\');
-    out += L'"';
-    return out;
-}
-
 struct NoCaseLess {
     bool operator()(const std::wstring& a, const std::wstring& b) const {
         return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(),
@@ -105,6 +80,99 @@ bool PortOpen(uint16_t port) {
 }
 
 }  // namespace
+
+std::wstring QuoteArg(std::wstring_view arg) {
+    if (!arg.empty() && arg.find_first_of(L" \t\"") == std::wstring_view::npos) {
+        return std::wstring(arg);
+    }
+    std::wstring out = L"\"";
+    size_t backslashes = 0;
+    for (const wchar_t c : arg) {
+        if (c == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (c == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+        } else {
+            out.append(backslashes, L'\\');
+        }
+        out += c;
+        backslashes = 0;
+    }
+    out.append(backslashes * 2, L'\\');
+    out += L'"';
+    return out;
+}
+
+SpawnedProcess SpawnPiped(const std::wstring& exe, std::wstring cmd,
+                          const std::vector<std::pair<std::wstring, std::wstring>>& envOverrides,
+                          const std::wstring& cwd) {
+    std::vector<wchar_t> environment = BuildEnvironment(envOverrides);
+
+    SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    wil::unique_handle inRead, inWrite, outRead, outWrite, errRead, errWrite;
+    if (!CreatePipe(inRead.put(), inWrite.put(), &inheritable, 1 << 20) ||
+        !CreatePipe(outRead.put(), outWrite.put(), &inheritable, 1 << 16) ||
+        !CreatePipe(errRead.put(), errWrite.put(), &inheritable, 0)) {
+        ThrowLastError("CreatePipe");
+    }
+    SetHandleInformation(inWrite.get(), HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(outRead.get(), HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(errRead.get(), HANDLE_FLAG_INHERIT, 0);
+
+    // Only the three pipe ends are inherited, not whatever else this process has open.
+    SIZE_T attributesSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributesSize);
+    std::vector<std::byte> attributesBuffer(attributesSize);
+    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributesBuffer.data());
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributesSize)) {
+        ThrowLastError("InitializeProcThreadAttributeList");
+    }
+    auto deleteAttributes = wil::scope_exit([&] { DeleteProcThreadAttributeList(attributes); });
+    std::array<HANDLE, 3> inherited{inRead.get(), outWrite.get(), errWrite.get()};
+    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(),
+                                   sizeof(inherited), nullptr, nullptr)) {
+        ThrowLastError("UpdateProcThreadAttribute");
+    }
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = inRead.get();
+    startup.StartupInfo.hStdOutput = outWrite.get();
+    startup.StartupInfo.hStdError = errWrite.get();
+    startup.lpAttributeList = attributes;
+
+    // The CLI and everything it spawns die with the job, so nothing outlives a chat.
+    wil::unique_handle job(CreateJobObjectW(nullptr, nullptr));
+    if (!job) {
+        ThrowLastError("CreateJobObject");
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        ThrowLastError("SetInformationJobObject");
+    }
+
+    PROCESS_INFORMATION info{};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
+                        CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT |
+                            EXTENDED_STARTUPINFO_PRESENT,
+                        environment.data(), cwd.empty() ? nullptr : cwd.c_str(), &startup.StartupInfo, &info)) {
+        ThrowLastError("CreateProcess");
+    }
+    wil::unique_handle process(info.hProcess);
+    const wil::unique_handle thread(info.hThread);
+    if (!AssignProcessToJobObject(job.get(), process.get())) {
+        TerminateProcess(process.get(), 1);
+        ThrowLastError("AssignProcessToJobObject");
+    }
+    ResumeThread(thread.get());
+
+    // Our copies of the child's ends: without closing them the reads never see EOF.
+    return SpawnedProcess{std::move(process), std::move(job), std::move(inWrite), std::move(outRead),
+                          std::move(errRead)};
+}
 
 ClaudeProcess::~ClaudeProcess() {
     Stop();
@@ -167,77 +235,12 @@ void ClaudeProcess::Start(const ClaudeOptions& options, MessageHandler onMessage
                                            {L"HTTP_PROXY", options.proxy},
                                            {L"NO_PROXY", L"127.0.0.1,localhost,::1"}});
     }
-    std::vector<wchar_t> environment = BuildEnvironment(overrides);
-
-    SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
-    wil::unique_handle inRead, inWrite, outRead, outWrite, errRead, errWrite;
-    if (!CreatePipe(inRead.put(), inWrite.put(), &inheritable, 1 << 20) ||
-        !CreatePipe(outRead.put(), outWrite.put(), &inheritable, 1 << 16) ||
-        !CreatePipe(errRead.put(), errWrite.put(), &inheritable, 0)) {
-        ThrowLastError("CreatePipe");
-    }
-    SetHandleInformation(inWrite.get(), HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(outRead.get(), HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(errRead.get(), HANDLE_FLAG_INHERIT, 0);
-
-    // Only the three pipe ends are inherited, not whatever else this process has open.
-    SIZE_T attributesSize = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributesSize);
-    std::vector<std::byte> attributesBuffer(attributesSize);
-    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributesBuffer.data());
-    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributesSize)) {
-        ThrowLastError("InitializeProcThreadAttributeList");
-    }
-    auto deleteAttributes = wil::scope_exit([&] { DeleteProcThreadAttributeList(attributes); });
-    std::array<HANDLE, 3> inherited{inRead.get(), outWrite.get(), errWrite.get()};
-    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(),
-                                   sizeof(inherited), nullptr, nullptr)) {
-        ThrowLastError("UpdateProcThreadAttribute");
-    }
-    STARTUPINFOEXW startup{};
-    startup.StartupInfo.cb = sizeof(startup);
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = inRead.get();
-    startup.StartupInfo.hStdOutput = outWrite.get();
-    startup.StartupInfo.hStdError = errWrite.get();
-    startup.lpAttributeList = attributes;
-
-    // The CLI and everything it spawns die with the job, so nothing outlives a chat.
-    wil::unique_handle job(CreateJobObjectW(nullptr, nullptr));
-    if (!job) {
-        ThrowLastError("CreateJobObject");
-    }
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
-        ThrowLastError("SetInformationJobObject");
-    }
-
-    PROCESS_INFORMATION info{};
-    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                        CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT |
-                            EXTENDED_STARTUPINFO_PRESENT,
-                        environment.data(), options.cwd.empty() ? nullptr : options.cwd.c_str(),
-                        &startup.StartupInfo, &info)) {
-        ThrowLastError("CreateProcess");
-    }
-    wil::unique_handle process(info.hProcess);
-    const wil::unique_handle thread(info.hThread);
-    if (!AssignProcessToJobObject(job.get(), process.get())) {
-        TerminateProcess(process.get(), 1);
-        ThrowLastError("AssignProcessToJobObject");
-    }
-    ResumeThread(thread.get());
-
-    // Our copies of the child's ends: without closing them the reads never see EOF.
-    inRead.reset();
-    outWrite.reset();
-    errWrite.reset();
-
-    process_ = std::move(process);
-    job_ = std::move(job);
-    stdoutRead_ = std::move(outRead);
-    stderrRead_ = std::move(errRead);
+    SpawnedProcess spawned = SpawnPiped(exe, std::move(cmd), overrides, options.cwd);
+    process_ = std::move(spawned.process);
+    job_ = std::move(spawned.job);
+    stdoutRead_ = std::move(spawned.stdoutRead);
+    stderrRead_ = std::move(spawned.stderrRead);
+    wil::unique_handle& inWrite = spawned.stdinWrite;
     {
         std::lock_guard lock(writeMutex_);
         stdinWrite_ = std::move(inWrite);

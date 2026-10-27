@@ -438,6 +438,7 @@ Settings LoadSettings() {
     settings.model = JsonStr(data, "model");
     settings.effort = JsonStr(data, "effort");
     settings.permissions = JsonStr(data, "permissions");
+    settings.claudeModels = JsonStr(data, "claudeModels");
     settings.connectors = JsonAt(data, "connectors").is_boolean() && JsonAt(data, "connectors").get<bool>();
     const auto number = [&](const char* key, long long fallback) {
         const Json& value = JsonAt(data, key);
@@ -501,6 +502,7 @@ void SaveSettings(const Settings& settings) {
     out << Json{{"model", settings.model},
                 {"effort", settings.effort},
                 {"permissions", settings.permissions},
+                {"claudeModels", settings.claudeModels},
                 {"connectors", settings.connectors},
                 {"sessionPercent", settings.sessionPercent},
                 {"sessionResets", settings.sessionResets},

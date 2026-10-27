@@ -13,9 +13,9 @@
 #include <nlohmann/json.hpp>
 #include <wil/resource.h>
 
-namespace aic {
+#include "core/agent_process.h"
 
-using Json = nlohmann::json;
+namespace aic {
 
 struct ClaudeOptions {
     std::wstring exe;     // claude.exe; empty: FindClaudeExe()
@@ -37,13 +37,10 @@ struct ClaudeOptions {
 
 // claude.exe in stream-json mode (see PLAN.md, "Протокол"): one process per chat, serving
 // turn after turn while its stdin stays open. Both handlers run on the reader thread.
-class ClaudeProcess {
+class ClaudeProcess : public AgentProcess {
 public:
-    using MessageHandler = std::function<void(Json)>;
-    using ExitHandler = std::function<void(DWORD exitCode, std::string stderrTail)>;
-
     ClaudeProcess() = default;
-    ~ClaudeProcess();
+    ~ClaudeProcess() override;
     ClaudeProcess(const ClaudeProcess&) = delete;
     ClaudeProcess& operator=(const ClaudeProcess&) = delete;
 
@@ -51,16 +48,15 @@ public:
     void Start(const ClaudeOptions& options, MessageHandler onMessage, ExitHandler onExit);
     // Closes stdin, gives the CLI a moment to finish, then kills its whole process tree.
     // No handler runs after this returns.
-    void Stop();
+    void Stop() override;
 
-    void SendUserText(std::string_view text);
-    // A message as content blocks: pictures, documents, text.
-    void SendUserContent(Json content);
-    void Interrupt();
-    // Another model for the turns to come, the conversation kept (set_model; no restart).
-    void SetModel(const std::string& model);
-    void Respond(const std::string& requestId, Json response);
-    void RespondError(const std::string& requestId, std::string_view error);
+    void SendUserText(std::string_view text) override;
+    void SendUserContent(Json content) override;
+    void Interrupt() override;
+    // set_model: no restart.
+    void SetModel(const std::string& model) override;
+    void Respond(const std::string& requestId, Json response) override;
+    void RespondError(const std::string& requestId, std::string_view error) override;
 
 private:
     // afterInit: hold the message until the CLI has answered initialize.
@@ -93,6 +89,22 @@ private:
 
 // Our environment plus the overrides, as a CREATE_UNICODE_ENVIRONMENT block for CreateProcessW.
 std::vector<wchar_t> MakeEnvironmentBlock(const std::vector<std::pair<std::wstring, std::wstring>>& overrides);
+
+// One argument for CommandLineToArgvW / the CRT's parser.
+std::wstring QuoteArg(std::wstring_view arg);
+
+// A CLI child with its three pipes, in a job that kills it and everything it spawns when closed.
+struct SpawnedProcess {
+    wil::unique_handle process;
+    wil::unique_handle job;
+    wil::unique_handle stdinWrite;
+    wil::unique_handle stdoutRead;
+    wil::unique_handle stderrRead;
+};
+// `commandLine` is the whole line, exe first. Throws std::runtime_error when it cannot start.
+SpawnedProcess SpawnPiped(const std::wstring& exe, std::wstring commandLine,
+                          const std::vector<std::pair<std::wstring, std::wstring>>& envOverrides,
+                          const std::wstring& cwd);
 
 // %USERPROFILE%\.local\bin\claude.exe (the native installer's place), else PATH; empty if none.
 std::wstring FindClaudeExe();

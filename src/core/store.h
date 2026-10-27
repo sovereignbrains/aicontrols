@@ -36,6 +36,8 @@ struct TranscriptEntry {
 struct Settings {
     std::string model;   // a value from the CLI's model list; empty: its default
     std::string effort;  // low … max; empty: the model's default
+    // Claude's model list as last reported (JSON), so a start on a Grok model still offers the way back.
+    std::string claudeModels;
     // What runs without a card: "" asks before anything that changes something, "edits" writes files on this
     // computer unasked (commands and servers still ask), "all" asks nothing.
     std::string permissions;

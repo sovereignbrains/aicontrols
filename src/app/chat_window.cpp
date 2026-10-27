@@ -44,6 +44,7 @@
 #include "core/auth.h"
 #include "core/claude_install.h"
 #include "core/claude_process.h"
+#include "core/grok_process.h"
 #include "core/github.h"
 #include "core/markdown.h"
 #include "core/memory_writer.h"
@@ -844,7 +845,10 @@ private:
     }
 
     // The account: `claude auth status / login / logout`, each on its own thread.
-    bool SignedOut() const { return auth_.known && !auth_.loggedIn; }
+    bool SignedOut() const { return auth_.known && !auth_.loggedIn && !GrokSelected(); }
+    // Grok's models are all "grok-…"; choosing one moves the chat to grok.exe, any other to claude.exe.
+    bool GrokSelected() const { return settings_.model.starts_with("grok-"); }
+    void MergeModels();
     void RefreshAuth();
     void SignIn();
     void CancelSignIn();
@@ -1263,14 +1267,18 @@ private:
     std::wstring workspace_;
     std::wstring folderName_;  // its project's name, for the chip under the input
     Settings settings_;
-    Json models_ = Json::array();
+    Json models_ = Json::array();  // claudeModels_ (with "Auto"), then grokModels_
+    Json claudeModels_ = Json::array();
+    Json grokModels_ = Json::array();
     std::string userName_;
 
     ClaudeProcess claude_;
-    // Declared after claude_: the tool threads answer through it, so they are joined first.
+    GrokProcess grok_;
+    AgentProcess* agent_ = &claude_;  // the one the chat runs on: Grok when a Grok model is chosen
+    // Declared after the processes: the tool threads answer through them, so they are joined first.
     SecretStore secrets_{SecretStore::DefaultPath()};
     Tools tools_{secrets_, {}};
-    ToolHost host_{tools_, [this](const std::string& id, Json response) { claude_.Respond(id, std::move(response)); }};
+    ToolHost host_{tools_, [this](const std::string& id, Json response) { agent_->Respond(id, std::move(response)); }};
     WPARAM generation_ = 0;  // bumped per process; stale posts are dropped
     bool running_ = false;
     bool busy_ = false;
@@ -1297,6 +1305,22 @@ int ChatWindow::Run(int show) {
     SetSettingsReadOnly(gallery_);
     secrets_.Load();
     settings_ = LoadSettings();
+    // The model lists known before a process has answered: Claude's as last reported, Grok's as measured 27.10.2026
+    // (grok.exe reports its own once a Grok chat has started).
+    claudeModels_ = Json::parse(settings_.claudeModels, nullptr, false);
+    if (!claudeModels_.is_array()) {
+        claudeModels_ = Json::array();
+    }
+    if (!FindGrokExe().empty()) {
+        const Json efforts = {"xhigh", "high", "medium", "low"};
+        grokModels_ = Json::array(
+            {Json{{"value", "grok-4.7"}, {"displayName", "Grok 4.7"}, {"supportedEffortLevels", efforts}},
+             Json{{"value", "grok-4.7-build-fast"}, {"displayName", "Grok 4.7 Fast"}, {"supportedEffortLevels", efforts}},
+             Json{{"value", "grok-4.6"}, {"displayName", "Grok 4.6"}, {"supportedEffortLevels", efforts}},
+             Json{{"value", "grok-4.5"}, {"displayName", "Grok 4.5"},
+                  {"supportedEffortLevels", Json::array({"high", "medium", "low"})}}});
+        MergeModels();
+    }
     workspace_ = DefaultWorkspace();
     if (std::error_code error; !settings_.workspace.empty() && std::filesystem::is_directory(settings_.workspace, error)) {
         workspace_ = settings_.workspace;  // the project chosen last time
@@ -2182,7 +2206,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         ++generation_;
         tabs_.clear();  // every shell ends
         host_.CancelAll();
-        claude_.Stop();
+        agent_->Stop();
         PostQuitMessage(0);
         return 0;
     default:
@@ -4934,7 +4958,7 @@ void ChatWindow::SignOut() {
 void ChatWindow::OnLogoutDone() {
     authWorking_ = false;
     ++generation_;  // the running CLI still holds the old account: it goes
-    claude_.Stop();
+    agent_->Stop();
     running_ = false;
     busy_ = false;
     RefreshAuth();
@@ -5033,7 +5057,7 @@ void ChatWindow::UpdateClaudeCli() {
             item.verdict = Verdict::Cancelled;
         }
     }
-    claude_.Stop();
+    agent_->Stop();
     running_ = false;
     busy_ = false;
     setupBusy_ = true;
@@ -8237,12 +8261,20 @@ void ChatWindow::IndexModels() {
         const std::string value = JsonStr(models_[i], "value");
         if (value == "default") {
             defaultResolved_ = JsonStr(models_[i], "resolvedModel");
-        } else if (value.find('-') == std::string::npos) {
+        } else if (value.find('-') == std::string::npos || value.starts_with("grok-")) {
             mainModels_.push_back(i);
         } else {
             moreModels_.push_back(i);
         }
     }
+}
+
+void ChatWindow::MergeModels() {
+    models_ = claudeModels_;
+    for (const Json& model : grokModels_) {
+        models_.push_back(model);
+    }
+    IndexModels();
 }
 
 const Json* ChatWindow::CurrentModel() const {
@@ -8325,9 +8357,16 @@ void ChatWindow::Apply(const Settings& next) {
     if (next.model == settings_.model && next.effort == settings_.effort) {
         return;
     }
+    const bool otherCli = next.model.starts_with("grok-") != GrokSelected();
     settings_ = next;
     SaveSettings(settings_);
     PlaceChildren();
+    if (otherCli) {  // a conversation is the CLI's own: the chat goes on in a new one, the old stays in the history
+        ResetChat();
+        StartClaude();
+        Flash(GrokSelected() ? L"Новый чат на Grok" : L"Новый чат на Claude", 3000);
+        return;
+    }
     Restart();  // the same conversation goes on with the new model
 }
 
@@ -8336,8 +8375,13 @@ bool ChatWindow::StartClaude() {
         return false;
     }
     ClaudeOptions options;
-    options.exe = FindClaudeExe();
-    claudeMissing_ = options.exe.empty();
+    const bool grok = GrokSelected();
+    options.exe = grok ? FindGrokExe() : FindClaudeExe();
+    claudeMissing_ = !grok && options.exe.empty();
+    if (grok && options.exe.empty()) {
+        Add(Kind::Error, L"Не нашёл grok.exe ни в %USERPROFILE%\\.grok\\bin, ни в PATH.");
+        return false;
+    }
     if (options.exe.empty()) {
         Refresh();  // an empty chat offers to install it; a chat that has words says so in the feed
         if (!HasConversation()) {
@@ -8362,23 +8406,33 @@ bool ChatWindow::StartClaude() {
 
     const WPARAM generation = ++generation_;
     const HWND hwnd = hwnd_;
+    const auto onMessage = [hwnd, generation](Json message) {
+        auto payload = std::make_unique<Json>(std::move(message));
+        if (PostMessageW(hwnd, kClaudeMessage, generation, reinterpret_cast<LPARAM>(payload.get()))) {
+            payload.release();
+        }
+    };
+    const auto onExit = [hwnd, generation](DWORD code, std::string stderrTail) {
+        auto payload = std::make_unique<ExitInfo>(ExitInfo{code, std::move(stderrTail)});
+        if (PostMessageW(hwnd, kClaudeExit, generation, reinterpret_cast<LPARAM>(payload.get()))) {
+            payload.release();
+        }
+    };
     try {
-        claude_.Start(
-            options,
-            [hwnd, generation](Json message) {
-                auto payload = std::make_unique<Json>(std::move(message));
-                if (PostMessageW(hwnd, kClaudeMessage, generation, reinterpret_cast<LPARAM>(payload.get()))) {
-                    payload.release();
-                }
-            },
-            [hwnd, generation](DWORD code, std::string stderrTail) {
-                auto payload = std::make_unique<ExitInfo>(ExitInfo{code, std::move(stderrTail)});
-                if (PostMessageW(hwnd, kClaudeExit, generation, reinterpret_cast<LPARAM>(payload.get()))) {
-                    payload.release();
-                }
-            });
+        if (grok) {
+            // Grok: no Claude settings, connectors or autocompact; its models come from its own handshake.
+            options.settings.clear();
+            options.connectors = false;
+            options.autocompact.clear();
+            options.model = settings_.model;
+            agent_ = &grok_;
+            grok_.Start(options, onMessage, onExit);
+        } else {
+            agent_ = &claude_;
+            claude_.Start(options, onMessage, onExit);
+        }
     } catch (const std::exception& e) {
-        Add(Kind::Error, L"Не запустился claude.exe: " + ToWide(e.what()));
+        Add(Kind::Error, (grok ? L"Не запустился grok.exe: " : L"Не запустился claude.exe: ") + ToWide(e.what()));
         return false;
     }
     running_ = true;
@@ -8395,7 +8449,7 @@ void ChatWindow::Restart() {
             item.verdict = Verdict::Cancelled;
         }
     }
-    claude_.Stop();
+    agent_->Stop();
     running_ = false;
     busy_ = false;
     StartClaude();
@@ -8404,7 +8458,7 @@ void ChatWindow::Restart() {
 void ChatWindow::ResetChat() {
     ++generation_;
     host_.CancelAll();
-    claude_.Stop();
+    agent_->Stop();
     running_ = false;
     busy_ = false;
     sessionId_.clear();
@@ -8464,15 +8518,15 @@ void ChatWindow::Submit() {
         shown += (shown.empty() ? L"" : L"\n\n") + text;
     }
     // "Auto": the model for this task, chosen before it goes (a message during a turn joins that turn: no switch).
-    if (settings_.model == "auto" && !busy_) {
+    if (settings_.model == "auto" && !busy_ && agent_ == &claude_) {
         const bool opening = std::ranges::none_of(feed_, [](const FeedItem& item) { return item.kind == Kind::User; });
         const std::string pick = RouteModel({text, attachments_.size(), opening, autoModel_, lastContext_});
         if (pick != autoModel_) {
             autoModel_ = pick;
-            claude_.SetModel(pick);
+            agent_->SetModel(pick);
         }
     }
-    claude_.SendUserContent(std::move(content));
+    agent_->SendUserContent(std::move(content));
     Add(Kind::User, std::move(shown));
     feed_.back().images = std::move(images);
     attachments_.clear();
@@ -8563,7 +8617,9 @@ void ChatWindow::OnClaude(const Json& message) {
         if (!stateEvents_) {
             busy_ = false;
         }
-        FetchUsage();  // a turn spent some: the ring follows
+        if (!GrokSelected()) {
+            FetchUsage();  // a turn spent some: the ring follows
+        }
         {  // how big the chat is now, for "Auto": its last request (the turn's sum counts the chat once per call)
             const Json& total = JsonAt(message, "usage");
             const Json& iterations = JsonAt(total, "iterations");
@@ -8591,7 +8647,7 @@ void ChatWindow::OnClaude(const Json& message) {
                 Add(Kind::Error, wide);
             }
         }
-        if (!sessionId_.empty()) {
+        if (!sessionId_.empty() && !GrokSelected()) {  // Grok keeps no transcript the history could list
             if (std::wstring title = SessionTitle(workspace_, sessionId_); !title.empty()) {
                 title_ = std::move(title);
             }
@@ -8629,13 +8685,16 @@ void ChatWindow::OnClaude(const Json& message) {
         const Json& response = JsonAt(message, "response");
         if (JsonStr(response, "request_id") == "aic_init") {
             const Json& answer = JsonAt(response, "response");
-            if (JsonAt(answer, "models").is_array()) {
-                models_ = JsonAt(answer, "models");
+            if (JsonAt(answer, "models").is_array() && agent_ == &grok_) {
+                grokModels_ = JsonAt(answer, "models");
+                MergeModels();
+            } else if (JsonAt(answer, "models").is_array()) {
+                Json models = JsonAt(answer, "models");
                 // "Auto" after the aliases (their keys 1–4 stay): the client picks Haiku, Sonnet or Opus per task.
                 // Its efforts: those all three have, so a switch never meets one its model refuses.
                 std::vector<std::string> efforts;
                 bool firstAlias = true;
-                for (const Json& model : models_) {
+                for (const Json& model : models) {
                     const std::string value = JsonStr(model, "value");
                     if (value != "opus" && value != "sonnet" && value != "haiku") {
                         continue;
@@ -8649,11 +8708,16 @@ void ChatWindow::OnClaude(const Json& message) {
                     efforts = std::move(own);
                     firstAlias = false;
                 }
-                models_.push_back(Json{{"value", "auto"},
-                                       {"displayName", "Auto"},
-                                       {"description", "Haiku, Sonnet or Opus by the task"},
-                                       {"supportedEffortLevels", efforts}});
-                IndexModels();
+                models.push_back(Json{{"value", "auto"},
+                                      {"displayName", "Auto"},
+                                      {"description", "Haiku, Sonnet or Opus by the task"},
+                                      {"supportedEffortLevels", efforts}});
+                claudeModels_ = std::move(models);
+                if (settings_.claudeModels != claudeModels_.dump()) {  // kept for the starts that open on Grok
+                    settings_.claudeModels = claudeModels_.dump();
+                    SaveSettings(settings_);
+                }
+                MergeModels();
             }
             const std::string email = JsonStr(JsonAt(answer, "account"), "email");
             userName_ = email.substr(0, email.find('@'));
@@ -8667,7 +8731,7 @@ void ChatWindow::OnClaude(const Json& message) {
         } else if (subtype == "mcp_message") {
             host_.HandleMcp(id, request);
         } else {
-            claude_.RespondError(id, "Not supported in this build yet.");
+            agent_->RespondError(id, "Not supported in this build yet.");
         }
     } else if (type == "aic_raw") {
         Add(Kind::Notice, ToWide(JsonStr(message, "text")));
@@ -8688,13 +8752,13 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     const std::string name = OwnToolName(JsonStr(request, "tool_name"));
     const Json& input = JsonAt(request, "input");
     if (name.empty()) {
-        claude_.Respond(requestId, Json{{"behavior", "deny"}, {"message", "Only AIControls tools are available here."}});
+        agent_->Respond(requestId, Json{{"behavior", "deny"}, {"message", "Only AIControls tools are available here."}});
         return;
     }
     ToolSummary summary = SummarizeTool(name, input);
     if (settings_.permissions == "plan" && name != "read_file" && name != "list_directory") {
         Add(Kind::Notice, L"План: не выполнено — " + summary.title + L": " + summary.detail);
-        claude_.Respond(requestId, Json{{"behavior", "deny"},
+        agent_->Respond(requestId, Json{{"behavior", "deny"},
                                         {"message", "Plan mode is on: nothing may be changed or run. Read what you "
                                                     "need, then give the user a plan; they will switch the mode to "
                                                     "carry it out."}});
@@ -8702,7 +8766,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     }
     if (!ToolNeedsApproval(name, input)) {
         Add(Kind::Notice, summary.title + L": " + summary.detail, true);
-        claude_.Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
+        agent_->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
         return;
     }
     FeedItem item;
@@ -8715,7 +8779,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     item.input = input;
     if (AllowedUnasked(name, input)) {  // the card still shows the call and its output, already allowed
         item.verdict = Verdict::Allowed;
-        claude_.Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
+        agent_->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
     }
     feed_.push_back(std::move(item));
     stick_ = true;
@@ -8759,9 +8823,9 @@ void ChatWindow::Decide(size_t index, bool allow) {
     FeedItem& item = feed_[index];
     item.verdict = allow ? Verdict::Allowed : Verdict::Denied;
     if (allow) {
-        claude_.Respond(item.requestId, Json{{"behavior", "allow"}, {"updatedInput", item.input}});
+        agent_->Respond(item.requestId, Json{{"behavior", "allow"}, {"updatedInput", item.input}});
     } else {
-        claude_.Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The user declined this call."}});
+        agent_->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The user declined this call."}});
     }
     hover_ = {};
     Refresh();
@@ -8770,7 +8834,7 @@ void ChatWindow::Decide(size_t index, bool allow) {
 void ChatWindow::CancelApprovals() {
     for (FeedItem& item : feed_) {
         if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
-            claude_.Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The turn was stopped."}});
+            agent_->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The turn was stopped."}});
             item.verdict = Verdict::Cancelled;
         }
     }
@@ -8779,7 +8843,7 @@ void ChatWindow::CancelApprovals() {
 void ChatWindow::StopTurn() {
     CancelApprovals();
     host_.CancelAll();
-    claude_.Interrupt();
+    agent_->Interrupt();
 }
 
 void ChatWindow::OnClaudeExit(const ExitInfo& exit) {

@@ -28,7 +28,9 @@ add_library(aic_core STATIC
   src/core/claude_install.cpp
   src/core/claude_process.cpp
   src/core/github.cpp
+  src/core/grok_process.cpp
   src/core/highlight.cpp
+  src/core/loopback_server.cpp
   src/core/markdown.cpp
   src/core/memory_writer.cpp
   src/core/model_router.cpp
@@ -61,10 +63,11 @@ endforeach()
 
 # Probes, run by hand against the real world (see each file's header):
 #   aic_e2e_probe     claude.exe calling our tools (spends a request)
+#   aic_grok_probe    grok.exe calling our tools over ACP (spends a request)
 #   aic_github_probe  the repositories the GITHUB secret reaches, and a clone
 #   aic_store_probe   the titles of the real chats; --delete <id>
 #   aic_memory_probe  the memory folder committed and pushed (GITHUB in the environment)
-foreach(name e2e github store memory)
+foreach(name e2e grok github store memory)
   add_executable(aic_${name}_probe tests/probes/${name}_probe.cpp)
   target_link_libraries(aic_${name}_probe PRIVATE aic_core)
 endforeach()

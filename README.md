@@ -76,5 +76,5 @@ docs       протокол claude.exe: docs/protocol.md
 
 ## Лицензия
 
-Код — [MIT](LICENSE). Шрифты в `assets/fonts` (Unbounded, Golos Text, JetBrains Mono) — SIL Open Font
+Код — [MIT](LICENSE). Шрифты в `assets/fonts` (Unbounded, Geist, JetBrains Mono) — SIL Open Font
 License, тексты лицензий лежат рядом с ними.

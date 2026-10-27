@@ -1651,7 +1651,7 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
     return result;
 }
 
-// RichEdit's caret is the font's whole line: Golos keeps room above its capitals (for Й, Ё), so it started
+// RichEdit's caret is the font's whole line: the text font keeps room above its capitals (for Й, Ё), so it started
 // well above the letters and stopped at their baseline, and stood crooked. Whenever RichEdit has put its own,
 // it is replaced by one from the capitals' top to the descenders' bottom, at the same place.
 void ChatWindow::FitCaret(HWND input) {

@@ -9,7 +9,7 @@ namespace aic {
 
 // The families of the embedded fonts, as DirectWrite and GDI know them.
 inline constexpr wchar_t kDisplayFont[] = L"Unbounded";   // the greeting, the header
-inline constexpr wchar_t kTextFont[] = L"Golos Text";     // everything else
+inline constexpr wchar_t kTextFont[] = L"Geist";          // everything else
 inline constexpr wchar_t kMonoFont[] = L"JetBrains Mono"; // code
 
 // A collection of the three fonts, built from the exe's resources (Windows 10 1809+).

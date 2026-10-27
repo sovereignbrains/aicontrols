@@ -3,6 +3,6 @@
 IDI_APP ICON "../../assets/aicontrols.ico"
 
 IDR_FONT_UNBOUNDED RCDATA "../../assets/fonts/Unbounded.ttf"
-IDR_FONT_GOLOS RCDATA "../../assets/fonts/GolosText.ttf"
+IDR_FONT_TEXT RCDATA "../../assets/fonts/Geist.ttf"
 IDR_FONT_MONO RCDATA "../../assets/fonts/JetBrainsMono.ttf"
 IDR_MASCOT RCDATA "../../assets/mascot.png"

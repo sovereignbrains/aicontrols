@@ -23,7 +23,7 @@ Blob FontResource(HINSTANCE instance, int id) {
     return loaded == nullptr ? Blob{} : Blob{LockResource(loaded), SizeofResource(instance, found)};
 }
 
-constexpr std::array<int, 3> kFonts{IDR_FONT_UNBOUNDED, IDR_FONT_GOLOS, IDR_FONT_MONO};
+constexpr std::array<int, 3> kFonts{IDR_FONT_UNBOUNDED, IDR_FONT_TEXT, IDR_FONT_MONO};
 
 }  // namespace
 
@@ -66,7 +66,7 @@ wil::com_ptr<IDWriteFontCollection> LoadFontCollection(IDWriteFactory* factory) 
 }
 
 void RegisterGdiFonts(HINSTANCE instance) {
-    const Blob blob = FontResource(instance, IDR_FONT_GOLOS);
+    const Blob blob = FontResource(instance, IDR_FONT_TEXT);
     if (blob.data != nullptr) {
         DWORD count = 0;
         AddFontMemResourceEx(const_cast<void*>(blob.data), blob.size, nullptr, &count);  // lives with the process

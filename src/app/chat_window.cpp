@@ -223,7 +223,6 @@ constexpr const wchar_t* kPickScript = LR"JS((() => {
 })();)JS";
 constexpr float kMenuRow = 30.f;
 constexpr float kModelsWidth = 270.f;
-constexpr float kMoreWidth = 230.f;
 constexpr float kEffortWidth = 250.f;
 constexpr float kEffortHeight = 112.f;
 constexpr float kAttachmentRow = 88.f;
@@ -495,9 +494,7 @@ enum class Target {
     ProjectRow,   // row: the same: a project's head (folds it or opens it)
     ProjectNew,   // row: the same: "+" on the head, a new chat in that project
     AddProject,   // "+" beside the projects' label: a folder or a GitHub repository
-    ModelRow,     // row: an index into the main models
-    MoreModels,   // the row that opens the other models
-    MoreRow,      // row: an index into the other models
+    ModelRow,     // row: an index into the models
     EffortTrack,
     EffortReset,
     ApprovalAllow,  // row: the feed item
@@ -575,8 +572,6 @@ struct Geometry {
     float listTop = 0;
     // Models.
     float modelsTop = 0;
-    D2D1_RECT_F more{};
-    D2D1_RECT_F submenu{};
     // Effort.
     D2D1_RECT_F track{};
     D2D1_RECT_F reset{};
@@ -712,6 +707,45 @@ std::wstring EffortName(const std::string& level) {
     std::wstring name = ToWide(level);
     name[0] = static_cast<wchar_t>(std::towupper(name[0]));
     return name;
+}
+
+// Left of the track is faster, right is smarter. CLIs list the levels either way.
+int EffortRank(const std::string& level) {
+    if (level == "minimal" || level == "min") {
+        return 0;
+    }
+    if (level == "low") {
+        return 1;
+    }
+    if (level == "medium") {
+        return 2;
+    }
+    if (level == "high") {
+        return 3;
+    }
+    if (level == "xhigh") {
+        return 4;
+    }
+    if (level == "max") {
+        return 5;
+    }
+    return 6;
+}
+
+// "grok-4.7-build-fast" → {4, 7}: the generation, whatever the variant.
+std::pair<int, int> GrokVersion(std::string_view value) {
+    std::pair<int, int> version{0, 0};
+    int* part = &version.first;
+    for (const char c : value.substr(std::min(value.size(), std::string_view("grok-").size()))) {
+        if (c >= '0' && c <= '9') {
+            *part = *part * 10 + (c - '0');
+        } else if (c == '.' && part == &version.first) {
+            part = &version.second;
+        } else {
+            break;
+        }
+    }
+    return version;
 }
 
 // Dark native menus: uxtheme's SetPreferredAppMode(ForceDark), as in Sovereign.
@@ -1251,15 +1285,13 @@ private:
     std::wstring renameText_;
     D2D1_POINT_2F mouse_{-1.f, -1.f};  // the pointer in DIPs; off the window after it leaves
     size_t selected_ = 0;
-    // Models: indexes into models_.
+    // Models: indexes into models_, those the menu shows.
     std::vector<size_t> mainModels_;
-    std::vector<size_t> moreModels_;
     std::string defaultResolved_;  // what the CLI's "default" stands for
     // "Auto" (settings model "auto"): the alias the chat runs on now, and how big the chat is (the last turn's
     // input), as switching down in a big chat would rewrite its whole cache.
     std::string autoModel_ = "sonnet";
     long long lastContext_ = 0;
-    bool moreOpen_ = false;
     // Effort, applied when its panel closes.
     std::string pendingEffort_;
     bool draggingEffort_ = false;
@@ -1769,10 +1801,6 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             hover_ = hit;
             if (hit.target == Target::HistoryRow) {
                 selected_ = hit.row;
-            } else if (hit.target == Target::MoreModels) {
-                moreOpen_ = true;
-            } else if (hit.target == Target::ModelRow) {
-                moreOpen_ = false;
             }
             Refresh();
         }
@@ -2226,13 +2254,6 @@ void ChatWindow::OnClick(float x, float y) {
         switch (hit.target) {
         case Target::ModelRow:
             ChooseModel(mainModels_[hit.row]);
-            return;
-        case Target::MoreRow:
-            ChooseModel(moreModels_[hit.row]);
-            return;
-        case Target::MoreModels:
-            moreOpen_ = !moreOpen_;
-            Refresh();
             return;
         case Target::EffortReset:
             pendingEffort_.clear();
@@ -2733,20 +2754,10 @@ Geometry ChatWindow::Layout() const {
     switch (popup_) {
     case Popup::Models: {
         const float rows = static_cast<float>(mainModels_.size());
-        const float height = 12 + rows * kMenuRow + (moreModels_.empty() ? 0 : 9 + kMenuRow);
+        const float height = 12 + rows * kMenuRow;
         const float popupLeft = ClampTo(g.model.left, 10.f, g.area - 10 - kModelsWidth);
         g.popup = D2D1::RectF(popupLeft, g.box.top - 6 - height, popupLeft + kModelsWidth, g.box.top - 6);
         g.modelsTop = g.popup.top + 6;
-        if (!moreModels_.empty()) {
-            const float moreTop = g.modelsTop + rows * kMenuRow + 9;
-            g.more = D2D1::RectF(g.popup.left + 6, moreTop, g.popup.right - 6, moreTop + kMenuRow);
-            const float subHeight = 12 + static_cast<float>(moreModels_.size()) * kMenuRow;
-            const bool roomLeft = g.popup.left - 4 - kMoreWidth >= 10;
-            const float subLeft = roomLeft ? g.popup.left - 4 - kMoreWidth : g.popup.right + 4;
-            const float subBottom = g.more.bottom + 6;
-            const float subTop = std::max(kHeader + 4, subBottom - subHeight);
-            g.submenu = D2D1::RectF(subLeft, subTop, subLeft + kMoreWidth, subTop + subHeight);
-        }
         break;
     }
     case Popup::Effort: {
@@ -2775,14 +2786,7 @@ Hit ChatWindow::HitTest(float x, float y) const {
     const Geometry g = Layout();
     switch (popup_) {
     case Popup::Models:
-        if (moreOpen_ && Inside(g.submenu, x, y)) {
-            const auto row = static_cast<size_t>(std::max(0.f, y - g.submenu.top - 6) / kMenuRow);
-            return row < moreModels_.size() ? Hit{Target::MoreRow, row} : Hit{Target::InsidePopup};
-        }
         if (Inside(g.popup, x, y)) {
-            if (Inside(g.more, x, y)) {
-                return {Target::MoreModels};
-            }
             if (y >= g.modelsTop) {
                 const auto row = static_cast<size_t>((y - g.modelsTop) / kMenuRow);
                 if (row < mainModels_.size()) {
@@ -6271,29 +6275,6 @@ void ChatWindow::PaintModels(const Geometry& g) {
         const bool hovered = hover_.target == Target::ModelRow && hover_.row == i;
         rowFor(mainModels_[i], r, hovered, i < 9 ? std::to_wstring(i + 1) : L"");
     }
-    if (moreModels_.empty()) {
-        return;
-    }
-    brush_->SetColor(Color(kLine));
-    target_->FillRectangle(D2D1::RectF(g.popup.left + 10, g.more.top - 5, g.popup.right - 10, g.more.top - 4),
-                           brush_.get());
-    if (moreOpen_ || hover_.target == Target::MoreModels) {
-        Fill(g.more, 6.f, kRaised);
-    }
-    Text(L"Ещё модели", ui_.get(), D2D1::RectF(g.more.left + 10, g.more.top, g.more.right - 30, g.more.bottom),
-         kPrimary);
-    const D2D1_POINT_2F c{g.more.right - 16, (g.more.top + g.more.bottom) / 2};
-    Line({c.x - 2.f, c.y - 4.f}, {c.x + 2.f, c.y}, kSecondary, 1.5f);
-    Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.5f);
-
-    if (moreOpen_) {
-        PaintPanel(g.submenu);
-        for (size_t i = 0; i < moreModels_.size(); ++i) {
-            const float top = g.submenu.top + 6 + static_cast<float>(i) * kMenuRow;
-            const D2D1_RECT_F r = D2D1::RectF(g.submenu.left + 6, top, g.submenu.right - 6, top + kMenuRow);
-            rowFor(moreModels_[i], r, hover_.target == Target::MoreRow && hover_.row == i, L"");
-        }
-    }
 }
 
 void ChatWindow::PaintEffort(const Geometry& g) {
@@ -8076,12 +8057,10 @@ void ChatWindow::OpenPopup(Popup popup) {
     popup_ = popup;
     hover_ = {};
     switch (popup) {
-    case Popup::Models:
-        moreOpen_ = false;
-        break;
     case Popup::Effort:
         pendingEffort_ = settings_.effort;
         break;
+    case Popup::Models:
     case Popup::Usage:
     case Popup::Image:
     case Popup::None:
@@ -8103,7 +8082,6 @@ void ChatWindow::ClosePopup() {
     }
     const Popup was = popup_;
     popup_ = Popup::None;
-    moreOpen_ = false;
     hover_ = {};
     if (was == Popup::Image) {
         viewer_ = {};
@@ -8251,20 +8229,26 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     RebuildRows();  // no new chat under the project any more
 }
 
-// The CLI lists aliases (opus, sonnet…) and pinned versions (claude-opus-4-8…): the aliases are the
-// main list, the versions go under "more"; "default" itself is shown as a badge on what it means.
+// The menu shows the newest models only (27.10.2026, his: are the old ones of any use?). Claude's CLI lists
+// aliases (opus, sonnet…, always the newest) and pinned versions (claude-opus-4-8…): the aliases stay. Grok's
+// lists its generations (grok-4.7, grok-4.7-build-fast, grok-4.6…): the newest one stays, Fast included.
+// "default" itself is shown as a badge on what it means.
 void ChatWindow::IndexModels() {
     mainModels_.clear();
-    moreModels_.clear();
     defaultResolved_.clear();
+    std::pair<int, int> newestGrok{-1, -1};
+    for (const Json& model : models_) {
+        if (const std::string value = JsonStr(model, "value"); value.starts_with("grok-")) {
+            newestGrok = std::max(newestGrok, GrokVersion(value));
+        }
+    }
     for (size_t i = 0; i < models_.size(); ++i) {
         const std::string value = JsonStr(models_[i], "value");
         if (value == "default") {
             defaultResolved_ = JsonStr(models_[i], "resolvedModel");
-        } else if (value.find('-') == std::string::npos || value.starts_with("grok-")) {
+        } else if (value.starts_with("grok-") ? GrokVersion(value) == newestGrok
+                                              : value.find('-') == std::string::npos) {
             mainModels_.push_back(i);
-        } else {
-            moreModels_.push_back(i);
         }
     }
 }
@@ -8285,9 +8269,9 @@ const Json* ChatWindow::CurrentModel() const {
             return &model;
         }
     }
-    for (const size_t i : moreModels_) {
-        if (JsonStr(models_[i], "value") == settings_.model) {
-            return &models_[i];
+    for (const Json& model : models_) {  // one picked before the menu stopped showing it: still named
+        if (JsonStr(model, "value") == settings_.model) {
+            return &model;
         }
     }
     return nullptr;
@@ -8319,6 +8303,9 @@ std::vector<std::string> ChatWindow::EffortLevels() const {
             levels.push_back(level.get<std::string>());
         }
     }
+    std::stable_sort(levels.begin(), levels.end(), [](const std::string& a, const std::string& b) {
+        return EffortRank(a) < EffortRank(b);
+    });
     return levels;
 }
 

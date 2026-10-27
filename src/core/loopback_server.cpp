@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace aic {
 namespace {
@@ -150,13 +151,13 @@ void LoopbackServer::AcceptLoop() {
 void LoopbackServer::Serve(Connection& connection) {
     const SOCKET socket = connection.socket;
     std::string buffer;
-    char chunk[16384];
+    std::vector<char> chunk(16384);  // on the heap: the analyzer's stack limit
     const auto fill = [&] {
-        const int got = recv(socket, chunk, sizeof(chunk), 0);
+        const int got = recv(socket, chunk.data(), static_cast<int>(chunk.size()), 0);
         if (got <= 0) {
             return false;
         }
-        buffer.append(chunk, static_cast<size_t>(got));
+        buffer.append(chunk.data(), static_cast<size_t>(got));
         return true;
     };
 

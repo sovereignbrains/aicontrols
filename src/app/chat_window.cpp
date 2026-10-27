@@ -1239,6 +1239,7 @@ private:
     std::optional<FeedPoint> feedAnchor_;  // where a selection in the feed began
     std::optional<FeedPoint> feedFocus_;   // ... and where it ends now
     bool feedSelecting_ = false;           // the mouse is dragging one
+    D2D1_POINT_2F feedPress_{};            // where it was pressed: let go near there, it is a click (a link opens)
     std::vector<GithubRepo> repos_;  // as GitHub listed them for the GITHUB secret
     std::wstring reposError_;
     bool reposLoading_ = false;
@@ -1990,6 +1991,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 ClearFeedSelection();
                 feedAnchor_ = FeedPointAt(g, at.x, at.y);
                 feedFocus_ = feedAnchor_;
+                feedPress_ = at;
                 feedSelecting_ = feedAnchor_.has_value();
                 if (feedSelecting_) {
                     SetCapture(hwnd_);
@@ -2027,9 +2029,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (feedSelecting_) {
             feedSelecting_ = false;
             ReleaseCapture();
-            if (!HasFeedSelection()) {  // a plain click: nothing selected, a link opens
+            // A plain click, a hand's tremor across a letter's edge included: nothing selected, a link opens.
+            const D2D1_POINT_2F at = CursorDip(lParam);
+            if (!HasFeedSelection() || (std::abs(at.x - feedPress_.x) < 4.f && std::abs(at.y - feedPress_.y) < 4.f)) {
                 ClearFeedSelection();
-                const D2D1_POINT_2F at = CursorDip(lParam);
                 const std::wstring url = LinkAt(Layout(), at.x, at.y);
                 if (url.starts_with(L"http://") || url.starts_with(L"https://") || url.starts_with(L"mailto:")) {
                     ShellExecuteW(hwnd_, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);

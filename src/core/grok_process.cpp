@@ -110,6 +110,7 @@ void GrokProcess::Start(const ClaudeOptions& options, MessageHandler onMessage, 
         pendingModel_.clear();
         textOpen_ = false;
         permissions_.clear();
+        refusals_.clear();
         mcp_.clear();
     }
 
@@ -286,14 +287,25 @@ void GrokProcess::Respond(const std::string& requestId, Json response) {
         permissions_.erase(it);
     }
     const bool allow = JsonStr(response, "behavior") == "allow";
-    const char* wanted = allow ? "allow_once" : "reject_once";
+    const bool stopped = JsonAt(response, "interrupt").is_boolean() && JsonAt(response, "interrupt").get<bool>();
+    // A "no" to one of our tools is let through and answered by our MCP server with the reason: refused there,
+    // Grok cancels every other call of the step and ends the turn without a word (28.10.2026, his: "оборвалось").
+    const std::string tool = JsonStr(entry, "tool");
+    const bool refuseInside = !allow && !stopped && !tool.empty();
+    if (refuseInside) {
+        std::string message = JsonStr(response, "message");
+        std::lock_guard lock(stateMutex_);
+        refusals_.push_back(Refusal{tool, JsonAt(entry, "input"),
+                                    message.empty() ? std::string("The user declined this call.") : std::move(message)});
+    }
+    const char* wanted = allow || refuseInside ? "allow_once" : "reject_once";
     std::string optionId;
     for (const Json& option : JsonAt(entry, "options")) {
         if (JsonStr(option, "kind") == wanted) {
             optionId = JsonStr(option, "optionId");
         }
     }
-    if (optionId.empty()) {
+    if (optionId.empty() || stopped) {  // ACP's answer to a prompt left when the turn is cancelled
         Reply(JsonAt(entry, "id"), Json{{"outcome", {{"outcome", "cancelled"}}}});
         return;
     }
@@ -461,9 +473,14 @@ void GrokProcess::OnRequest(const Json& id, const std::string& method, const Jso
     const Json& raw = JsonAt(call, "rawInput");
     std::string name;
     Json input;
+    std::string ours;  // our MCP server's name of the tool, when it is one of ours
     if (JsonStr(raw, "variant") == "UseTool") {
-        name = "mcp__" + JsonStr(raw, "tool_name");  // aic__run_command -> mcp__aic__run_command
+        const std::string tool = JsonStr(raw, "tool_name");
+        name = "mcp__" + tool;  // aic__run_command -> mcp__aic__run_command
         input = JsonAt(raw, "tool_input");
+        if (const std::string prefix = std::string(kToolServer) + "__"; tool.starts_with(prefix)) {
+            ours = tool.substr(prefix.size());
+        }
     } else {
         name = JsonStr(call, "title");  // not ours: the window refuses it
         input = raw;
@@ -472,7 +489,7 @@ void GrokProcess::OnRequest(const Json& id, const std::string& method, const Jso
     {
         std::lock_guard lock(stateMutex_);
         requestId = "perm_" + std::to_string(++permissionCounter_);
-        permissions_[requestId] = Json{{"id", id}, {"options", JsonAt(params, "options")}};
+        permissions_[requestId] = Json{{"id", id}, {"options", JsonAt(params, "options")}, {"tool", ours}, {"input", input}};
         textOpen_ = false;
     }
     Emit(Json{{"type", "control_request"},
@@ -623,6 +640,7 @@ void GrokProcess::FinishTurn(const Json& result, const Json& error) {
         std::lock_guard lock(stateMutex_);
         turnActive_ = false;
         textOpen_ = false;
+        refusals_.clear();  // a "no" whose call never came: not carried to the next turn
         more = !queue_.empty();
     }
     Json out{{"type", "result"}, {"subtype", "success"}, {"is_error", false}};
@@ -715,6 +733,24 @@ std::string GrokProcess::HandleMcpRequest(const std::string& body) {
     std::string requestId;
     {
         std::lock_guard lock(stateMutex_);
+        if (JsonStr(request, "method") == "tools/call" && !refusals_.empty()) {
+            // A call the user said no to: the same tool with the same input, or, failing that, the same tool
+            // (when in doubt it is refused, never run).
+            const Json& params = JsonAt(request, "params");
+            const std::string tool = JsonStr(params, "name");
+            auto it = std::ranges::find_if(refusals_, [&](const Refusal& refusal) {
+                return refusal.tool == tool && refusal.input == JsonAt(params, "arguments");
+            });
+            if (it == refusals_.end()) {
+                it = std::ranges::find_if(refusals_, [&](const Refusal& refusal) { return refusal.tool == tool; });
+            }
+            if (it != refusals_.end()) {
+                Json result{{"content", Json::array({Json{{"type", "text"}, {"text", it->message}}})}, {"isError", true}};
+                refusals_.erase(it);
+                return Json{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}}.dump(
+                    -1, ' ', false, Json::error_handler_t::replace);
+            }
+        }
         requestId = "mcp_" + std::to_string(++mcpCounter_);
         mcp_[requestId] = McpWait{};
     }

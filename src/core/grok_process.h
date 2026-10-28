@@ -118,7 +118,13 @@ private:
     unsigned messageCounter_ = 0;
     std::string messageId_;
     unsigned permissionCounter_ = 0;
-    std::map<std::string, Json> permissions_;  // our request id -> {id (the agent's), options}
+    std::map<std::string, Json> permissions_;  // our request id -> {id (the agent's), options, tool, input}
+    struct Refusal {  // a call of ours the user said no to: let through by ACP, refused by our MCP server
+        std::string tool;     // our name: run_command
+        Json input;
+        std::string message;  // what Grok reads as the call's result
+    };
+    std::vector<Refusal> refusals_;
     unsigned mcpCounter_ = 0;
     struct McpWait {
         bool done = false;

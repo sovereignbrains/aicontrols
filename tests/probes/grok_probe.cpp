@@ -58,9 +58,15 @@ int wmain(int argc, wchar_t** argv) {
                     std::cout << "[mcp] " << aic::JsonStr(aic::JsonAt(request, "message"), "method") << "\n";
                     host.HandleMcp(id, request);
                 } else if (subtype == "can_use_tool") {
-                    std::cout << "[allow] " << aic::JsonStr(request, "tool_name") << " "
+                    const std::string own = aic::OwnToolName(aic::JsonStr(request, "tool_name"));
+                    // AIC_DENY=run_command: that tool is refused, as when he says no; the turn has to go on
+                    char denied[64] = {};
+                    GetEnvironmentVariableA("AIC_DENY", denied, sizeof(denied));
+                    std::cout << (own == denied ? "[deny] " : "[allow] ") << aic::JsonStr(request, "tool_name") << " "
                               << aic::JsonAt(request, "input").dump() << "\n";
-                    if (aic::OwnToolName(aic::JsonStr(request, "tool_name")).empty()) {
+                    if (!own.empty() && own == denied) {
+                        grok.Respond(id, aic::Json{{"behavior", "deny"}, {"message", "The user declined this call."}});
+                    } else if (own.empty()) {
                         grok.Respond(id, aic::Json{{"behavior", "deny"}, {"message", "not ours"}});
                     } else {
                         grok.Respond(id, aic::Json{{"behavior", "allow"}, {"updatedInput", aic::JsonAt(request, "input")}});

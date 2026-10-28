@@ -127,6 +127,25 @@ int main() {
     Expect(!r.isError && !Has(r.text, "hunter2value") && Has(r.text, "***"), "secret passed and scrubbed", r.text);
     r = run("run_command", {{"command", "Write-Output 1"}, {"env_secrets", {"NOPE"}}});
     Expect(r.isError && Has(r.text, "NOPE") && !Has(r.text, "[exit code"), "unknown secret runs nothing", r.text);
+    {  // any name he likes: Cyrillic and a space, as {{secret:...}} and as ${env:...}
+        const std::string spaced = "\xD0\xBF\xD0\xB0\xD1\x80\xD0\xBE\xD0\xBB\xD1\x8C \xD1\x82\xD0\xBE\xD1\x87\xD0\xBA\xD0\xB8";
+        secrets.Set(spaced, "wifipass9");
+        r = run("run_command", {{"command", "Write-Output (\"{{secret:" + spaced + "}}\" -eq 'wifipass9'); ${env:" + spaced +
+                                                "}.Length; ${env:" + spaced + "}"},
+                                {"env_secrets", {spaced}}});
+        Expect(!r.isError && Has(r.text, "True") && Has(r.text, "9") && Has(r.text, "***") && !Has(r.text, "wifipass9"),
+               "a secret named with Cyrillic and a space", r.text);
+        const std::string listed = tools.Definitions().dump(-1, ' ', false);
+        Expect(Has(listed, "\\\"" + spaced + "\\\""), "such a name is quoted in the list", listed);
+        r = run("run_command", {{"command", "id"}, {"on", "root@example.invalid"}, {"env_secrets", {spaced}}});
+        Expect(r.isError && Has(r.text, "{{secret:") && !Has(r.text, "[exit code"),
+               "a server cannot have it as a variable: told, nothing run", r.text);
+        secrets.Set("A=B", "eqvalue1");
+        r = run("run_command", {{"command", "Write-Output 1"}, {"env_secrets", {"A=B"}}});
+        Expect(r.isError && Has(r.text, "{{secret:A=B}}") && !Has(r.text, "[exit code"), "= cannot name a variable", r.text);
+        secrets.Remove("A=B");
+        secrets.Remove(spaced);
+    }
     {
         std::atomic<bool> stop = false;
         std::thread canceller([&] {

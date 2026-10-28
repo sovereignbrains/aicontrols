@@ -784,6 +784,7 @@ Settings LoadSettings() {
     settings.model = JsonStr(data, "model");
     settings.effort = JsonStr(data, "effort");
     settings.permissions = JsonStr(data, "permissions");
+    settings.grokPermissions = JsonStr(data, "grokPermissions");
     settings.claudeModels = JsonStr(data, "claudeModels");
     settings.claudeModel = JsonStr(data, "claudeModel");
     settings.connectors = JsonAt(data, "connectors").is_boolean() && JsonAt(data, "connectors").get<bool>();
@@ -851,6 +852,7 @@ void SaveSettings(const Settings& settings) {
     out << Json{{"model", settings.model},
                 {"effort", settings.effort},
                 {"permissions", settings.permissions},
+                {"grokPermissions", settings.grokPermissions},
                 {"claudeModels", settings.claudeModels},
                 {"claudeModel", settings.claudeModel},
                 {"connectors", settings.connectors},

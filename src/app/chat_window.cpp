@@ -891,6 +891,11 @@ private:
     void ShowPermissionMenu();
     std::wstring PermissionName() const;
     bool AllowedUnasked(const std::string& tool, const Json& input) const;
+    // Claude and Grok each have their own mode: the chip and its menu show the chosen model's, a call is
+    // let through by the mode of the CLI that asks.
+    const std::string& ModeOf(bool grok) const { return grok ? settings_.grokPermissions : settings_.permissions; }
+    const std::string& ChosenMode() const { return ModeOf(GrokSelected()); }
+    const std::string& RunningMode() const { return ModeOf(GrokRunning()); }
 
     // The account: `claude auth status / login / logout`, each on its own thread.
     bool SignedOut() const { return auth_.known && !auth_.loggedIn && !GrokSelected(); }
@@ -3193,7 +3198,7 @@ void ChatWindow::CreateInput() {
     SetWindowSubclass(input_, &ChatWindow::InputProc, kSubclassId, reinterpret_cast<DWORD_PTR>(this));
     StyleInput();
     fieldBrush_.reset(CreateSolidBrush(ToColorRef(kRaised)));
-    nameEdit_ = CreateSecretField(false, L"Имя, например GITHUB");
+    nameEdit_ = CreateSecretField(false, L"Любое имя или ssh user@host");
     valueEdit_ = CreateSecretField(true, L"Значение");
     PlaceChildren();
     SetFocus(input_);
@@ -3879,7 +3884,7 @@ void ChatWindow::PaintInput(const Geometry& g) {
         }
         Text(PermissionName(), ui_.get(),
              D2D1::RectF(g.permission.left + 9, g.permission.top, g.permission.right, g.permission.bottom),
-             settings_.permissions == "all" ? kAccent : (active ? kPrimary : kSecondary));
+             ChosenMode() == "all" ? kAccent : (active ? kPrimary : kSecondary));
     }
     if (g.effort.right > g.effort.left) {
         const bool effortActive = hover_.target == Target::EffortChip || popup_ == Popup::Effort;
@@ -4114,15 +4119,26 @@ void ChatWindow::SetSecretsOpen(bool open) {
 void ChatWindow::SubmitSecret() {
     std::wstring name = Trimmed(FieldText(nameEdit_));
     std::wstring value = Trimmed(FieldText(valueEdit_));
-    const bool validName = !name.empty() && !std::iswdigit(name[0]) &&
-                           std::ranges::all_of(name, [](wchar_t c) { return c < 128 && (std::iswalnum(c) || c == L'_'); });
-    // "ssh root@1.2.3.4" (or "root@1.2.3.4") holds that server's password: `on` logs in with it.
-    if (const std::string server = ServerSecretName(ToUtf8(name)); !server.empty()) {
-        name = ToWide(server);
-    } else if (!validName) {
-        Flash(L"Имя: латиница, цифры и _, или ssh user@host для пароля сервера", 3500);
+    // Any name he likes (28.10.2026, his: "ни разу не сделал название, которое хотел"), except what would break
+    // {{secret:NAME}}. One that starts with "ssh " is a server's password: `on` logs in with it.
+    if (name.empty()) {
+        Flash(L"Введите имя", 2500);
         SetFocus(nameEdit_);
         return;
+    }
+    if (name.find(L"}}") != std::wstring::npos || name.back() == L'}') {
+        Flash(L"Имя не может содержать }} или кончаться на }", 3500);
+        SetFocus(nameEdit_);
+        return;
+    }
+    if (name.starts_with(L"ssh ")) {
+        const std::string server = ServerSecretName(ToUtf8(name));
+        if (server.empty()) {
+            Flash(L"После ssh нужен сервер: ssh user@host или ssh user@host:port", 3500);
+            SetFocus(nameEdit_);
+            return;
+        }
+        name = ToWide(server);
     }
     if (value.empty()) {
         Flash(L"Введите значение", 2500);
@@ -5751,28 +5767,29 @@ void ChatWindow::ShowFolderMenu(POINT screen) {
 }
 
 std::wstring ChatWindow::PermissionName() const {
-    if (settings_.permissions == "all") {
+    const std::string& mode = ChosenMode();
+    if (mode == "all") {
         return L"Без вопросов";
     }
-    if (settings_.permissions == "auto") {
+    if (mode == "auto") {
         return L"Auto";  // as the model's and the effort's Auto beside it
     }
-    if (settings_.permissions == "plan") {
+    if (mode == "plan") {
         return L"План";
     }
-    return settings_.permissions == "edits" ? L"Файлы без вопросов" : L"Спрашивать";
+    return mode == "edits" ? L"Файлы без вопросов" : L"Спрашивать";
 }
 
-// A call that changes something, which the chosen mode lets through without its card.
+// A call that changes something, which the running CLI's mode lets through without its card.
 bool ChatWindow::AllowedUnasked(const std::string& tool, const Json& input) const {
-    if (settings_.permissions == "all") {
+    const std::string& mode = RunningMode();
+    if (mode == "all") {
         return true;
     }
-    if (settings_.permissions == "auto") {
+    if (mode == "auto") {
         return AutoAllows(tool, input);
     }
-    return settings_.permissions == "edits" && (tool == "write_file" || tool == "edit_file") &&
-           JsonStr(input, "on").empty();
+    return mode == "edits" && (tool == "write_file" || tool == "edit_file") && JsonStr(input, "on").empty();
 }
 
 void ChatWindow::ShowPermissionMenu() {
@@ -5785,15 +5802,18 @@ void ChatWindow::ShowPermissionMenu() {
         L"Без вопросов\tвсё сразу, без подтверждений"};
     wil::unique_hmenu menu(CreatePopupMenu());
     for (size_t i = 0; i < kModes.size(); ++i) {
-        AppendMenuW(menu.get(), MF_STRING | (settings_.permissions == kModes[i] ? MF_CHECKED : 0),
+        AppendMenuW(menu.get(), MF_STRING | (ChosenMode() == kModes[i] ? MF_CHECKED : 0),
                     static_cast<UINT>(i + 1), kLabels[i]);
     }
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 0,
+                GrokSelected() ? L"Режим чатов Grok, у Claude свой" : L"Режим чатов Claude, у Grok свой");
     const Geometry g = Layout();
     POINT screen{ToPx(g.permission.left), ToPx(g.permission.top - 4.f)};
     ClientToScreen(hwnd_, &screen);
     const auto chosen = static_cast<size_t>(Menu(menu.get(), screen, true));
     if (chosen >= 1 && chosen <= kModes.size()) {
-        settings_.permissions = kModes[chosen - 1];
+        (GrokSelected() ? settings_.grokPermissions : settings_.permissions) = kModes[chosen - 1];
         SaveSettings(settings_);
         for (size_t i = 0; i < feed_.size(); ++i) {  // the cards waiting now that the new mode lets through
             const FeedItem& item = feed_[i];
@@ -9649,7 +9669,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
         return;
     }
     ToolSummary summary = SummarizeTool(name, input);
-    if (settings_.permissions == "plan" && !ReadOnlyTool(name)) {
+    if (RunningMode() == "plan" && !ReadOnlyTool(name)) {
         Add(Kind::Notice, L"План: не выполнено — " + summary.title + L": " + summary.detail);
         runner_->agent->Respond(requestId, Json{{"behavior", "deny"},
                                         {"message", "Plan mode is on: nothing may be changed or run. Read what you "
@@ -9727,7 +9747,8 @@ void ChatWindow::Decide(size_t index, bool allow) {
 void ChatWindow::CancelApprovals() {
     for (FeedItem& item : feed_) {
         if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
-            runner_->agent->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The turn was stopped."}});
+            runner_->agent->Respond(item.requestId,
+                                    Json{{"behavior", "deny"}, {"message", "The turn was stopped."}, {"interrupt", true}});
             item.verdict = Verdict::Cancelled;
         }
     }

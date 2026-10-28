@@ -502,6 +502,12 @@ bool ApplyEdit(std::string& text, const Json& input, const std::string& where, s
     return true;
 }
 
+// A name that is a variable everywhere, $NAME in bash and $env:NAME in PowerShell; any other is a secret's name still.
+bool PlainName(std::string_view name) {
+    return !name.empty() && !(name[0] >= '0' && name[0] <= '9') &&
+           name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") == std::string_view::npos;
+}
+
 // The command, the secrets and the timeout of a run_command call; false with `error` when it cannot run.
 bool PrepareCommand(const SecretStore& secrets, const Json& input, std::string& command,
                     std::vector<std::pair<std::wstring, std::wstring>>& overrides, int& timeout, ToolResult& error) {
@@ -518,6 +524,13 @@ bool PrepareCommand(const SecretStore& secrets, const Json& input, std::string& 
             if (item.is_string()) {
                 names.push_back(item.get<std::string>());
             }
+        }
+    }
+    for (const std::string& name : names) {
+        if (name.find('=') != std::string::npos) {  // Windows cannot name a variable so; {{secret:NAME}} can
+            error = Error("The secret \"" + name + "\" cannot be an environment variable: write {{secret:" + name +
+                          "}} in the command instead. Nothing was run.");
+            return false;
         }
     }
     overrides = secrets.Environment(names, missing);
@@ -707,8 +720,9 @@ Json Tools::Definitions() const {
     for (const std::string& name : secrets_.Names()) {
         if (name.starts_with("ssh ")) {
             serverList += (serverList.empty() ? "" : ", ") + name.substr(4);
-        } else {
-            secretList += (secretList.empty() ? "" : ", ") + name;
+        } else {  // a name with spaces or commas in quotes, so the list shows where it ends
+            secretList += (secretList.empty() ? "" : ", ") +
+                          (PlainName(name) ? name : Json(name).dump(-1, ' ', false, Json::error_handler_t::replace));
         }
     }
     std::string known = secretList.empty() ? std::string(" No secrets are stored yet.") : " Stored secrets: " + secretList + ".";
@@ -728,7 +742,8 @@ Json Tools::Definitions() const {
              {"description",
               "Run a PowerShell command on this computer (non-interactive; with `on`, a bash/sh command on that "
               "server) and return its combined output and exit "
-              "code. Secrets: list names in env_secrets (they arrive as environment variables) or write "
+              "code. Secrets: list names in env_secrets (they arrive as environment variables; a name that is not "
+              "a plain identifier is ${env:NAME} in PowerShell and cannot be one on a server) or write "
               "{{secret:NAME}} in the command; their values are cut out of the output, so you never see them." + known},
              {"inputSchema",
               Schema({{"on", on},
@@ -888,9 +903,11 @@ ToolResult Tools::ExecuteOn(const std::string& on, const std::string& name, cons
         std::string script;
         for (const auto& [variable, value] : overrides) {
             const std::string key = ToUtf8(variable);
-            if (key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") == std::string::npos) {
-                script += "export " + key + "=" + ShQuote(ToUtf8(value)) + "\n";
+            if (!PlainName(key)) {  // bash has no such variable: said, not skipped without a word
+                return Error("The secret \"" + key + "\" cannot be an environment variable on a server: write {{secret:" +
+                             key + "}} in the command instead. Nothing was run.");
             }
+            script += "export " + key + "=" + ShQuote(ToUtf8(value)) + "\n";
         }
         if (const std::string dir = StringArg(input, "cwd"); !dir.empty()) {
             script += "cd " + ShPath(dir) + " || exit 1\n";

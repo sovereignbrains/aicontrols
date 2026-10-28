@@ -437,19 +437,6 @@ ToolResult Describe(const ProcessResult& run, int timeout, bool clixml) {
                       run.end != End::Exited || run.code != 0};
 }
 
-// This very program: ssh asks it for a server's password (AskPass in main.cpp).
-std::wstring OwnExe() {
-    std::wstring path(MAX_PATH, L'\0');
-    for (;;) {
-        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-        if (length < path.size()) {
-            path.resize(length);
-            return path;
-        }
-        path.resize(path.size() * 2);
-    }
-}
-
 // Runs `script` on a server through the system ssh.exe, with no prompts: by key, or by the password stored
 // for it (target.secret), which ssh gets from this program through SSH_ASKPASS, so it never passes through
 // the chat or a command line. A new host's key is remembered, stdin is `input`. The script travels as base64

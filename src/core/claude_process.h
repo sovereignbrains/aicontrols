@@ -108,8 +108,10 @@ SpawnedProcess SpawnPiped(const std::wstring& exe, std::wstring commandLine,
 
 // %USERPROFILE%\.local\bin\claude.exe (the native installer's place), else PATH; empty if none.
 std::wstring FindClaudeExe();
-// The way out for the CLI's HTTPS: the old client's bridge (2092), else sing-box's mixed port
-// (2080), else direct (empty).
+// This very program: ssh asks it for a server's password (AskPass in main.cpp).
+std::wstring OwnExe();
+// The way out for the CLI's HTTPS: our bridge (core/bridge.h); if it cannot listen, the old client's
+// bridge (2092), else sing-box's mixed port (2080), else direct (empty).
 std::wstring PickProxy();
 
 std::string ToUtf8(std::wstring_view text);

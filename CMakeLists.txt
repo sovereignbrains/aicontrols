@@ -25,6 +25,7 @@ add_library(aic_core STATIC
   src/core/app_update.cpp
   src/core/attachment.cpp
   src/core/auth.cpp
+  src/core/bridge.cpp
   src/core/chat_export.cpp
   src/core/claude_install.cpp
   src/core/claude_process.cpp
@@ -68,7 +69,8 @@ endforeach()
 #   aic_github_probe  the repositories the GITHUB secret reaches, and a clone
 #   aic_store_probe   the titles of the real chats; --delete <id>
 #   aic_memory_probe  the memory folder committed and pushed (GITHUB in the environment)
-foreach(name e2e grok github store memory)
+#   aic_bridge_probe  the CLIs' way out listening, for curl -x; --no-direct: as with the VPN off
+foreach(name e2e grok github store memory bridge)
   add_executable(aic_${name}_probe tests/probes/${name}_probe.cpp)
   target_link_libraries(aic_${name}_probe PRIVATE aic_core)
 endforeach()

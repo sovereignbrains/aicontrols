@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "core/bridge.h"
+
 namespace aic {
 namespace {
 
@@ -434,7 +436,22 @@ std::wstring FindClaudeExe() {
     return {};
 }
 
+std::wstring OwnExe() {
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length < path.size()) {
+            path.resize(length);
+            return path;
+        }
+        path.resize(path.size() * 2);
+    }
+}
+
 std::wstring PickProxy() {
+    if (std::wstring bridge = BridgeUrl(); !bridge.empty()) {
+        return bridge;
+    }
     static const bool winsock = [] {
         WSADATA data{};
         return WSAStartup(MAKEWORD(2, 2), &data) == 0;

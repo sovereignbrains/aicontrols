@@ -92,7 +92,8 @@ std::optional<std::string> ChatMarkdown(const std::wstring& workspace, const std
             heading.reset();
             break;
         case EntryKind::Tool: {
-            const std::string own = OwnToolName(ToUtf8(entry.text));
+            const std::string full = ToUtf8(entry.text);
+            const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
             const Json input = Json::parse(entry.toolInput, nullptr, false);
             const ToolSummary summary =
                 !own.empty() && input.is_object() ? SummarizeTool(own, input) : ToolSummary{entry.text, {}};
@@ -100,9 +101,14 @@ std::optional<std::string> ChatMarkdown(const std::wstring& workspace, const std
             if (!summary.detail.empty()) {
                 out += Fenced(ToUtf8(summary.detail));
             }
-            if (entry.toolAnswered && !entry.toolOutput.empty()) {
-                out += std::string(entry.toolFailed ? "\nОшибка:\n\n" : "\nВывод:\n\n") +
-                       Fenced(Head(ToUtf8(entry.toolOutput)));
+            std::string output = ToUtf8(entry.toolOutput);
+            if (GrokOwnTool(own)) {
+                if (const Json made = Json::parse(output, nullptr, false); !JsonStr(made, "path").empty()) {
+                    output = JsonStr(made, "path");  // the picture or video Grok saved
+                }
+            }
+            if (entry.toolAnswered && !output.empty()) {
+                out += std::string(entry.toolFailed ? "\nОшибка:\n\n" : "\nВывод:\n\n") + Fenced(Head(output));
             }
             out += "\n</details>\n";
             break;

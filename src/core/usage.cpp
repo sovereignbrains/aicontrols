@@ -4,12 +4,15 @@
 
 #include <winhttp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <regex>
 #include <sstream>
 
 #include <wil/resource.h>
@@ -86,6 +89,76 @@ long long ParseIsoTime(const std::string& text) {
         return text[sign] == '+' ? utc - offset : utc + offset;
     }
     return utc < 0 ? 0 : utc;
+}
+
+PlanUsage ParseGrokBilling(const std::string& json) {
+    PlanUsage usage;
+    const Json data = Json::parse(json, nullptr, false);
+    const Json& config = JsonAt(data, "config");
+    const Json& used = JsonAt(config, "creditUsagePercent");
+    if (!used.is_number()) {
+        return usage;
+    }
+    const Json& period = JsonAt(config, "currentPeriod");
+    usage.weekPercent = static_cast<int>(std::lround(used.get<double>()));
+    usage.weekResets = ParseIsoTime(JsonStr(period, "end").empty() ? JsonStr(config, "billingPeriodEnd")
+                                                                   : JsonStr(period, "end"));
+    usage.monthly = JsonStr(period, "type").find("MONTH") != std::string::npos;
+    usage.tier = JsonStr(data, "subscription_tier");
+    usage.ok = true;
+    return usage;
+}
+
+MoscowClock MoscowTime(long long unixSeconds) {
+    const long long moscow = std::max(0LL, unixSeconds) + 3 * 3600;
+    const long long days = moscow / 86400;
+    const int minutes = static_cast<int>(moscow % 86400 / 60);
+    const std::chrono::year_month_day date{std::chrono::sys_days{std::chrono::days{days}}};
+    return MoscowClock{static_cast<int>((days + 4) % 7),  // 1 Jan 1970 was a Thursday
+                       minutes / 60,
+                       minutes % 60,
+                       static_cast<int>(static_cast<unsigned>(date.day())),
+                       static_cast<int>(static_cast<unsigned>(date.month()))};
+}
+
+std::wstring LimitInMoscow(const std::wstring& text) {
+    static const std::wregex said(
+        LR"(^You['’]ve hit your (.+?) limit(?: · resets (?:(\w{3}) (\d{1,2}), )?(\d{1,2})(?::(\d{2}))?([ap]m)(?: \(([^)]*)\))?)?\.?$)");
+    std::wsmatch match;
+    if (!std::regex_match(text, match, said)) {
+        return text;
+    }
+    const std::wstring window = match[1];
+    std::wstring head;
+    if (window == L"5-hour" || window == L"session") {
+        head = L"Лимит сессии (5 ч) исчерпан";
+    } else if (window == L"weekly" || window == L"week" || window == L"7-day") {
+        head = L"Недельный лимит исчерпан";
+    } else {
+        head = L"Лимит " + window + L" исчерпан";
+    }
+    if (!match[6].matched) {
+        return head;  // no time in it: nothing to move
+    }
+    if (match[7].matched && match[7].str() != L"Europe/Moscow") {
+        return text;  // another zone: not ours to convert
+    }
+    const int hour = std::stoi(match[4]) % 12 + (match[6] == L"pm" ? 12 : 0);
+    const int minute = match[5].matched ? std::stoi(match[5]) : 0;
+    std::wstring when = std::format(L"в {:02}:{:02} мск", hour, minute);
+    if (match[2].matched) {
+        static constexpr const wchar_t* months[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
+                                                    L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+        static constexpr const wchar_t* names[] = {L"янв", L"фев", L"мар", L"апр", L"мая", L"июн",
+                                                   L"июл", L"авг", L"сен", L"окт", L"ноя", L"дек"};
+        for (size_t i = 0; i < std::size(months); ++i) {
+            if (match[2] == months[i]) {
+                when = match[3].str() + L" " + names[i] + L" " + when;
+                break;
+            }
+        }
+    }
+    return head + L" · сброс " + when;
 }
 
 PlanUsage ParsePlanUsage(const std::string& json) {

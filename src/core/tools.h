@@ -29,13 +29,19 @@ struct ToolSummary {
 
 // A tool's name as the model sees it (mcp__aic__run_command) → ours (run_command); empty if it is not ours.
 std::string OwnToolName(const std::string& fullName);
+// Grok's own tools that its agent profile lets through: the web and Imagine (web_search, web_fetch, image_gen,
+// image_edit, image_to_video, reference_to_video). GrokProcess hands them on as grok__<name>.
+inline constexpr const char* kGrokToolPrefix = "grok__";
+bool GrokOwnTool(const std::string& name);
+// grok__image_gen → image_gen; empty for anything else.
+std::string GrokToolName(const std::string& fullName);
 // The tools that change nothing: reading and listing files, and this client's chats.
 bool ReadOnlyTool(const std::string& name);
 // Reading and listing run without asking; commands and writes wait for the user.
 // Anything aimed at a server (`on`) waits too.
 bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object());
-// The "Auto" permission mode: file edits here and commands that look harmless go without asking; deleting,
-// installing, the network, secrets, the system and anything aimed at a server still wait for the user.
+// The "Auto" permission mode: file edits here, Grok's pictures and commands that look harmless go without asking;
+// deleting, installing, the network, secrets, the system, videos and anything aimed at a server still wait.
 bool AutoAllows(const std::string& name, const Json& input);
 ToolSummary SummarizeTool(const std::string& name, const Json& input);
 // The name of the secret that holds a server's password, "ssh user@host[:port]", for what the user typed as a

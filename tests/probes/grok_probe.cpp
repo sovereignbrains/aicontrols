@@ -1,5 +1,6 @@
 // Manual end-to-end probe (spends one short request): the real grok.exe with our MCP tools.
-// Usage: aic_grok_probe.exe "<prompt>" [model]    Allows every tool call and prints what happens.
+// Usage: aic_grok_probe.exe "<prompt>" [model]    Allows every tool call (ours and Grok's own: the web, Imagine)
+// and prints what happens.
 #include <windows.h>
 
 #include <chrono>
@@ -41,6 +42,12 @@ int wmain(int argc, wchar_t** argv) {
 
     aic::ClaudeOptions options;
     options.cwd = workspace;
+    // AIC_CWD: another folder, so the probe's session is not among his chats.
+    std::wstring cwd(MAX_PATH, L'\0');
+    cwd.resize(GetEnvironmentVariableW(L"AIC_CWD", cwd.data(), static_cast<DWORD>(cwd.size())));
+    if (!cwd.empty()) {
+        options.cwd = cwd;
+    }
     options.appendSystemPrompt = aic::Tools::SystemPrompt();  // as the window starts it
     options.proxy = aic::PickProxy();
     options.model = argc >= 3 ? aic::ToUtf8(argv[2]) : "";
@@ -58,7 +65,8 @@ int wmain(int argc, wchar_t** argv) {
                     std::cout << "[mcp] " << aic::JsonStr(aic::JsonAt(request, "message"), "method") << "\n";
                     host.HandleMcp(id, request);
                 } else if (subtype == "can_use_tool") {
-                    const std::string own = aic::OwnToolName(aic::JsonStr(request, "tool_name"));
+                    const std::string full = aic::JsonStr(request, "tool_name");
+                    const std::string own = aic::OwnToolName(full).empty() ? aic::GrokToolName(full) : aic::OwnToolName(full);
                     // AIC_DENY=run_command: that tool is refused, as when he says no; the turn has to go on
                     char denied[64] = {};
                     GetEnvironmentVariableA("AIC_DENY", denied, sizeof(denied));

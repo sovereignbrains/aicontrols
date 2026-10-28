@@ -568,6 +568,19 @@ std::string OwnToolName(const std::string& fullName) {
     return fullName.starts_with(prefix) ? fullName.substr(prefix.size()) : std::string();
 }
 
+bool GrokOwnTool(const std::string& name) {
+    return name == "web_search" || name == "web_fetch" || name == "image_gen" || name == "image_edit" ||
+           name == "image_to_video" || name == "reference_to_video";
+}
+
+std::string GrokToolName(const std::string& fullName) {
+    if (!fullName.starts_with(kGrokToolPrefix)) {
+        return {};
+    }
+    std::string name = fullName.substr(std::string_view(kGrokToolPrefix).size());
+    return GrokOwnTool(name) ? name : std::string();
+}
+
 bool ReadOnlyTool(const std::string& name) {
     return name == "read_file" || name == "list_directory" || name == "list_chats" || name == "read_chat";
 }
@@ -623,7 +636,7 @@ bool AutoAllows(const std::string& name, const Json& input) {
     if (!StringArg(input, "on").empty()) {
         return false;
     }
-    if (name == "write_file" || name == "edit_file") {
+    if (name == "write_file" || name == "edit_file" || name == "image_gen" || name == "image_edit") {
         return true;
     }
     if (name != "run_command") {
@@ -636,6 +649,39 @@ bool AutoAllows(const std::string& name, const Json& input) {
 }
 
 namespace {
+
+// The pictures one of Grok's calls starts from, a line each: what it draws over or brings to life.
+std::wstring SourcePictures(const Json& input) {
+    std::wstring lines;
+    const auto add = [&](const Json& value) {
+        if (value.is_string()) {
+            lines += L"\n" + ToWide(value.get<std::string>());
+        }
+    };
+    for (const char* key : {"image", "first_frame", "last_frame"}) {
+        add(JsonAt(input, key));
+    }
+    for (const Json& image : JsonAt(input, "images")) {
+        add(image);
+    }
+    return lines;
+}
+
+// What Grok is asked to make, beyond the prompt: "6 с · 480p · 16:9".
+std::wstring Shape(const Json& input) {
+    std::wstring shape;
+    const auto add = [&](const std::wstring& part) {
+        if (!part.empty()) {
+            shape += (shape.empty() ? L"" : L" · ") + part;
+        }
+    };
+    if (const Json& duration = JsonAt(input, "duration"); duration.is_number()) {
+        add(std::format(L"{:g} с", duration.get<double>()));
+    }
+    add(ToWide(StringArg(input, "resolution_name")));
+    add(ToWide(StringArg(input, "aspect_ratio")));
+    return shape.empty() ? shape : L"\n" + shape;
+}
 
 ToolSummary SummarizeHere(const std::string& name, const Json& input) {
     const std::wstring path = ToWide(StringArg(input, "path"));
@@ -674,6 +720,24 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
     }
     if (name == "read_chat") {
         return {L"Прочитать чат", ToWide(StringArg(input, "id")) + (project.empty() ? L"" : L"\n" + project)};
+    }
+    // Grok's own: the web and Imagine.
+    const std::wstring prompt = ToWide(StringArg(input, "prompt"));
+    if (name == "web_search") {
+        return {L"Поиск в интернете", ToWide(StringArg(input, "query"))};
+    }
+    if (name == "web_fetch") {
+        return {L"Открыть страницу", ToWide(StringArg(input, "url"))};
+    }
+    if (name == "image_gen") {
+        return {L"Картинка", prompt + Shape(input)};
+    }
+    if (name == "image_edit") {
+        return {L"Изменить картинку", prompt + SourcePictures(input) + Shape(input)};
+    }
+    if (name == "image_to_video" || name == "reference_to_video") {
+        return {name == "image_to_video" ? L"Видео из картинки" : L"Видео по образцам",
+                prompt + SourcePictures(input) + Shape(input)};
     }
     return {ToWide(name), ToWide(Truncated(input.dump(-1, ' ', false, Json::error_handler_t::replace), 800))};
 }

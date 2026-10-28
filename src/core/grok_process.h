@@ -25,11 +25,12 @@ namespace aic {
 // The chat window knows Claude's stream-json; this class translates ACP into it:
 //   agent_message_chunk       -> stream_event (text_delta)
 //   session/request_permission -> control_request can_use_tool   (answered through Respond)
-//   tool_call_update          -> user / tool_result
+//   tool_call_update          -> user / tool_result, or aic_tool for a web search (it asks nobody)
 //   session/prompt's answer   -> result
 // Our five tools reach Grok as an MCP server over HTTP on the loopback (LoopbackServer), and each request
 // of it goes out as Claude's control_request mcp_message, so ToolHost serves both CLIs alike.
-// Grok's own tools are cut down by an agent profile to the two that reach MCP.
+// Grok's own tools are cut down by an agent profile to the two that reach MCP, the web and Imagine; those
+// are asked about as grok__<name> (GrokOwnTool).
 // ClaudeOptions is reused: exe (grok.exe), cwd, proxy, model, effort, resume, appendSystemPrompt (the rules).
 class GrokProcess : public AgentProcess {
 public:
@@ -48,6 +49,10 @@ public:
     void SetModel(const std::string& model) override;
     void Respond(const std::string& requestId, Json response) override;
     void RespondError(const std::string& requestId, std::string_view error) override;
+
+    // Asks what the plan has left (ACP _x.ai/billing, what Grok's /usage shows); the answer comes as an aic_usage
+    // message with the result under "billing". Nothing before the session is open.
+    void RequestUsage();
 
 private:
     using Callback = std::function<void(const Json& result, const Json& error)>;

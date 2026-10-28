@@ -32,13 +32,14 @@ std::string RandomToken() {
     return token;
 }
 
-// What Grok may use of its own: the two tools that reach MCP servers (ours). Everything else it can do, it does
-// through the five tools, where the user is asked and the secrets are kept.
+// What Grok may use of its own: the two tools that reach MCP servers (ours), the web and Imagine (28.10.2026, his:
+// "надо включить поиск в интернете и Imagine"). Everything else it can do, it does through the five tools, where
+// the user is asked and the secrets are kept. web_search runs on xAI's side and asks nobody; the rest ask.
 constexpr const char* kProfile =
     "---\n"
     "name: aic\n"
     "description: AIControls chat\n"
-    "tools: search_tool, use_tool\n"
+    "tools: search_tool, use_tool, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video\n"
     "---\n";
 
 std::wstring WriteProfile() {
@@ -58,8 +59,12 @@ Json RpcError(const Json& id, int code, const char* message) {
     return Json{{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", message}}}};
 }
 
-// The text of a finished tool call, whatever shape Grok wraps it in.
+// The text of a finished tool call, whatever shape Grok wraps it in. A picture or a video it made stays JSON: the
+// window takes the file's "path" from it, as from the history.
 std::string OutputText(const Json& rawOutput) {
+    if (JsonStr(rawOutput, "type") == "WebFetch") {
+        return JsonStr(JsonAt(rawOutput, "Content"), "content");
+    }
     const Json& output = JsonAt(rawOutput, "output");
     for (const char* key : {"OkayOutput", "ErrorOutput", "Output"}) {
         if (output.is_object() && output.contains(key)) {
@@ -131,7 +136,8 @@ void GrokProcess::Start(const ClaudeOptions& options, MessageHandler onMessage, 
     }
     cmd += L" stdio";
 
-    std::vector<std::pair<std::wstring, std::wstring>> overrides = {{L"NO_COLOR", L"1"}};
+    // web_fetch is off in grok.exe unless asked for.
+    std::vector<std::pair<std::wstring, std::wstring>> overrides = {{L"NO_COLOR", L"1"}, {L"GROK_WEB_FETCH", L"1"}};
     if (!options.proxy.empty()) {
         overrides.insert(overrides.end(), {{L"HTTPS_PROXY", options.proxy},
                                            {L"HTTP_PROXY", options.proxy},
@@ -327,6 +333,20 @@ void GrokProcess::RespondError(const std::string& requestId, std::string_view er
     Respond(requestId, Json{{"behavior", "deny"}});
 }
 
+void GrokProcess::RequestUsage() {
+    {
+        std::lock_guard lock(stateMutex_);
+        if (!sessionOpen_) {
+            return;
+        }
+    }
+    Call("_x.ai/billing", Json::object(), [this](const Json& result, const Json& error) {
+        if (error.is_null() && result.is_object()) {
+            Emit(Json{{"type", "aic_usage"}, {"billing", result}});
+        }
+    });
+}
+
 // ---- JSON-RPC out ----
 
 void GrokProcess::Call(const char* method, Json params, Callback done) {
@@ -481,8 +501,11 @@ void GrokProcess::OnRequest(const Json& id, const std::string& method, const Jso
         if (const std::string prefix = std::string(kToolServer) + "__"; tool.starts_with(prefix)) {
             ours = tool.substr(prefix.size());
         }
+    } else if (const std::string own = JsonStr(JsonAt(JsonAt(call, "_meta"), "x.ai/tool"), "name"); GrokOwnTool(own)) {
+        name = kGrokToolPrefix + own;  // a picture, a video, a page: the window asks as for ours
+        input = raw;
     } else {
-        name = JsonStr(call, "title");  // not ours: the window refuses it
+        name = JsonStr(call, "title");  // neither: the window refuses it
         input = raw;
     }
     std::string requestId;
@@ -513,7 +536,12 @@ void GrokProcess::OnUpdate(const Json& update) {
         textOpen_ = false;  // what is said after the call is a new message
     } else if (type == "tool_call_update") {
         const std::string status = JsonStr(update, "status");
-        if (status == "completed" || status == "failed") {
+        const Json& action = JsonAt(JsonAt(update, "rawOutput"), "action");
+        if (JsonStr(action, "type") == "search") {  // a web search, done on xAI's side: no card, a line in the feed
+            if (status == "completed") {
+                Emit(Json{{"type", "aic_tool"}, {"name", "web_search"}, {"input", action}});
+            }
+        } else if (status == "completed" || status == "failed") {
             EmitToolResult(update);
         }
     }
@@ -562,6 +590,7 @@ void GrokProcess::OpenSession(const Json& initResult) {
             pendingModel_.clear();
         }
         Emit(Json{{"type", "system"}, {"subtype", "init"}, {"session_id", session}});
+        RequestUsage();  // the ring is right before the first message
         if (!model.empty()) {
             SetModel(model);
         }
@@ -663,6 +692,7 @@ void GrokProcess::FinishTurn(const Json& result, const Json& error) {
         }
     }
     Emit(std::move(out));
+    RequestUsage();  // the turn spent some
     if (more) {
         Pump();
     } else {

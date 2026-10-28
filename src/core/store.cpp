@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "core/claude_process.h"
+#include "core/tools.h"
 
 namespace aic {
 namespace {
@@ -422,6 +423,8 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& history) {
                     name = "mcp__" + JsonStr(input, "tool_name");  // as it comes live: aic__read_file -> mcp__aic__read_file
                     Json inner = JsonAt(input, "tool_input");
                     input = std::move(inner);
+                } else if (GrokOwnTool(name)) {
+                    name = kGrokToolPrefix + name;  // image_gen -> grok__image_gen
                 }
                 TranscriptEntry tool{EntryKind::Tool, ToWide(name)};
                 tool.toolId = JsonStr(call, "id");
@@ -439,9 +442,19 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& history) {
                 std::wstring output = ToWide(JsonStr(entry, "content"));
                 const size_t end = output.find_last_not_of(L" \t\r\n");
                 output.resize(end == std::wstring::npos ? 0 : end + 1);
+                // How Grok keeps a call that failed: "Tool `image_gen` failed: ...".
+                call->toolFailed = output.starts_with(L"Tool `") && output.find(L"` failed: ") != std::wstring::npos;
                 call->toolOutput = std::move(output);
                 call->toolAnswered = true;
                 break;
+            }
+        } else if (type == "backend_tool_call") {  // a web search, done on xAI's side
+            const Json& kind = JsonAt(entry, "kind");
+            if (JsonStr(kind, "tool_type") == "web_search") {
+                TranscriptEntry search{EntryKind::Tool, ToWide(std::string(kGrokToolPrefix) + "web_search")};
+                search.toolInput = JsonAt(kind, "action").dump(-1, ' ', false, Json::error_handler_t::replace);
+                search.toolAnswered = true;
+                entries.push_back(std::move(search));
             }
         }
     }

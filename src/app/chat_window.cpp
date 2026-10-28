@@ -167,6 +167,7 @@ constexpr float kSecretRow = 38.f;
 constexpr float kFieldHeight = 34.f;
 constexpr float kSecretsNote = 40.f;
 constexpr float kUsageRow = 58.f;
+constexpr float kUsageNote = 24.f;  // Grok's popup: a line under its one bar
 constexpr float kTextMin = 16.f;  // the input hugs its line: the row centres it (taller, it sat high)
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 26.f;
@@ -327,7 +328,8 @@ struct FeedItem {
     std::wstring who;
     float whoHeight = 0;
     std::wstring shown;         // the text the layout was made of (markdown without its markup ...): selections index it
-    // Kind::User: the pictures above the bubble, and where the bubble starts below them.
+    // Kind::User: the pictures above the bubble, and where the bubble starts below them. Kind::Approval: the
+    // picture Grok made, under the card's text.
     std::vector<FeedImage> images;
     float bubbleTop = 0;
     std::string tool;  // Kind::Approval: the tool's own name (write_file ...)
@@ -341,10 +343,15 @@ struct FeedItem {
     bool outputError = false;
     std::wstring output;       // what the tool returned
     size_t outputStart = 0;    // where it begins in the card's layout
+    std::wstring made;         // the picture or video one of Grok's own tools saved
 };
 
-// A card of write_file or edit_file that wrote a file here (not on a server): it gets "open" and "show in folder".
+// A card of write_file or edit_file that wrote a file here (not on a server), or of Grok making a picture or a
+// video: it gets "open" and "show in folder".
 bool HasFileActions(const FeedItem& item) {
+    if (item.kind == Kind::Approval && !item.made.empty()) {
+        return true;
+    }
     return item.kind == Kind::Approval && (item.tool == "write_file" || item.tool == "edit_file") &&
            item.verdict == Verdict::Allowed && item.done && !item.outputError && !JsonStr(item.input, "path").empty() &&
            JsonStr(item.input, "on").empty();
@@ -352,6 +359,9 @@ bool HasFileActions(const FeedItem& item) {
 
 // ... and the file, a relative path being the chat folder's (as the tools resolve it).
 std::wstring WrittenFile(const FeedItem& item, const std::wstring& workspace) {
+    if (!item.made.empty()) {
+        return item.made;
+    }
     const std::filesystem::path path(ToWide(JsonStr(item.input, "path")));
     return (path.is_relative() ? std::filesystem::path(workspace) / path : path).lexically_normal().wstring();
 }
@@ -1092,6 +1102,9 @@ private:
 
     void AskApproval(const std::string& requestId, const Json& request);
     void OnToolResult(const Json& block);
+    // A card of Grok's own tool that came back: the picture it made under the text, a video as a file, an error
+    // in words.
+    void SettleGrokTool(FeedItem& item) const;
     void Decide(size_t index, bool allow);
     void CancelApprovals();  // pending cards are answered "no" and marked as cancelled
     void StopTurn();
@@ -1104,10 +1117,13 @@ private:
     static void ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& preview, D2D1_RECT_F& open,
                                     D2D1_RECT_F& reveal);
 
-    // Pictures in the feed: above the bubble of the message they went with; a click shows one over the window
-    // (the arrows go through the others), the right button copies, opens or finds it.
+    // Pictures in the feed: above the bubble of the message they went with, or in the card of Grok's call that
+    // made them; a click shows one over the window (the arrows go through the others), the right button copies,
+    // opens or finds it.
     FeedImage MakeFeedImage(std::wstring path) const;
-    static float LayoutImages(FeedItem& item, float column);  // the pictures' height
+    // In rows within `room` (x from the column's left edge), the first row at room.top; the rows end at its right
+    // edge (a message's, like the bubble) or start at its left (a card's). The pictures' height.
+    static float LayoutImages(FeedItem& item, D2D1_RECT_F room, bool fromRight);
     D2D1_RECT_F ImageRect(const Geometry& g, const FeedItem& item, size_t index) const;
     ID2D1Bitmap* Bitmap(FeedImage& image);
     void PaintImages(const Geometry& g, FeedItem& item);
@@ -1422,6 +1438,9 @@ private:
     std::set<std::string> streamed_;  // messages whose text came as deltas
     Limit session_;  // the five-hour window
     Limit week_;
+    Limit grokWeek_;  // Grok's one allowance, when a chat runs on it (a week or a month, grokMonthly_)
+    bool grokMonthly_ = false;
+    std::string grokTier_;  // "SuperGrok"
     std::wstring route_;
     std::wstring status_;
 };
@@ -2252,6 +2271,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             Refresh();
         } else if (wParam == kUsageTimer) {
             FetchUsage();
+            if (GrokRunning()) {
+                runner_->grok.RequestUsage();
+            }
         } else if (wParam == kUpdateTimer) {
             CheckAppUpdate();
         } else if (wParam == kPuffTimer) {
@@ -2922,7 +2944,7 @@ Geometry ChatWindow::Layout() const {
     }
     case Popup::Usage: {
         const float popupRight = ClampTo(g.usage.right + 4, 10.f + kUsageWidth, g.area - 10);
-        const float height = 14 + 24 + 2 * kUsageRow + 4;
+        const float height = GrokRunning() ? 14 + 24 + kUsageRow + kUsageNote + 4 : 14 + 24 + 2 * kUsageRow + 4;
         // Above the box, like the other panels: the input's own window would hide whatever lay over it.
         g.popup = D2D1::RectF(popupRight - kUsageWidth, g.box.top - 6 - height, popupRight, g.box.top - 6);
         break;
@@ -3275,7 +3297,8 @@ void ChatWindow::MeasureFeed(float column) {
             if (item.kind == Kind::Approval) {
                 item.height = ApprovalHeight(item);  // the buttons go once it is decided
             } else if (item.kind == Kind::User) {
-                const float pictures = LayoutImages(item, column);  // the same: the column may have changed
+                // The same: the column may have changed.
+                const float pictures = LayoutImages(item, D2D1::RectF(column * 0.15f, 0, column, 0), true);
                 item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
                 item.height = item.bubbleTop + (item.text.empty() ? 0.f : item.layoutHeight + 2 * kBubblePad);
             }
@@ -3317,23 +3340,27 @@ void ChatWindow::MeasureFeed(float column) {
         item.layout->GetMetrics(&metrics);
         item.textWidth = metrics.widthIncludingTrailingWhitespace;
         item.layoutHeight = metrics.height;
+        if (item.kind == Kind::Approval) {  // a picture Grok made, under the text
+            LayoutImages(item, D2D1::RectF(kCardPad, kCardPad + kCardTitle + 4.f + metrics.height + kCardPad, column - kCardPad, 0),
+                         false);
+        }
         item.height = item.kind == Kind::Approval ? ApprovalHeight(item) : metrics.height;
         if (item.kind == Kind::Assistant) {
             item.whoHeight = item.who.empty() ? 0.f : kWhoRow;
             item.height += item.whoHeight;
         }
         if (item.kind == Kind::User) {  // the pictures, then the bubble (none for pictures alone)
-            const float pictures = LayoutImages(item, column);
+            const float pictures = LayoutImages(item, D2D1::RectF(column * 0.15f, 0, column, 0), true);
             item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
             item.height = item.bubbleTop + (item.text.empty() ? 0.f : metrics.height + 2 * kBubblePad);
         }
     }
 }
 
-float ChatWindow::LayoutImages(FeedItem& item, float column) {
-    // Side by side while they fit in the bubble's room, rows right-aligned like the bubble.
-    const float room = column * 0.85f;
-    float top = 0;
+float ChatWindow::LayoutImages(FeedItem& item, D2D1_RECT_F box, bool fromRight) {
+    // Side by side while they fit in the room.
+    const float room = box.right - box.left;
+    float top = box.top;
     size_t first = 0;
     while (first < item.images.size()) {
         float rowWidth = 0;
@@ -3349,7 +3376,7 @@ float ChatWindow::LayoutImages(FeedItem& item, float column) {
             rowWidth += (end > first ? kImageGap : 0.f) + width;
             rowHeight = std::max(rowHeight, image.height * scale);
         }
-        float x = column - rowWidth;
+        float x = fromRight ? box.right - rowWidth : box.left;
         for (size_t i = first; i < end; ++i) {
             FeedImage& image = item.images[i];
             const float scale = std::min(1.f, room / std::max(image.width, 1.f));
@@ -3359,7 +3386,7 @@ float ChatWindow::LayoutImages(FeedItem& item, float column) {
         top += rowHeight + kImageGap;
         first = end;
     }
-    return top > 0 ? top - kImageGap : 0.f;
+    return top > box.top ? top - kImageGap - box.top : 0.f;
 }
 
 float ChatWindow::FeedHeight() const {
@@ -3490,6 +3517,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         const bool visible = item.layout && y + item.height >= g.feed.top && y <= g.feed.bottom;
         if (visible && item.kind == Kind::Approval) {
             PaintApproval(g, item, left);
+            PaintImages(g, item);
         } else if (visible && !(item.kind == Kind::Notice && !HasConversation())) {
             uint32_t color = kPrimary;
             float x = left;
@@ -3648,7 +3676,11 @@ float ChatWindow::ApprovalHeight(const FeedItem& item) {
     DWRITE_TEXT_METRICS metrics{};
     item.layout->GetMetrics(&metrics);
     const float buttons = item.verdict == Verdict::Pending ? kCardPad + kCardButton : 0.f;
-    return kCardPad + kCardTitle + 4.f + metrics.height + buttons + kCardPad;
+    float body = kCardPad + kCardTitle + 4.f + metrics.height;
+    for (const FeedImage& image : item.images) {  // laid out under the text
+        body = std::max(body, image.at.bottom);
+    }
+    return body + buttons + kCardPad;
 }
 
 void ChatWindow::ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& allow, D2D1_RECT_F& deny) {
@@ -3665,7 +3697,7 @@ void ChatWindow::ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2
     const float right = g.left + g.column - kCardPad + 4.f;
     reveal = D2D1::RectF(right - kCardSmallButton, top, right, top + kCardTitle);
     open = D2D1::RectF(reveal.left - 4.f - kCardSmallButton, top, reveal.left - 4.f, top + kCardTitle);
-    preview = IsPreviewable(ToWide(JsonStr(item.input, "path")))
+    preview = IsPreviewable(item.made.empty() ? ToWide(JsonStr(item.input, "path")) : item.made)
                   ? D2D1::RectF(open.left - 4.f - kCardSmallButton, top, open.left - 4.f, top + kCardTitle)
                   : D2D1_RECT_F{};
 }
@@ -3904,7 +3936,7 @@ void ChatWindow::PaintInput(const Geometry& g) {
         const D2D1_POINT_2F center{(g.usage.left + g.usage.right) / 2, (g.usage.top + g.usage.bottom) / 2};
         brush_->SetColor(Color(kLine));
         target_->DrawEllipse(D2D1::Ellipse(center, 7.5f, 7.5f), brush_.get(), 2.f);
-        if (const Limit session = Current(session_); session.percent >= 0) {
+        if (const Limit session = Current(GrokRunning() ? grokWeek_ : session_); session.percent >= 0) {
             Ring(center, 7.5f, static_cast<float>(session.percent) / 100.f, session.percent >= 90 ? kDanger : kAccent);
         }
     }
@@ -3952,28 +3984,27 @@ void ChatWindow::PaintInput(const Geometry& g) {
     Line({c.x - 5.f, c.y + 1.f}, {c.x - 1.5f, c.y + 4.5f}, color, 1.5f);
 }
 
-// When a limit window resets: "через 3 ч 56 мин" for the short one, "вт 3:00" for the week.
-std::wstring ResetText(const Limit& limit, bool weekday) {
+// When a limit window resets, on Moscow's clock (his, whatever the PC says): "18:00 мск · 3 ч 56 мин" for the short
+// one, "вт 03:00 мск" for the week, "2 ноя 03:28 мск" for a month.
+std::wstring ResetText(const Limit& limit, bool weekday, bool dated = false) {
     if (limit.resetsAt <= 0) {
         return {};
     }
+    const MoscowClock time = MoscowTime(limit.resetsAt);
     if (!weekday) {
         const long long now = static_cast<long long>(std::time(nullptr));
         const long long minutes = std::max(0LL, (limit.resetsAt - now + 59) / 60);
-        return minutes >= 60 ? std::format(L"Сброс через {} ч {} мин", minutes / 60, minutes % 60)
-                             : std::format(L"Сброс через {} мин", minutes);
+        return minutes >= 60
+                   ? std::format(L"Сброс {:02}:{:02} мск · {} ч {} мин", time.hour, time.minute, minutes / 60, minutes % 60)
+                   : std::format(L"Сброс {:02}:{:02} мск · {} мин", time.hour, time.minute, minutes);
     }
-    constexpr long long kUnixToFileTime = 11644473600LL;
-    ULARGE_INTEGER ticks{};
-    ticks.QuadPart = static_cast<unsigned long long>(limit.resetsAt + kUnixToFileTime) * 10'000'000ULL;
-    FILETIME utc{ticks.LowPart, ticks.HighPart};
-    FILETIME local{};
-    SYSTEMTIME time{};
-    if (!FileTimeToLocalFileTime(&utc, &local) || !FileTimeToSystemTime(&local, &time)) {
-        return {};
+    if (dated) {
+        static constexpr const wchar_t* months[] = {L"янв", L"фев", L"мар", L"апр", L"мая", L"июн",
+                                                    L"июл", L"авг", L"сен", L"окт", L"ноя", L"дек"};
+        return std::format(L"Сброс {} {} {:02}:{:02} мск", time.day, months[(time.month - 1) % 12], time.hour, time.minute);
     }
     static constexpr const wchar_t* days[] = {L"вс", L"пн", L"вт", L"ср", L"чт", L"пт", L"сб"};
-    return std::format(L"Сброс {} {}:{:02}", days[time.wDayOfWeek % 7], time.wHour, time.wMinute);
+    return std::format(L"Сброс {} {:02}:{:02} мск", days[time.weekday % 7], time.hour, time.minute);
 }
 
 // An arc from the top, clockwise, for `fraction` of the circle.
@@ -4007,22 +4038,34 @@ void ChatWindow::PaintUsage(const Geometry& g) {
     PaintPanel(g.popup);
     const float left = g.popup.left + 16;
     const float right = g.popup.right - 16;
-    Text(L"Лимиты использования", ui_.get(), D2D1::RectF(left, g.popup.top + 10, right, g.popup.top + 34), kSecondary);
+    const bool grok = GrokRunning();
+    Text(grok ? L"Лимит использования · " + (grokTier_.empty() ? std::wstring(L"Grok") : ToWide(grokTier_))
+              : std::wstring(L"Лимиты использования"),
+         ui_.get(), D2D1::RectF(left, g.popup.top + 10, right, g.popup.top + 34), kSecondary);
     struct Row {
-        const wchar_t* label;
-        const Limit* limit;
-        bool weekday;
+        std::wstring label;
+        Limit limit;
+        std::wstring reset;
     };
-    const Row rows[] = {{L"Сессия · 5 ч", &session_, false}, {L"Неделя · все модели", &week_, true}};
+    std::vector<Row> rows;
+    if (grok) {  // one allowance for all of Grok (the CLI does not split it into Build, Imagine and chat)
+        const Limit limit = Current(grokWeek_);
+        rows.push_back({grokMonthly_ ? L"Месяц · все модели" : L"Неделя · все модели", limit,
+                        ResetText(limit, true, grokMonthly_)});
+    } else {
+        const Limit session = Current(session_);
+        const Limit week = Current(week_);
+        rows.push_back({L"Сессия · 5 ч", session, ResetText(session, false)});
+        rows.push_back({L"Неделя · все модели", week, ResetText(week, true)});
+    }
     constexpr float kPercentWidth = 40.f;
     float top = g.popup.top + 14 + 24;
     for (const Row& row : rows) {
-        const Limit limit = Current(*row.limit);
-        const int percent = limit.percent;
+        const int percent = row.limit.percent;
         const float labelWidth = TextWidth(row.label, uiBold_.get()) + 12.f;
         Text(row.label, uiBold_.get(), D2D1::RectF(left, top, left + labelWidth, top + 20), kPrimary);
-        Text(ResetText(limit, row.weekday), uiRight_.get(),
-             D2D1::RectF(left + labelWidth, top, right - kPercentWidth - 8, top + 20), kSecondary);
+        Text(row.reset, uiRight_.get(), D2D1::RectF(left + labelWidth, top, right - kPercentWidth - 8, top + 20),
+             kSecondary);
         Text(percent >= 0 ? std::format(L"{}%", percent) : std::wstring(L"—"), uiRight_.get(),
              D2D1::RectF(right - kPercentWidth, top, right, top + 20), kSecondary);
         const D2D1_RECT_F bar = D2D1::RectF(left, top + 28, right, top + 34);
@@ -4032,6 +4075,10 @@ void ChatWindow::PaintUsage(const Geometry& g) {
             Fill(D2D1::RectF(left, bar.top, left + width, bar.bottom), 3.f, percent >= 90 ? kDanger : kAccent);
         }
         top += kUsageRow;
+    }
+    if (grok) {
+        Text(L"Разбивка по Build, Imagine и чату — на grok.com", ui_.get(), D2D1::RectF(left, top - 8, right, top + 14),
+             kSecondary);
     }
 }
 
@@ -8873,14 +8920,19 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
             Add(Kind::Notice, L"Чат сжат: дальше Claude помнит начало по сводке");
             break;
         case EntryKind::Tool: {
-            const std::string own = OwnToolName(ToUtf8(entry.text));
+            const std::string full = ToUtf8(entry.text);
+            const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
             const Json input = Json::parse(entry.toolInput, nullptr, false);
             if (own.empty() || !input.is_object()) {
                 Add(Kind::Notice, L"инструмент: " + entry.text, true);
                 break;
             }
-            // Our own tools come back as the card they were: the call, and what it printed.
             ToolSummary summary = SummarizeTool(own, input);
+            if (own == "web_search") {  // as it was shown: a line
+                Add(Kind::Notice, summary.title + L": " + summary.detail, true);
+                break;
+            }
+            // Our own tools (and Grok's pictures) come back as the card they were: the call, and what it printed.
             FeedItem item;
             item.kind = Kind::Approval;
             item.title = std::move(summary.title);
@@ -8892,6 +8944,9 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
             item.output = entry.toolOutput;
             item.outputError = entry.toolFailed;
             item.done = entry.toolAnswered;
+            if (item.done && GrokOwnTool(own)) {
+                SettleGrokTool(item);
+            }
             feed_.push_back(std::move(item));
             break;
         }
@@ -9554,7 +9609,7 @@ void ChatWindow::OnClaude(const Json& message) {
                 text = JsonStr(message, "subtype");
             }
             // The CLI says "You've hit your session limit" twice: as a reply and as the turn's result.
-            const std::wstring wide = ToWide(text);
+            const std::wstring wide = LimitInMoscow(ToWide(text));
             const bool said = !feed_.empty() && feed_.back().kind == Kind::Assistant && feed_.back().text == wide;
             if (!said) {
                 Add(Kind::Error, wide);
@@ -9565,6 +9620,14 @@ void ChatWindow::OnClaude(const Json& message) {
                 title_ = std::move(title);
             }
             RefreshSessions();  // a new chat appears in the list, a title may have changed
+        }
+    } else if (type == "aic_usage") {  // Grok's plan: what _x.ai/billing answered
+        const PlanUsage usage = ParseGrokBilling(JsonAt(message, "billing").dump());
+        if (usage.ok) {
+            grokWeek_ = Limit{usage.weekPercent, usage.weekResets};
+            grokMonthly_ = usage.monthly;
+            grokTier_ = usage.tier;
+            Refresh();
         }
     } else if (type == "rate_limit_event") {
         const Json& info = JsonAt(message, "rate_limit_info");
@@ -9648,6 +9711,9 @@ void ChatWindow::OnClaude(const Json& message) {
         }
     } else if (type == "aic_raw") {
         Add(Kind::Notice, ToWide(JsonStr(message, "text")));
+    } else if (type == "aic_tool") {  // Grok searched the web: nobody was asked, a line says what it looked for
+        const ToolSummary summary = SummarizeTool(JsonStr(message, "name"), JsonAt(message, "input"));
+        Add(Kind::Notice, summary.title + L": " + summary.detail, true);
     }
     if (updatePending_ && !inBackground_ && !AnyBusy()) {  // the turn the update waited for has ended
         StartUpdate();
@@ -9662,14 +9728,15 @@ void ChatWindow::OnClaude(const Json& message) {
 // The model wants to call a tool. Reading runs at once (a note in the feed); anything that changes
 // something waits on a card for the user's word, unless the permission mode lets it through.
 void ChatWindow::AskApproval(const std::string& requestId, const Json& request) {
-    const std::string name = OwnToolName(JsonStr(request, "tool_name"));
+    const std::string full = JsonStr(request, "tool_name");
+    const std::string name = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
     const Json& input = JsonAt(request, "input");
     if (name.empty()) {
         runner_->agent->Respond(requestId, Json{{"behavior", "deny"}, {"message", "Only AIControls tools are available here."}});
         return;
     }
     ToolSummary summary = SummarizeTool(name, input);
-    if (RunningMode() == "plan" && !ReadOnlyTool(name)) {
+    if (RunningMode() == "plan" && !ReadOnlyTool(name) && name != "web_fetch") {  // a page only read is research
         Add(Kind::Notice, L"План: не выполнено — " + summary.title + L": " + summary.detail);
         runner_->agent->Respond(requestId, Json{{"behavior", "deny"},
                                         {"message", "Plan mode is on: nothing may be changed or run. Read what you "
@@ -9722,10 +9789,41 @@ void ChatWindow::OnToolResult(const Json& block) {
         item.outputError = JsonAt(block, "is_error").is_boolean() && JsonAt(block, "is_error").get<bool>();
         item.done = true;
         item.layout.reset();
+        if (GrokOwnTool(item.tool)) {
+            SettleGrokTool(item);
+        }
         if (HasFileActions(item) && IsPage(WrittenFile(item, workspace_))) {
             OpenPreview(WrittenFile(item, workspace_));  // a page just written: shown at once, as it changes
         }
         return;
+    }
+}
+
+void ChatWindow::SettleGrokTool(FeedItem& item) const {
+    if (item.outputError) {  // xAI's words for what cannot be had here, in ours
+        if (item.output.find(L"not available in your region") != std::wstring::npos) {
+            item.output = L"Imagine недоступен из этой страны: нужен выход через VPN.";
+        } else if (item.output.find(L"zero data retention") != std::wstring::npos) {
+            item.output = L"Видео не сделать, пока в аккаунте Grok включена приватность (ZDR): её выключает /privacy в grok.";
+        }
+        return;
+    }
+    const Json result = Json::parse(ToUtf8(item.output), nullptr, false);
+    const std::wstring path = ToWide(JsonStr(result, "path"));
+    std::error_code error;
+    if (path.empty()) {
+        return;
+    }
+    if (!std::filesystem::exists(path, error)) {
+        item.output = path + L"\nФайла больше нет.";
+        return;
+    }
+    item.made = path;
+    item.output.clear();
+    if (FeedImage image = MakeFeedImage(path); image.preview) {
+        item.images.push_back(std::move(image));  // the picture is the answer
+    } else {
+        item.output = path;  // a video: where it is
     }
 }
 
@@ -9774,7 +9872,7 @@ void ChatWindow::Add(Kind kind, std::wstring text, bool leading) {
     FeedItem item;
     item.kind = kind;
     item.leading = leading;
-    item.text = std::move(text);
+    item.text = kind == Kind::Assistant || kind == Kind::Error ? LimitInMoscow(text) : std::move(text);  // a spent limit: his clock
     feed_.push_back(std::move(item));
     Refresh();
 }
@@ -9783,6 +9881,13 @@ void ChatWindow::FillGallery() {
     const std::wstring longPath =
         L"C:\\Users\\user\\.claude\\projects\\C--Users-user-AppData-Roaming-ssh-desktop-app-claude-workspace\\memory\\project_aicontrols.md";
     const std::wstring longWord = L"Сверхдлинноеслововбезединогопробеладлятогочтобыпроверитьпереносстрокивузкойколонкеиобрезку";
+    {  // the limits' ring and panel: a sample of each (Grok's is the real answer of _x.ai/billing)
+        const long long now = static_cast<long long>(std::time(nullptr));
+        session_ = Limit{42, now + 3 * 3600 + 56 * 60};
+        week_ = Limit{18, now + 3 * 86400};
+        grokWeek_ = Limit{39, 1793579333};
+        grokTier_ = "SuperGrok";
+    }
     Add(Kind::User, L"Короткое сообщение");
     Add(Kind::User, L"Длинное сообщение пользователя с кириллицей, English words, 😀 эмодзи и ссылкой "
                     L"https://example.com/очень/длинный/путь/который/не/помещается/в/колонку?query=1&other=2\n"
@@ -9847,6 +9952,27 @@ void ChatWindow::FillGallery() {
          Json{{"path", "C:\\Users\\user\\notes.txt"}, {"old_string", "было\nстарое"}, {"new_string", "стало\nновое\nи ещё"}},
          Verdict::Pending, false, L"", false);
     card("read_file", Json{{"path", ToUtf8(longPath)}}, Verdict::Allowed, true, L"содержимое файла\nвторая строка", false);
+    // Grok's own tools: a search that ran on its side, a picture saved on disk, a video that cannot be had, a missing file.
+    Add(Kind::Notice, L"Поиск в интернете: последняя версия sing-box", true);
+    std::array<wchar_t, MAX_PATH> exePath{};
+    GetModuleFileNameW(nullptr, exePath.data(), static_cast<DWORD>(exePath.size()));
+    const std::wstring picture = (std::filesystem::path(exePath.data()).parent_path() / L"../../assets/mascot.png")
+                                     .lexically_normal()
+                                     .wstring();
+    const auto grokCard = [&](const std::string& tool, Json input, const std::wstring& output, bool failed) {
+        card("grok__" + tool, std::move(input), Verdict::Allowed, true, output, failed);
+        SettleGrokTool(feed_.back());
+    };
+    grokCard("image_gen", Json{{"prompt", "рыба-мичман в аквариуме, акварель"}, {"aspect_ratio", "1:1"}},
+             L"{\"type\":\"ImageGen\",\"path\":" + ToWide(Json(ToUtf8(picture)).dump()) + L"}", false);
+    grokCard("image_edit", Json{{"prompt", "добавить шляпу"}, {"image", ToUtf8(picture)}, {"aspect_ratio", "16:9"}},
+             L"{\"type\":\"ImageEdit\",\"path\":" + ToWide(Json(ToUtf8(picture)).dump()) + L"}", false);
+    grokCard("image_to_video", Json{{"prompt", "рыба плывёт"}, {"image", ToUtf8(picture)}, {"duration", 6}, {"resolution_name", "480p"}},
+             L"Tool `image_to_video` failed: Video generation tools are unavailable under zero data retention (ZDR)", true);
+    grokCard("image_gen", Json{{"prompt", "закат над морем"}},
+             L"Tool `image_gen` failed: HTTP 403 This service is not available in your region", true);
+    grokCard("image_gen", Json{{"prompt", "картинку уже убрали с диска"}},
+             L"{\"type\":\"ImageGen\",\"path\":\"C:\\\\no\\\\such\\\\1.jpg\"}", false);
     Add(Kind::Assistant, L"Скриншот: `C:\\Users\\user\\gallery1.png` и PDF `C:\\Users\\user\\a.pdf`, страница `C:\\Users\\user\\a.html`.");
     Add(Kind::Assistant, L"Финальный короткий ответ.");
     feed_[2].who = L"Claude Opus 5.5";  // the first answer of a turn is signed: one of each agent

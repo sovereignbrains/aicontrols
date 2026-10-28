@@ -217,6 +217,21 @@ int main() {
            "Auto lets harmless things through and asks about risky ones");
     Expect(aic::SummarizeTool("run_command", {{"command", "ls"}, {"on", "root@h"}}).detail.starts_with(L"→ root@h\n"),
            "the card names the server");
+    Expect(aic::GrokToolName("grok__image_gen") == "image_gen" && aic::GrokToolName("grok__bash").empty() &&
+               aic::GrokToolName("image_gen").empty() && aic::OwnToolName("grok__image_gen").empty(),
+           "GrokToolName: only the web and Imagine");
+    Expect(aic::AutoAllows("image_gen", {{"prompt", "a fish"}}) && !aic::AutoAllows("image_to_video", {{"prompt", "a"}}) &&
+               !aic::AutoAllows("web_fetch", {{"url", "https://x"}}) && aic::ToolNeedsApproval("image_gen"),
+           "Auto draws pictures; videos and pages still ask");
+    {
+        const aic::ToolSummary video = aic::SummarizeTool(
+            "image_to_video", {{"prompt", "swims"}, {"image", "C:\\1.jpg"}, {"duration", 6}, {"resolution_name", "480p"}});
+        Expect(video.title == L"Видео из картинки" && video.detail == L"swims\nC:\\1.jpg\n6 с · 480p", "a video's card",
+               aic::ToUtf8(video.detail));
+        Expect(aic::SummarizeTool("image_gen", {{"prompt", "a fish"}, {"aspect_ratio", "1:1"}}).detail == L"a fish\n1:1" &&
+                   aic::SummarizeTool("web_search", {{"query", "sing-box"}}).title == L"Поиск в интернете",
+               "a picture's card, a search's line");
+    }
 
     {  // what the model is told: the stored secrets by name (never the values), and how to use the tools
         const std::string listed = tools.Definitions().dump();

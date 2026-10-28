@@ -81,6 +81,14 @@ int main() {
         << R"({"type":"tool_result","tool_call_id":"c2","content":"hello\n"})" << "\n"
         << R"({"type":"user","content":[{"type":"text","text":"<system-reminder>x</system-reminder>"}],"synthetic_reason":"r"})" << "\n"
         << R"({"type":"assistant","content":"done"})" << "\n";
+    fs::create_directories(grokA / L"g-2", error);
+    std::ofstream(grokA / L"g-2" / L"chat_history.jsonl")
+        << R"({"type":"user","content":[{"type":"text","text":"<user_query>\nнарисуй рыбу\n</user_query>"}],"prompt_index":0})" << "\n"
+        << R"({"type":"backend_tool_call","kind":{"tool_type":"web_search","action":{"type":"search","query":"fish"},"status":"completed"}})" << "\n"
+        << R"({"type":"assistant","content":"","tool_calls":[{"id":"i1","name":"image_gen","arguments":"{\"prompt\":\"a fish\"}"},)"
+        << R"({"id":"i2","name":"image_to_video","arguments":"{\"prompt\":\"swims\"}"}]})" << "\n"
+        << R"({"type":"tool_result","tool_call_id":"i1","content":"{\"path\":\"C:\\\\1.jpg\"}"})" << "\n"
+        << R"({"type":"tool_result","tool_call_id":"i2","content":"Tool `image_to_video` failed: no video"})" << "\n";
     std::ofstream(grokA / L"g-empty" / L"chat_history.jsonl")
         << R"({"type":"user","content":[{"type":"text","text":"<rules>be brief</rules>"}]})" << "\n";
     std::vector<aic::SessionInfo> listed = aic::ListSessions(a);
@@ -97,6 +105,11 @@ int main() {
                said[1].toolInput == R"({"path":"a.txt"})" && said[1].toolOutput == L"hello" && said[1].toolAnswered,
            "a grok tool call as it comes live, with its answer; its tool lookups left out");
     Expect(said.size() == 3 && said[2].kind == aic::EntryKind::Assistant && said[2].text == L"done", "the answer");
+    const std::vector<aic::TranscriptEntry> made = aic::LoadTranscript(a, "g-2", 100, truncated);
+    Expect(made.size() == 4 && made[1].text == L"grok__web_search" && made[1].toolInput.find("\"fish\"") != std::string::npos &&
+               made[2].text == L"grok__image_gen" && made[2].toolOutput == LR"({"path":"C:\\1.jpg"})" && !made[2].toolFailed &&
+               made[3].text == L"grok__image_to_video" && made[3].toolFailed,
+           "grok's own tools in its history: the search, the picture, the video that failed");
     Expect(aic::RenameSession(a, "g-1", L"Навигация") && aic::SessionTitle(a, "g-1") == L"Навигация" &&
                fs::exists(grokA / L"g-1" / L"chat_history.jsonl"),
            "a grok chat renamed, its history left as it is");

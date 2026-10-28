@@ -455,7 +455,7 @@ Limit Current(const Limit& limit) {
 }
 
 // The lists that scroll: each has a bar at its right edge to be dragged, and scrolls under the middle button.
-enum class Scroller { None, Feed, Sidebar, Secrets, Terminal };
+enum class Scroller { None, Feed, Sidebar, Secrets, Terminal, Input };
 
 // A list's scrollbar as laid out now: the strip a press takes, the thumb in it, and where the list is, in its
 // own units (DIPs for the feed, rows or lines for the others).
@@ -694,6 +694,21 @@ std::wstring ClipboardText(HWND owner) {
     }
     CloseClipboard();
     return text;
+}
+
+// "1 строка", "3 строки", "12 340 строк": the count with its noun in the form Russian wants, thousands apart.
+std::wstring Counted(size_t count, const wchar_t* one, const wchar_t* few, const wchar_t* many) {
+    std::wstring digits = std::to_wstring(count);
+    for (size_t at = digits.size(); at > 3; at -= 3) {
+        digits.insert(at - 3, 1, L' ');
+    }
+    const size_t tens = count % 100;
+    const size_t last = count % 10;
+    const wchar_t* noun = many;
+    if (tens < 11 || tens > 14) {
+        noun = last == 1 ? one : (last >= 2 && last <= 4 ? few : many);
+    }
+    return digits + L' ' + noun;
 }
 
 uint64_t FileTicks(const FILETIME& time) {
@@ -1066,6 +1081,8 @@ private:
     void ScrollDips(Scroller s, float dips);    // the middle button's: DIPs into those units, the rest kept
     void DragBar(float y);
     void PaintBar(const Geometry& g, Scroller s);
+    bool WheelInput(int delta);                 // the wheel over the input, when it holds more than it shows
+    void NoteInputScroll(bool settle);          // from InputProc: the bar follows what RichEdit scrolled itself
     void StartPan(Scroller s, D2D1_POINT_2F at);
     void StopPan();
     void PanStep();
@@ -1363,6 +1380,10 @@ private:
     LONG caretTop_ = -1;      // below the line's top, px (the font's internal leading)
     LONG caretHeight_ = 0;
     float textHeight_ = kTextMin;  // the input's text area, grows with what is typed
+    int inputLinePx_ = 0;          // one of its lines, as RichEdit lays it out: its scrollbar counts in them
+    float inputWheel_ = 0;         // the part of a line the wheel has not moved it by yet
+    LONG inputScroll_ = 0;         // how far it was scrolled (px) and how many lines it held when last painted
+    int inputLines_ = 1;
     bool inputFocused_ = false;
     bool hasText_ = false;
     std::vector<Attachment> attachments_;  // go with the next message
@@ -1647,7 +1668,33 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
         reinterpret_cast<ChatWindow*>(self)->PasteClipboard();  // files and pictures too, not only text
         return 0;
     }
+    if (message == WM_MOUSEWHEEL && reinterpret_cast<ChatWindow*>(self)->WheelInput(GET_WHEEL_DELTA_WPARAM(wParam))) {
+        return 0;  // RichEdit without a scrollbar of its own hands the wheel to the feed
+    }
     const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+    switch (message) {  // what may have scrolled it: the bar beside it follows
+    case WM_LBUTTONUP:
+        reinterpret_cast<ChatWindow*>(self)->NoteInputScroll(true);
+        break;
+    case WM_MOUSEMOVE:
+        if ((wParam & MK_LBUTTON) != 0) {
+            reinterpret_cast<ChatWindow*>(self)->NoteInputScroll(false);
+        }
+        break;
+    case WM_KEYDOWN:
+    case WM_CHAR:
+    case WM_TIMER:
+    case WM_SETTEXT:
+    case EM_LINESCROLL:
+    case EM_SCROLL:
+    case EM_SCROLLCARET:
+    case EM_REPLACESEL:
+    case EM_PASTESPECIAL:
+        reinterpret_cast<ChatWindow*>(self)->NoteInputScroll(false);
+        break;
+    default:
+        break;
+    }
     if (message == WM_PAINT && GetWindowTextLengthW(hwnd) == 0) {
         const auto* window = reinterpret_cast<const ChatWindow*>(self);
         HDC dc = GetDC(hwnd);
@@ -2112,6 +2159,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             firstRow_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), rows_.size(), SidebarRows(g));
             hover_ = HitTest(ToDip(at.x), ToDip(at.y));
             Refresh();
+        } else if (popup_ == Popup::None && Inside(g.box, ToDip(at.x), ToDip(at.y)) &&
+                   WheelInput(GET_WHEEL_DELTA_WPARAM(wParam))) {
+            // the input's own text, beside its scrollbar
         } else if (popup_ == Popup::None) {
             ScrollBy(steps * 64.f);
         }
@@ -2304,7 +2354,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (header->hwndFrom == input_ && header->code == EN_REQUESTRESIZE) {
             const RECT& wanted = reinterpret_cast<const REQRESIZE*>(lParam)->rc;
-            const float height = std::clamp(ToDip(wanted.bottom - wanted.top), kTextMin, kTextMax);
+            const int lines = std::max(1, static_cast<int>(SendMessageW(input_, EM_GETLINECOUNT, 0, 0)));
+            inputLinePx_ = std::max(1, static_cast<int>(wanted.bottom - wanted.top) / lines);
+            float height = std::clamp(ToDip(wanted.bottom - wanted.top), kTextMin, kTextMax);
+            // Past the cap it shows whole lines: the next one cut through at the edge reads as a mistake.
+            if (const int fit = std::max(1, ToPx(kTextMax) / inputLinePx_); lines > fit) {
+                height = ToDip(fit * inputLinePx_);
+            }
             if (std::abs(height - textHeight_) > 0.5f) {
                 textHeight_ = height;
                 PlaceChildren();
@@ -2834,7 +2890,8 @@ Geometry ChatWindow::Layout() const {
     constexpr float kTextNudge = 2.5f;
     constexpr float kDescentRoom = 4.f;  // RichEdit insets its line a little: without it "р" and "у" lost their tails
     const float textTop = rowTop + (rowHeight - textHeight_) / 2 - kTextNudge;
-    g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 4, textTop + textHeight_ + kDescentRoom);
+    // Beside the text stands its scrollbar's strip, for when it holds more than it shows (Bar, Scroller::Input).
+    g.text = D2D1::RectF(g.attach.right + 4, textTop, g.send.left - 3 - kBarStrip, textTop + textHeight_ + kDescentRoom);
 
     const float ringTop = chipsTop + (kChipRow - kRing) / 2;
     g.usage = D2D1::RectF(right - 6 - kRing, ringTop, right - 6, ringTop + kRing);
@@ -3001,7 +3058,8 @@ Hit ChatWindow::HitTest(float x, float y) const {
         return {Target::SplitTerminal};
     }
     if (popup_ == Popup::None) {  // a list's scrollbar: before its rows, which reach under it
-        for (const Scroller s : {Scroller::Feed, Scroller::Sidebar, Scroller::Secrets, Scroller::Terminal}) {
+        for (const Scroller s : {Scroller::Feed, Scroller::Sidebar, Scroller::Secrets, Scroller::Terminal,
+                                 Scroller::Input}) {
             if (const auto bar = Bar(g, s); bar && Inside(bar->strip, x, y)) {
                 return {Target::ScrollBar, static_cast<size_t>(s)};
             }
@@ -3891,6 +3949,7 @@ void ChatWindow::PaintInput(const Geometry& g) {
     target_->DrawRoundedRectangle(D2D1::RoundedRect(g.box, 12.f, 12.f), brush_.get(), 1.f);
 
     PaintAttachments(g);
+    PaintBar(g, Scroller::Input);  // beside the text, outside the child window that covers it
     {  // "+": attach files or photos
         const bool active = hover_.target == Target::Attach;
         if (active) {
@@ -6357,6 +6416,27 @@ std::optional<ScrollBar> ChatWindow::Bar(const Geometry& g, Scroller s) const {
         view = static_cast<float>(screen->Rows());
         break;
     }
+    case Scroller::Input: {
+        if (input_ == nullptr || inputLinePx_ <= 0) {
+            return std::nullopt;
+        }
+        RECT client{};
+        GetClientRect(input_, &client);
+        const int fit = std::max(1, static_cast<int>(client.bottom) / inputLinePx_);
+        const int lines = std::max(1, static_cast<int>(SendMessageW(input_, EM_GETLINECOUNT, 0, 0)));
+        if (lines <= fit) {
+            return std::nullopt;
+        }
+        POINT scroll{};
+        SendMessageW(input_, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+        right = g.text.right + kBarStrip;
+        top = g.text.top;
+        bottom = g.text.bottom;
+        pos = static_cast<float>(scroll.y) / static_cast<float>(inputLinePx_);  // in lines
+        max = static_cast<float>(lines - fit);
+        view = static_cast<float>(fit);
+        break;
+    }
     case Scroller::None:
         return std::nullopt;
     }
@@ -6383,6 +6463,8 @@ Scroller ChatWindow::ScrollerAt(const Geometry& g, float x, float y) const {
         s = secretsOpen_ ? Scroller::Secrets : Scroller::Sidebar;
     } else if (Inside(g.feed, x, y)) {
         s = Scroller::Feed;
+    } else if (Inside(g.box, x, y)) {
+        s = Scroller::Input;
     }
     return Bar(g, s) ? s : Scroller::None;
 }
@@ -6405,6 +6487,12 @@ void ChatWindow::ScrollTo(Scroller s, float pos) {
             Tab()->scroll = most - std::min(whole(pos), most);
         }
         break;
+    case Scroller::Input:
+        if (const auto bar = Bar(Layout(), s)) {  // whole lines: the top one is never cut through
+            POINT to{0, static_cast<LONG>(std::clamp(whole(pos), size_t{0}, static_cast<size_t>(bar->max))) * inputLinePx_};
+            SendMessageW(input_, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&to));
+        }
+        break;
     case Scroller::None:
         return;
     }
@@ -6419,7 +6507,10 @@ void ChatWindow::ScrollDips(Scroller s, float dips) {
         ScrollBy(dips);
         return;
     }
-    const float unit = s == Scroller::Sidebar ? kHistoryRow : (s == Scroller::Secrets ? kSecretRow : cellH_);
+    const float unit = s == Scroller::Sidebar ? kHistoryRow
+                       : s == Scroller::Secrets ? kSecretRow
+                       : s == Scroller::Input   ? std::max(1.f, ToDip(inputLinePx_))
+                                                : cellH_;
     panRemainder_ += dips / unit;
     const float whole = std::trunc(panRemainder_);
     if (whole == 0.f) {
@@ -6451,8 +6542,47 @@ void ChatWindow::PaintBar(const Geometry& g, Scroller s) {
     const bool hot = barDrag_ == s || (hover_.target == Target::ScrollBar && hover_.row == static_cast<size_t>(s));
     const float width = hot ? 8.f : 3.f;
     const float right = bar->strip.right - 1.f;
+    // The input's is what tells how much of the text is out of sight: it is seen at rest, not only when sought.
     Fill(D2D1::RectF(right - width, bar->thumb.top + 1.f, right, bar->thumb.bottom - 1.f), width / 2,
-         hot || Inside(bar->strip, mouse_.x, mouse_.y) ? kSecondary : kLine);
+         hot || Inside(bar->strip, mouse_.x, mouse_.y) ? kSecondary : (s == Scroller::Input ? 0x5a5c63 : kLine));
+}
+
+// The wheel over the input scrolls its text, three lines a notch; without more text than it shows it is the
+// feed's, as before.
+bool ChatWindow::WheelInput(int delta) {
+    const auto bar = Bar(Layout(), Scroller::Input);
+    if (!bar) {
+        return false;
+    }
+    inputWheel_ += -static_cast<float>(delta) / WHEEL_DELTA * 3.f;
+    const float whole = std::trunc(inputWheel_);
+    if (whole != 0.f) {
+        inputWheel_ -= whole;
+        ScrollTo(Scroller::Input, bar->pos + whole);
+    }
+    return true;
+}
+
+// RichEdit scrolls the input by itself too (the caret, a selection dragged past its edge): the bar follows, and a
+// drag leaves the top line cut through, so when the button is let go it settles on a whole line. Called from
+// InputProc, so DefSubclassProc is the way to RichEdit.
+void ChatWindow::NoteInputScroll(bool settle) {
+    POINT scroll{};
+    DefSubclassProc(input_, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    if (settle && inputLinePx_ > 0) {
+        const LONG whole = (scroll.y + inputLinePx_ / 2) / inputLinePx_ * inputLinePx_;
+        if (whole != scroll.y) {
+            scroll.y = whole;
+            DefSubclassProc(input_, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+            DefSubclassProc(input_, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+        }
+    }
+    const int lines = static_cast<int>(DefSubclassProc(input_, EM_GETLINECOUNT, 0, 0));
+    if (scroll.y != inputScroll_ || lines != inputLines_) {
+        inputScroll_ = scroll.y;
+        inputLines_ = lines;
+        Refresh();
+    }
 }
 
 void ChatWindow::StartPan(Scroller s, D2D1_POINT_2F at) {
@@ -6970,7 +7100,15 @@ void ChatWindow::PasteClipboard() {
     } else if (!IsClipboardFormatAvailable(CF_UNICODETEXT) && ClipboardHasImage()) {
         AttachClipboardImage();
     } else {
+        const std::wstring pasted = ClipboardText(hwnd_);
         SendMessageW(input_, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
+        // The input shows a few lines of a long paste: how much went in is said once.
+        const size_t lines = 1 + static_cast<size_t>(std::ranges::count(pasted, L'\n'));
+        if (lines >= 3 || pasted.size() >= 200) {
+            Flash(L"Вставлено: " + Counted(lines, L"строка", L"строки", L"строк") + L", " +
+                      Counted(pasted.size(), L"знак", L"знака", L"знаков"),
+                  3500);
+        }
     }
 }
 

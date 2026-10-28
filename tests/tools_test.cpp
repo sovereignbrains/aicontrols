@@ -204,6 +204,12 @@ int main() {
         Expect(Has(listed, "TOKEN_A") && Has(listed, "SHORT") && !Has(listed, "hunter2value"),
                "run_command's description names the secrets, not their values");
         Expect(Has(listed, "\"on\""), "the file tools accept on");
+        secrets.Set("ssh root@example.com", "serverpass1");
+        const std::string withServer = tools.Definitions().dump();
+        secrets.Remove("ssh root@example.com");
+        Expect(Has(withServer, "stored password: root@example.com.") && !Has(withServer, "serverpass1") &&
+                   !Has(withServer, "secrets: SHORT, TOKEN_A, ssh"),
+               "a server's password is named as a server, apart from the secrets", withServer);
         Expect(!aic::ToolNeedsApproval("list_chats") && !aic::ToolNeedsApproval("read_chat", {{"id", "x"}}),
                "reading the client's chats asks nothing");
         const std::string prompt = aic::Tools::SystemPrompt();
@@ -216,6 +222,16 @@ int main() {
                             "root@host:", "root@host:12x", "u@h@x", "root@h$(id)"}) {
         r = run("run_command", {{"command", "id"}, {"on", bad}});
         Expect(r.isError && Has(r.text, "Bad `on`"), "bad target refused", bad);
+    }
+
+    // The secret that holds a server's password is named after the server; anything else is no server.
+    Expect(aic::ServerSecretName("ssh root@1.2.3.4") == "ssh root@1.2.3.4" &&
+               aic::ServerSecretName("root@host.example:2222") == "ssh root@host.example:2222" &&
+               aic::ServerSecretName("ssh  root@h") == "ssh root@h",
+           "server secret names");
+    for (const char* bad : {"GITHUB", "ssh GITHUB", "ssh host", "ssh -oProxyCommand=x@h", "ssh root@h -p 22",
+                            "ssh root@h;ls", "ssh ", "sshroot@h@x"}) {
+        Expect(aic::ServerSecretName(bad).empty(), "not a server secret", bad);
     }
 
     // A real server, only when asked for: AIC_TEST_SSH=user@host (key login). Reads and a scratch file in /tmp.

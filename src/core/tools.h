@@ -5,6 +5,7 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -37,6 +38,10 @@ bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object
 // installing, the network, secrets, the system and anything aimed at a server still wait for the user.
 bool AutoAllows(const std::string& name, const Json& input);
 ToolSummary SummarizeTool(const std::string& name, const Json& input);
+// The name of the secret that holds a server's password, "ssh user@host[:port]", for what the user typed as a
+// secret's name ("ssh root@1.2.3.4", or "root@1.2.3.4" alone); empty when it names no server. `on` with that
+// server logs in with the password when no key works.
+std::string ServerSecretName(std::string_view text);
 
 // The tools: run_command, read_file, write_file, edit_file, list_directory (the five work on a server too), and
 // list_chats and read_chat for the client's own chats.
@@ -54,7 +59,7 @@ public:
 
 private:
     ToolResult RunCommand(const Json& input, const std::atomic<bool>& cancel) const;
-    // Any of the five on a server, through the system ssh.exe (key login, no prompts).
+    // Any of the five on a server, through the system ssh.exe (by key or by its stored password, no prompts).
     ToolResult ExecuteOn(const std::string& on, const std::string& name, const Json& input,
                          const std::atomic<bool>& cancel) const;
     ToolResult ReadFile(const Json& input) const;

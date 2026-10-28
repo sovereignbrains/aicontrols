@@ -4112,12 +4112,15 @@ void ChatWindow::SetSecretsOpen(bool open) {
 }
 
 void ChatWindow::SubmitSecret() {
-    const std::wstring name = Trimmed(FieldText(nameEdit_));
+    std::wstring name = Trimmed(FieldText(nameEdit_));
     std::wstring value = Trimmed(FieldText(valueEdit_));
     const bool validName = !name.empty() && !std::iswdigit(name[0]) &&
                            std::ranges::all_of(name, [](wchar_t c) { return c < 128 && (std::iswalnum(c) || c == L'_'); });
-    if (!validName) {
-        Flash(L"Имя: латиница, цифры и _, как у переменной окружения", 3500);
+    // "ssh root@1.2.3.4" (or "root@1.2.3.4") holds that server's password: `on` logs in with it.
+    if (const std::string server = ServerSecretName(ToUtf8(name)); !server.empty()) {
+        name = ToWide(server);
+    } else if (!validName) {
+        Flash(L"Имя: латиница, цифры и _, или ssh user@host для пароля сервера", 3500);
         SetFocus(nameEdit_);
         return;
     }

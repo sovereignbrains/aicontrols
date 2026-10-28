@@ -222,8 +222,9 @@ Json Schema(Json properties, Json required) {
 
 // user@host[:port] as ssh takes it. Anything that could be read as an option or a shell word is refused.
 struct Target {
-    std::string host;  // user@host
-    std::string port;  // empty: ssh's default
+    std::string host;    // user@host
+    std::string port;    // empty: ssh's default
+    std::string secret;  // "ssh user@host" when the user stored its password; empty: keys only
 };
 
 std::optional<Target> ParseTarget(std::string_view on) {
@@ -436,15 +437,38 @@ ToolResult Describe(const ProcessResult& run, int timeout, bool clixml) {
                       run.end != End::Exited || run.code != 0};
 }
 
-// Runs `script` on a server through the system ssh.exe: keys only (no prompts), a new host's key is
-// remembered, stdin is `input`. The script travels as base64 in the remote command line, so no quoting
-// can break it and a command that reads its stdin cannot eat the rest of the script.
+// This very program: ssh asks it for a server's password (AskPass in main.cpp).
+std::wstring OwnExe() {
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length < path.size()) {
+            path.resize(length);
+            return path;
+        }
+        path.resize(path.size() * 2);
+    }
+}
+
+// Runs `script` on a server through the system ssh.exe, with no prompts: by key, or by the password stored
+// for it (target.secret), which ssh gets from this program through SSH_ASKPASS, so it never passes through
+// the chat or a command line. A new host's key is remembered, stdin is `input`. The script travels as base64
+// in the remote command line, so no quoting can break it and a command that reads its stdin cannot eat the
+// rest of the script.
 ProcessResult RunSsh(const Target& target, const std::string& script, const std::string& input, int timeout,
                      const std::atomic<bool>& cancel) {
     const std::string remote =
         "B=$(command -v bash || echo sh); $B -c \"$(printf %s " + Base64Bytes(script) + " | base64 -d)\"";
-    std::wstring line = L"ssh.exe -T -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 "
-                        L"-o StrictHostKeyChecking=accept-new";
+    std::wstring line = L"ssh.exe -T -o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=accept-new";
+    std::vector<std::pair<std::wstring, std::wstring>> environment;
+    if (target.secret.empty()) {
+        line += L" -o BatchMode=yes";
+    } else {  // keys first, then the password once: a wrong one must not use up the server's tries
+        line += L" -o NumberOfPasswordPrompts=1";
+        environment = {{L"SSH_ASKPASS", OwnExe()},
+                       {L"SSH_ASKPASS_REQUIRE", L"force"},
+                       {L"AIC_ASKPASS", ToWide(target.secret)}};
+    }
     if (!target.port.empty()) {
         line += L" -p " + ToWide(target.port);
     }
@@ -461,7 +485,7 @@ ProcessResult RunSsh(const Target& target, const std::string& script, const std:
         too.error = "The command is too long for ssh's command line; put it in a file with write_file and run that";
         return too;
     }
-    return RunProcess(std::move(line), MakeEnvironmentBlock({}), L"", timeout, input, cancel);
+    return RunProcess(std::move(line), MakeEnvironmentBlock(environment), L"", timeout, input, cancel);
 }
 
 // What an edit_file call does to `text`; false with `error` when it cannot be done.
@@ -526,6 +550,18 @@ bool PrepareCommand(const SecretStore& secrets, const Json& input, std::string& 
 }
 
 }  // namespace
+
+std::string ServerSecretName(std::string_view text) {
+    if (text.starts_with("ssh ")) {
+        text.remove_prefix(4);
+        text.remove_prefix(std::min(text.find_first_not_of(' '), text.size()));
+    }
+    // A user is required: a bare host would take GITHUB for a server.
+    if (text.find('@') == std::string_view::npos || !ParseTarget(text)) {
+        return {};
+    }
+    return "ssh " + std::string(text);
+}
 
 std::string OwnToolName(const std::string& fullName) {
     const std::string prefix = std::string("mcp__") + kToolServer + "__";
@@ -662,8 +698,9 @@ std::string Tools::SystemPrompt() {
            "paths on this computer; relative ones resolve against the chat's working directory. Every run_command, "
            "write_file and edit_file call, and anything aimed at a server, is shown to the user for approval, so "
            "keep commands focused and say briefly why you run them. "
-           "Every tool accepts `on`: user@host[:port] makes it act on that server instead, through ssh with key "
-           "login only (no passwords): run_command runs bash or sh there, the file tools read and write the "
+           "Every tool accepts `on`: user@host[:port] makes it act on that server instead, through ssh by key, or "
+           "by the password the user stored as the secret `ssh user@host` (you never see it, ssh gets it "
+           "straight from the client): run_command runs bash or sh there, the file tools read and write the "
            "server's files (remote paths are absolute or ~/...). This is the only chat: a task that spans this "
            "computer and any number of servers stays in one conversation. Each call is a fresh shell: cd, export "
            "and set -e do not carry over, so use cwd or chain with &&. "
@@ -679,15 +716,24 @@ std::string Tools::SystemPrompt() {
 
 Json Tools::Definitions() const {
     std::string secretList;
+    std::string serverList;  // the servers whose password is stored: `on` uses it, nothing else needs it
     for (const std::string& name : secrets_.Names()) {
-        secretList += (secretList.empty() ? "" : ", ") + name;
+        if (name.starts_with("ssh ")) {
+            serverList += (serverList.empty() ? "" : ", ") + name.substr(4);
+        } else {
+            secretList += (secretList.empty() ? "" : ", ") + name;
+        }
     }
-    const std::string known = secretList.empty() ? std::string(" No secrets are stored yet.") : " Stored secrets: " + secretList + ".";
+    std::string known = secretList.empty() ? std::string(" No secrets are stored yet.") : " Stored secrets: " + secretList + ".";
+    if (!serverList.empty()) {
+        known += " Servers `on` logs in to by their stored password: " + serverList + ".";
+    }
     const Json str{{"type", "string"}};
     const Json on{{"type", "string"},
                   {"description",
-                   "Do it on this server instead of this computer: user@host or user@host:port (key login through the "
-                   "system ssh). Paths and commands are then the server's; its shell is bash or sh, not PowerShell."}};
+                   "Do it on this server instead of this computer: user@host or user@host:port (the system ssh, by "
+                   "key or by the server's stored password). Paths and commands are then the server's; its shell is "
+                   "bash or sh, not PowerShell."}};
     const Json project{{"type", "string"},
                        {"description", "A project's folder (default: this chat's project first, then the others)"}};
     return Json::array({
@@ -820,9 +866,12 @@ ToolResult Tools::RunCommand(const Json& input, const std::atomic<bool>& cancel)
 // The same five tools on a server (`on`): the shell there is bash or sh, files go through cat and ls.
 ToolResult Tools::ExecuteOn(const std::string& on, const std::string& name, const Json& input,
                             const std::atomic<bool>& cancel) const {
-    const std::optional<Target> target = ParseTarget(on);
+    std::optional<Target> target = ParseTarget(on);
     if (!target) {
         return Error("Bad `on`: expected user@host or user@host:port, got: " + on);
+    }
+    if (const std::string secret = "ssh " + on; secrets_.Has(secret)) {
+        target->secret = secret;
     }
     const std::string path = StringArg(input, "path");
     // A file operation ends here: the output is the result when it worked, the reason when it did not.

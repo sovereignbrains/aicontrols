@@ -140,12 +140,17 @@ constexpr UINT kUpdateCheck = 30'000;  // ms
 constexpr UINT_PTR kVoiceTimer = 8;    // while recording: the seconds and the pulse move
 constexpr UINT_PTR kUsageTimer = 7;    // the plan's limits asked again
 constexpr UINT kUsageCheck = 60'000;   // ms
-// The mascot, in the status line while the agent answers, puffs up and back in rhythm. The window is drawn again
+// The agent's mark, in the status line while it answers, puffs up and back in rhythm. The window is drawn again
 // only during a puff.
 constexpr UINT_PTR kPuffTimer = 5;       // a frame of a puff
 constexpr UINT kPuffFrame = 33;          // ms
 constexpr float kPuffSeconds = 1.2f;     // one puff, up and back
 constexpr float kPuff = 0.18f;           // how much bigger at its fullest
+// The mark turns when the model changes (see AgentMark); the window is drawn again only meanwhile.
+constexpr UINT_PTR kMarkTimer = 18;
+constexpr UINT kMarkFrame = 16;           // ms
+constexpr float kMarkSeconds = 0.55f;
+constexpr float kChipMark = 18.f;           // room for the mark before the model's name in its chip
 // The middle button's scrolling, as browsers have it: a frame of it, the still zone round where it was pressed,
 // and held this long (or moved) it ends on release.
 constexpr UINT_PTR kPanTimer = 9;
@@ -1198,7 +1203,9 @@ private:
     void Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha = 1.f);
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width = 1.6f);
     void Check(D2D1_POINT_2F center, uint32_t color);
-    void AgentIcon(D2D1_POINT_2F center, float radius, bool grok, uint32_t ground);
+    void AgentIcon(D2D1_POINT_2F center, float radius, bool grok, float scale = 1.f, float angle = 0.f, float alpha = 1.f);
+    void AgentMark(D2D1_POINT_2F center, float radius, float extra = 1.f);
+    void OnMarkFrame();
     void ProjectIcon(D2D1_POINT_2F center, bool general, uint32_t color);
     void GithubIcon(D2D1_POINT_2F center, uint32_t color, float size = 13.f);
     static float ItemWidth(const FeedItem& item, float column);
@@ -1474,6 +1481,11 @@ private:
 
     wil::com_ptr<ID2D1Factory> d2d_;
 wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when first drawn
+    wil::com_ptr<ID2D1PathGeometry> claudeMark_, grokMark_;  // the agents', the same
+    std::optional<std::string> markModel_;  // the model the mark was drawn for last: a change plays the animation
+    bool markFromGrok_ = false;  // whose mark leaves, while it plays
+    bool marking_ = false;
+    std::chrono::steady_clock::time_point markStart_{};
     wil::com_ptr<IDWriteFactory> dwrite_;
     wil::com_ptr<IWICImagingFactory> wic_;
     wil::com_ptr<IDWriteFontCollection> fonts_;
@@ -1518,7 +1530,6 @@ wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when f
     size_t viewerImage_ = 0;
     bool viewerAttachment_ = false;  // one of the attachments over the input, not a picture of the feed
     FeedImage viewer_;
-    FeedImage mascot_;  // in the status line while the agent answers, where a dot was
     bool puffing_ = false;
     std::chrono::steady_clock::time_point puffStart_{};
     Hit hover_;
@@ -1665,11 +1676,7 @@ int ChatWindow::Run(int show) {
     RegisterGdiFonts(instance_);
     THROW_IF_FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                      IID_PPV_ARGS(wic_.put())));
-    if (HRSRC found = FindResourceW(instance_, MAKEINTRESOURCEW(IDR_MASCOT), RT_RCDATA); found != nullptr) {
-        if (HGLOBAL loaded = LoadResource(instance_, found); loaded != nullptr) {  // a resource needs no freeing
-            mascot_.preview = LoadImagePreview(wic_.get(), LockResource(loaded), SizeofResource(instance_, found), 128);
-        }
-    }
+
     D2D1_STROKE_STYLE_PROPERTIES stroke = D2D1::StrokeStyleProperties();
     stroke.startCap = stroke.endCap = D2D1_CAP_STYLE_ROUND;
     stroke.lineJoin = D2D1_LINE_JOIN_ROUND;
@@ -2516,6 +2523,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             CheckAppUpdate();
         } else if (wParam == kPuffTimer) {
             OnPuffFrame();
+        } else if (wParam == kMarkTimer) {
+            OnMarkFrame();
         } else if (wParam == kPanTimer) {
             PanStep();
         } else if (wParam == kParkedTimer) {
@@ -3163,7 +3172,7 @@ Geometry ChatWindow::Layout() const {
         g.effort = D2D1::RectF(chipsRight - width, chipTop, chipsRight, chipBottom);
         chipsRight = g.effort.left - 2;
     }
-    const float modelWidth = TextWidth(ModelName(), ui_.get()) + 18;
+    const float modelWidth = kChipMark + TextWidth(ModelName(), ui_.get()) + 18;
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
     const float permissionWidth = TextWidth(PermissionName(), ui_.get()) + 18;
     g.permission = D2D1::RectF(g.model.left - 2 - permissionWidth, chipTop, g.model.left - 2, chipBottom);
@@ -3631,52 +3640,41 @@ void ChatWindow::Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float wi
     target_->DrawLine(a, b, brush_.get(), width, round_.get());
 }
 
-// GitHub's mark (Octicons' mark-github, 16 by 16), parsed from its path data: M, C, c, s, l, h, v, A and z are all it uses.
-static wil::com_ptr<ID2D1PathGeometry> GithubMark(ID2D1Factory* factory) {
-    static constexpr const char* kPath =
-        "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94"
-        "-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07"
-        "-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27"
-        ".68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95"
-        ".29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z";
+// A mark from its SVG path data: M, L, H, V, C, S, A and Z, each also in relative form, which is all these marks use.
+// `winding` fills it by the non-zero rule, else by even-odd (Grok's mark is made so).
+static wil::com_ptr<ID2D1PathGeometry> SvgMark(ID2D1Factory* factory, const char* path, bool winding) {
     wil::com_ptr<ID2D1PathGeometry> geometry;
     wil::com_ptr<ID2D1GeometrySink> sink;
     if (FAILED(factory->CreatePathGeometry(geometry.put())) || FAILED(geometry->Open(sink.put()))) {
         return {};
     }
-    const char* p = kPath;
-    const auto number = [&p]() {
-        while (*p == ' ' || *p == ',') {
+    sink->SetFillMode(winding ? D2D1_FILL_MODE_WINDING : D2D1_FILL_MODE_ALTERNATE);
+    const char* p = path;
+    const auto skip = [&p]() {
+        while (*p == ' ' || *p == ',' || *p == '\n') {
             ++p;
         }
-        const char* start = p;
-        if (*p == '-') {
-            ++p;
-        }
-        while (*p >= '0' && *p <= '9') {
-            ++p;
-        }
-        if (*p == '.') {
-            ++p;
-            while (*p >= '0' && *p <= '9') {
-                ++p;
-            }
-        }
-        return std::strtof(start, nullptr);
     };
-    const auto more = [&p]() {
-        while (*p == ' ' || *p == ',') {
-            ++p;
-        }
+    const auto number = [&]() {
+        skip();
+        char* end = nullptr;
+        const float value = std::strtof(p, &end);  // stops at the second dot of "1.36.0729"
+        p = end;
+        return value;
+    };
+    const auto flag = [&]() {  // an arc's flags may stand together with no space: "0 00-1.829-1"
+        skip();
+        return *p++ == '1';
+    };
+    const auto more = [&]() {
+        skip();
         return *p == '-' || *p == '.' || (*p >= '0' && *p <= '9');
     };
-    D2D1_POINT_2F at{}, start{};
-    bool open = false;
+    D2D1_POINT_2F at{}, start{}, lastControl{};
+    bool open = false, smooth = false;  // smooth: the last segment was a curve, so S has a control point to mirror
     char cmd = 0;
-    while (*p != 0) {
-        while (*p == ' ') {
-            ++p;
-        }
+    while (true) {
+        skip();
         if (*p == 0) {
             break;
         }
@@ -3685,27 +3683,18 @@ static wil::com_ptr<ID2D1PathGeometry> GithubMark(ID2D1Factory* factory) {
         }
         const bool rel = cmd >= 'a';
         const float ox = rel ? at.x : 0.f, oy = rel ? at.y : 0.f;
+        bool curve = false;
         switch (cmd) {
-        case 'M': {
-            const float x = number(), y = number();
+        case 'M':
+        case 'm': {
+            if (open) {
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);  // filled, so closed either way
+            }
+            const float x = ox + number(), y = oy + number();
             at = start = {x, y};
             sink->BeginFigure(at, D2D1_FIGURE_BEGIN_FILLED);
             open = true;
-            cmd = 'L';
-            break;
-        }
-        case 'C':
-        case 'c': {
-            do {
-                const D2D1_POINT_2F a{ox + number(), oy + number()};
-                const D2D1_POINT_2F b{ox + number(), oy + number()};
-                const D2D1_POINT_2F e{ox + number(), oy + number()};
-                sink->AddBezier(D2D1::BezierSegment(a, b, e));
-                at = e;
-                if (rel) {
-                    break;  // the offsets are from the segment's start: one at a time
-                }
-            } while (more());
+            cmd = rel ? 'l' : 'L';  // more pairs after a move are lines
             break;
         }
         case 'L':
@@ -3714,10 +3703,37 @@ static wil::com_ptr<ID2D1PathGeometry> GithubMark(ID2D1Factory* factory) {
             sink->AddLine(at);
             break;
         }
-        case 'A': {
+        case 'H':
+        case 'h':
+            at.x = ox + number();
+            sink->AddLine(at);
+            break;
+        case 'V':
+        case 'v':
+            at.y = oy + number();
+            sink->AddLine(at);
+            break;
+        case 'C':
+        case 'c':
+        case 'S':
+        case 's': {
+            D2D1_POINT_2F a = smooth ? D2D1_POINT_2F{2 * at.x - lastControl.x, 2 * at.y - lastControl.y} : at;
+            if (cmd == 'C' || cmd == 'c') {
+                a = {ox + number(), oy + number()};
+            }
+            const D2D1_POINT_2F b{ox + number(), oy + number()};
+            const D2D1_POINT_2F e{ox + number(), oy + number()};
+            sink->AddBezier(D2D1::BezierSegment(a, b, e));
+            at = e;
+            lastControl = b;
+            curve = true;
+            break;
+        }
+        case 'A':
+        case 'a': {
             const float rx = number(), ry = number(), rot = number();
-            const bool large = number() != 0.f, sweep = number() != 0.f;
-            at = {number(), number()};
+            const bool large = flag(), sweep = flag();
+            at = {ox + number(), oy + number()};
             sink->AddArc(D2D1::ArcSegment(at, D2D1::SizeF(rx, ry), rot,
                                           sweep ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
                                           large ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
@@ -3728,10 +3744,18 @@ static wil::com_ptr<ID2D1PathGeometry> GithubMark(ID2D1Factory* factory) {
             sink->EndFigure(D2D1_FIGURE_END_CLOSED);
             open = false;
             at = start;
-            break;
+            if (!more()) {
+                continue;
+            }
+            // Drawing goes on from the start with no new "m": a figure of its own begins there.
+            sink->BeginFigure(at, D2D1_FIGURE_BEGIN_FILLED);
+            open = true;
+            cmd = 'l';
+            continue;
         default:
             return {};
         }
+        smooth = curve;
     }
     if (open) {
         sink->EndFigure(D2D1_FIGURE_END_CLOSED);
@@ -3739,21 +3763,96 @@ static wil::com_ptr<ID2D1PathGeometry> GithubMark(ID2D1Factory* factory) {
     return SUCCEEDED(sink->Close()) ? geometry : wil::com_ptr<ID2D1PathGeometry>();
 }
 
-// The agent's mark: Claude's twelve-spoke star, Grok's ring cut by a slash (`ground` is what the slash cuts with).
-void ChatWindow::AgentIcon(D2D1_POINT_2F c, float r, bool grok, uint32_t ground) {
-    if (!grok) {
-        for (int i = 0; i < 12; ++i) {
-            const float a = static_cast<float>(i) * 0.5235988f;
-            const float dx = std::cos(a), dy = std::sin(a);
-            Line({c.x + dx * r * 0.2f, c.y + dy * r * 0.2f}, {c.x + dx * r * 0.82f, c.y + dy * r * 0.82f}, kClaudeDot,
-                 r * 0.34f);
+// The marks as their makers draw them, all on a 24 square but GitHub's (Octicons' mark-github, 16): Claude's spark
+// (Simple Icons), Grok's (Lobe Icons), and what each is made of.
+static constexpr float kGithubBox = 16.f;
+static constexpr float kMarkBox = 24.f;
+static constexpr const char* kGithubPath =
+    "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94"
+    "-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07"
+    "-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27"
+    ".68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95"
+    ".29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z";
+static constexpr const char* kClaudePath =
+    "m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215"
+    "-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971"
+    "-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607"
+    ".8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032"
+    "-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296"
+    ".4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793"
+    ".4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046"
+    ".5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607"
+    " 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457"
+    ".6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093"
+    "l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17"
+    "l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079"
+    "-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425"
+    "-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882"
+    ".929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z";
+static constexpr const char* kGrokPath =
+    "M9.27 15.29l7.978-5.897c.391-.29.95-.177 1.137.272.98 2.369.542 5.215-1.41 7.169-1.951 1.954-4.667 2.382-7.149 1.406"
+    "l-2.711 1.257c3.889 2.661 8.611 2.003 11.562-.953 2.341-2.344 3.066-5.539 2.388-8.42l.006.007c-.983-4.232.242-5.924 2.75-9.383"
+    ".06-.082.12-.164.179-.248l-3.301 3.305v-.01L9.267 15.292M7.623 16.723c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483"
+    " 7.166-1.425l2.705-1.25a7.808 7.808 0 00-1.829-1A8.975 8.975 0 005.984 5.83c-2.533 2.536-3.33 6.436-1.962 9.764"
+    " 1.022 2.487-.653 4.246-2.34 6.022-.599.63-1.199 1.259-1.682 1.925l7.62-6.815";
+
+// The agent's mark, as its maker draws it: Claude's spark, Grok's slash. Turned by `angle` and grown by `scale` about
+// its middle, as faint as `alpha` says.
+void ChatWindow::AgentIcon(D2D1_POINT_2F c, float r, bool grok, float scale, float angle, float alpha) {
+    wil::com_ptr<ID2D1PathGeometry>& mark = grok ? grokMark_ : claudeMark_;
+    if (!mark) {
+        mark = grok ? SvgMark(d2d_.get(), kGrokPath, false) : SvgMark(d2d_.get(), kClaudePath, true);
+    }
+    if (!mark || scale <= 0.f || alpha <= 0.f) {
+        return;
+    }
+    const float size = r * 2.4f * scale;  // its square, a little more than the dot it came instead of
+    brush_->SetColor(Color(grok ? kGrokDot : kClaudeDot, alpha));
+    D2D1_MATRIX_3X2_F before{};
+    target_->GetTransform(&before);
+    target_->SetTransform(D2D1::Matrix3x2F::Translation(-kMarkBox / 2, -kMarkBox / 2) *
+                          D2D1::Matrix3x2F::Scale(size / kMarkBox, size / kMarkBox) * D2D1::Matrix3x2F::Rotation(angle * 57.2957795f) *
+                          D2D1::Matrix3x2F::Translation(c.x, c.y) * before);
+    target_->FillGeometry(mark.get(), brush_.get());
+    target_->SetTransform(before);
+}
+
+// The mark of whoever answers now, in the model's chip and the status line. When the model changes, by the menu or by
+// another chat opened, it plays: to the other agent the old mark shrinks away turning and the new grows in from the
+// other side with a little overshoot; within one agent it turns once round and bounces. `extra` is the status line's puff.
+void ChatWindow::AgentMark(D2D1_POINT_2F c, float r, float extra) {
+    const bool grok = GrokSelected();
+    if (markModel_ && *markModel_ != settings_.model) {
+        markFromGrok_ = markModel_->starts_with("grok-");
+        markStart_ = std::chrono::steady_clock::now();
+        if (!marking_) {
+            marking_ = true;
+            SetTimer(hwnd_, kMarkTimer, kMarkFrame, nullptr);
+        }
+    }
+    markModel_ = settings_.model;
+    const float t = marking_ ? std::clamp(std::chrono::duration<float>(std::chrono::steady_clock::now() - markStart_).count() /
+                                              kMarkSeconds, 0.f, 1.f)
+                             : 1.f;
+    if (t >= 1.f) {
+        AgentIcon(c, r, grok, extra, 0.f, 1.f);
+        return;
+    }
+    constexpr float kPi = std::numbers::pi_v<float>;
+    if (markFromGrok_ != grok) {
+        constexpr float kOut = 0.4f;  // the share of the time the old one leaves in
+        if (t < kOut) {
+            const float u = t / kOut;
+            AgentIcon(c, r, markFromGrok_, (1.f - u * u) * extra, -u * 1.2f, 1.f - u);
+        } else {
+            const float u = (t - kOut) / (1.f - kOut);
+            const float back = 1.f + 2.70158f * std::pow(u - 1.f, 3.f) + 1.70158f * std::pow(u - 1.f, 2.f);  // easeOutBack
+            AgentIcon(c, r, grok, back * extra, (1.f - u) * 1.2f, std::min(1.f, u * 3.f));
         }
         return;
     }
-    brush_->SetColor(Color(kGrokDot));
-    target_->DrawEllipse(D2D1::Ellipse(c, r * 0.72f, r * 0.72f), brush_.get(), r * 0.34f);
-    Line({c.x - r * 0.9f, c.y + r * 0.9f}, {c.x + r * 0.9f, c.y - r * 0.9f}, ground, r * 0.6f);
-    Line({c.x - r * 0.95f, c.y + r * 0.95f}, {c.x + r * 1.0f, c.y - r * 1.0f}, kGrokDot, r * 0.26f);
+    const float turn = 1.f - std::pow(1.f - t, 3.f);
+    AgentIcon(c, r, grok, (1.f + 0.25f * std::sin(kPi * t)) * extra, turn * 2.f * kPi, 1.f);
 }
 
 // A project's mark, a folder; the general chats' is a speech bubble.
@@ -3778,12 +3877,12 @@ void ChatWindow::ProjectIcon(D2D1_POINT_2F c, bool general, uint32_t color) {
 void ChatWindow::GithubIcon(D2D1_POINT_2F c, uint32_t color, float size) {
     brush_->SetColor(Color(color));
     if (!githubMark_) {
-        githubMark_ = GithubMark(d2d_.get());
+        githubMark_ = SvgMark(d2d_.get(), kGithubPath, true);
     }
     if (githubMark_) {
         D2D1_MATRIX_3X2_F before{};
         target_->GetTransform(&before);
-        target_->SetTransform(D2D1::Matrix3x2F::Scale(size / 16.f, size / 16.f) *
+        target_->SetTransform(D2D1::Matrix3x2F::Scale(size / kGithubBox, size / kGithubBox) *
                               D2D1::Matrix3x2F::Translation(c.x - size / 2, c.y - size / 2) * before);
         target_->FillGeometry(githubMark_.get(), brush_.get());
         target_->SetTransform(before);
@@ -4153,7 +4252,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             if (item.kind == Kind::Assistant) {
                 if (item.whoHeight > 0) {  // a dot of the agent's colour, then the model
                     const bool grok = item.who.starts_with(L"Grok");
-                    AgentIcon({x + 5.f, y + 8.f}, 6.f, grok, kWindow);
+                    AgentIcon({x + 5.f, y + 8.f}, 6.f, grok);
                     Text(item.who, small_.get(), D2D1::RectF(x + 13.f, y, left + g.column, y + kWhoRow), kSecondary);
                     textY = y + item.whoHeight;
                 }
@@ -4175,14 +4274,10 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             shown += std::wstring(static_cast<size_t>(ticks / 400 % 4), L'.');
         }
         float textLeft = left;
-        if (ID2D1Bitmap* mascot = Bitmap(mascot_); busy_ && mascot != nullptr) {  // the mascot puffs while it answers
-            constexpr float kMascot = 20.f;
-            const float size = kMascot * PuffScale();
-            const D2D1_POINT_2F middle{left + kMascot / 2, y + kStatusRow / 2};
-            target_->DrawBitmap(mascot, D2D1::RectF(middle.x - size / 2, middle.y - size / 2, middle.x + size / 2,
-                                                    middle.y + size / 2),
-                                1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-            textLeft = left + kMascot + 8.f;
+        if (busy_) {  // the mark of who answers puffs while it does
+            constexpr float kMarkSlot = 20.f;
+            AgentMark({left + kMarkSlot / 2, y + kStatusRow / 2}, kMarkSlot / 2.4f, PuffScale());
+            textLeft = left + kMarkSlot + 8.f;
         } else if (moving) {
             const D2D1_POINT_2F dot{left + 5.f, y + kStatusRow / 2};
             const float pulse = 0.55f + 0.45f * std::sin(static_cast<float>(ticks % 1200) / 1200.f * 2.f * std::numbers::pi_v<float>);
@@ -4584,7 +4679,8 @@ void ChatWindow::PaintInput(const Geometry& g) {
     if (modelActive) {
         Fill(g.model, 6.f, kRaised);
     }
-    Text(ModelName(), ui_.get(), D2D1::RectF(g.model.left + 9, g.model.top, g.model.right, g.model.bottom),
+    AgentMark({g.model.left + 9 + (kChipMark - 4.f) / 2, (g.model.top + g.model.bottom) / 2}, 6.f);
+    Text(ModelName(), ui_.get(), D2D1::RectF(g.model.left + 9 + kChipMark, g.model.top, g.model.right, g.model.bottom),
          modelActive ? kPrimary : kSecondary);
     {  // nothing asked is worth seeing at a glance: in the accent
         const bool active = hover_.target == Target::PermissionChip;
@@ -6442,7 +6538,7 @@ void ChatWindow::PaintConnect(const Geometry& g) {
         if (i == kGithubLink) {
             GithubIcon({row.left + 28.f, middle}, kPrimary, 20.f);
         } else {
-            AgentIcon({row.left + 28.f, middle}, 11.f, i == kGrokLink, kRaised);
+            AgentIcon({row.left + 28.f, middle}, 10.f, i == kGrokLink);
         }
         const float textLeft = row.left + 54.f;
         float textRight = button.left - 10.f;
@@ -7140,12 +7236,12 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             const float y = (chat.top + chat.bottom) / 2;
             float x = chat.left + 13.f;
             if (before) {
-                AgentIcon({chat.left + 10.f, y}, 4.5f, *before, ground);
+                AgentIcon({chat.left + 10.f, y}, 4.5f, *before);
                 brush_->SetColor(Color(ground));
                 x = chat.left + 15.f;
                 target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 6.f, 6.f), brush_.get());
             }
-            AgentIcon({x, y}, 5.f, grok, ground);
+            AgentIcon({x, y}, 5.f, grok);
         };
         if (rows_[row].session == kHead) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
@@ -9085,7 +9181,7 @@ void ChatWindow::OnMemorySaved(const MemorySave& saved) {
 }
 
 void ChatWindow::StartPuff() {
-    if (puffing_ || !mascot_.preview) {
+    if (puffing_) {
         return;
     }
     puffing_ = true;
@@ -9102,6 +9198,14 @@ void ChatWindow::OnPuffFrame() {
             puffing_ = false;
             KillTimer(hwnd_, kPuffTimer);
         }
+    }
+    Refresh();
+}
+
+void ChatWindow::OnMarkFrame() {
+    if (std::chrono::steady_clock::now() - markStart_ >= std::chrono::duration<float>(kMarkSeconds)) {
+        marking_ = false;
+        KillTimer(hwnd_, kMarkTimer);
     }
     Refresh();
 }

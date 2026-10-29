@@ -1156,6 +1156,8 @@ private:
     void Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha = 1.f);
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width = 1.6f);
     void Check(D2D1_POINT_2F center, uint32_t color);
+    void AgentIcon(D2D1_POINT_2F center, float radius, bool grok, uint32_t ground);
+    void ProjectIcon(D2D1_POINT_2F center, bool general, uint32_t color);
     static float ItemWidth(const FeedItem& item, float column);
     void MeasureFeed(float column, float view);
     void MeasureRest();
@@ -3100,7 +3102,7 @@ Geometry ChatWindow::Layout() const {
     if (sidebarWidth > 0) {
         g.sidebar = D2D1::RectF(0, kHeader, sidebarWidth, g.height);
         g.search = D2D1::RectF(10, kHeader + 10, sidebarWidth - 10, kHeader + 10 + kFieldHeight);
-        g.newItem = D2D1::RectF(6, g.search.bottom + 8, sidebarWidth - 6, g.search.bottom + 8 + kNavRow);
+        g.newItem = D2D1::RectF(6, g.search.bottom + 2, sidebarWidth - 6, g.search.bottom + 2);  // none: the general head has the "+"
         // At the bottom, the settings' end: the secrets over the account.
         // The account's row with the secrets' padlock at its right end, as Claude's app keeps its small button there.
         g.secrets = D2D1::RectF(sidebarWidth - 6 - 34, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
@@ -3311,9 +3313,6 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 if (rows_[row].session != kHead) {
                     return Inside(ChatMoreRect(row, SideRowRect(g, row)), x, y) ? Hit{Target::ChatMore, row}
                                                                                 : Hit{Target::HistoryRow, row};
-                }
-                if (projects_[rows_[row].project].folder == DefaultWorkspace()) {
-                    return {Target::ProjectRow, row};  // the general chats' label folds; no "+" (the top "new chat")
                 }
                 return Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
                                                                           : Hit{Target::ProjectRow, row};
@@ -3529,6 +3528,40 @@ void ChatWindow::Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, flo
 void ChatWindow::Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width) {
     brush_->SetColor(Color(color));
     target_->DrawLine(a, b, brush_.get(), width, round_.get());
+}
+
+// The agent's mark: Claude's twelve-spoke star, Grok's ring cut by a slash (`ground` is what the slash cuts with).
+void ChatWindow::AgentIcon(D2D1_POINT_2F c, float r, bool grok, uint32_t ground) {
+    if (!grok) {
+        for (int i = 0; i < 12; ++i) {
+            const float a = static_cast<float>(i) * 0.5235988f;
+            const float dx = std::cos(a), dy = std::sin(a);
+            Line({c.x + dx * r * 0.2f, c.y + dy * r * 0.2f}, {c.x + dx * r * 0.82f, c.y + dy * r * 0.82f}, kClaudeDot,
+                 r * 0.34f);
+        }
+        return;
+    }
+    brush_->SetColor(Color(kGrokDot));
+    target_->DrawEllipse(D2D1::Ellipse(c, r * 0.72f, r * 0.72f), brush_.get(), r * 0.34f);
+    Line({c.x - r * 0.9f, c.y + r * 0.9f}, {c.x + r * 0.9f, c.y - r * 0.9f}, ground, r * 0.6f);
+    Line({c.x - r * 0.95f, c.y + r * 0.95f}, {c.x + r * 1.0f, c.y - r * 1.0f}, kGrokDot, r * 0.26f);
+}
+
+// A project's mark, GitHub's repository book; the general chats' is a speech bubble.
+void ChatWindow::ProjectIcon(D2D1_POINT_2F c, bool general, uint32_t color) {
+    brush_->SetColor(Color(color));
+    if (general) {
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y - 5.f, c.x + 6.f, c.y + 3.5f), 2.5f, 2.5f),
+                                      brush_.get(), 1.4f, round_.get());
+        Line({c.x - 2.5f, c.y + 3.5f}, {c.x - 3.5f, c.y + 6.f}, color, 1.4f);
+        Line({c.x - 3.5f, c.y + 6.f}, {c.x + 0.5f, c.y + 3.5f}, color, 1.4f);
+        return;
+    }
+    target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 5.f, c.y - 6.f, c.x + 5.f, c.y + 6.f), 1.8f, 1.8f),
+                                  brush_.get(), 1.4f, round_.get());
+    Line({c.x - 5.f, c.y + 2.5f}, {c.x + 5.f, c.y + 2.5f}, color, 1.4f);
+    Line({c.x - 2.f, c.y + 6.f}, {c.x - 2.f, c.y + 2.5f}, color, 1.4f);
+    Line({c.x - 2.f, c.y + 6.f}, {c.x, c.y + 4.5f}, color, 1.4f);
 }
 
 void ChatWindow::Check(D2D1_POINT_2F c, uint32_t color) {
@@ -3884,8 +3917,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             if (item.kind == Kind::Assistant) {
                 if (item.whoHeight > 0) {  // a dot of the agent's colour, then the model
                     const bool grok = item.who.starts_with(L"Grok");
-                    brush_->SetColor(Color(grok ? kGrokDot : kClaudeDot));
-                    target_->FillEllipse(D2D1::Ellipse({x + 3.5f, y + 8.f}, 3.5f, 3.5f), brush_.get());
+                    AgentIcon({x + 5.f, y + 8.f}, 6.f, grok, kWindow);
                     Text(item.who, small_.get(), D2D1::RectF(x + 13.f, y, left + g.column, y + kWhoRow), kSecondary);
                     textY = y + item.whoHeight;
                 }
@@ -6340,19 +6372,6 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Text(searchText_, ui_.get(), field, kPrimary);
     }
 
-    {  // a new general chat: lit while the open chat is one, empty, as "New" is in Claude's app
-        const bool active = hover_.target == Target::NewChat || (!HasConversation() && workspace_ == DefaultWorkspace());
-        if (active) {
-            Fill(g.newItem, 8.f, kRaised);
-        }
-        const uint32_t color = active ? kPrimary : kSecondary;
-        const D2D1_POINT_2F c{g.newItem.left + 22.f, (g.newItem.top + g.newItem.bottom) / 2};
-        Line({c.x - 5.5f, c.y}, {c.x + 5.5f, c.y}, color, 1.5f);
-        Line({c.x, c.y - 5.5f}, {c.x, c.y + 5.5f}, color, 1.5f);
-        Text(L"Новый чат", ui_.get(),
-             D2D1::RectF(g.newItem.left + 42, g.newItem.top, g.newItem.right - 8, g.newItem.bottom), color);
-    }
-
     if (update_) {  // the client's update, over the secrets
         Fill(g.update, 8.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
@@ -6482,31 +6501,13 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             const float y = (chat.top + chat.bottom) / 2;
             float x = chat.left + 13.f;
             if (before) {
-                brush_->SetColor(Color(*before ? kGrokDot : kClaudeDot));
-                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(chat.left + 11.f, y), 3.f, 3.f), brush_.get());
+                AgentIcon({chat.left + 10.f, y}, 4.5f, *before, ground);
                 brush_->SetColor(Color(ground));
-                x = chat.left + 16.f;
-                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 4.5f, 4.5f), brush_.get());
+                x = chat.left + 15.f;
+                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 6.f, 6.f), brush_.get());
             }
-            brush_->SetColor(Color(grok ? kGrokDot : kClaudeDot));
-            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 3.f, 3.f), brush_.get());
+            AgentIcon({x, y}, 5.5f, grok, ground);
         };
-        if (rows_[row].session == kHead && project.folder == DefaultWorkspace()) {
-            // The general chats, under the projects: a section of their own, labelled as "projects" is; it folds.
-            if (hovered) {
-                Fill(lit(r), 8.f, kRaised);
-            }
-            const D2D1_POINT_2F c{r.left + 14.f, (r.top + r.bottom) / 2};
-            if (!searchText_.empty() || !ProjectFolded(project.folder)) {
-                Line({c.x - 4.f, c.y - 2.f}, {c.x, c.y + 2.f}, kSecondary, 1.4f);
-                Line({c.x, c.y + 2.f}, {c.x + 4.f, c.y - 2.f}, kSecondary, 1.4f);
-            } else {
-                Line({c.x - 2.f, c.y - 4.f}, {c.x + 2.f, c.y}, kSecondary, 1.4f);
-                Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.4f);
-            }
-            Text(L"Общие чаты", ui_.get(), D2D1::RectF(r.left + 28, r.top + 8, r.right - 10, r.bottom), kSecondary);
-            continue;
-        }
         if (rows_[row].session == kHead) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
             // chat in it under the pointer, else how many chats it has. The keyboard's row lights up too.
@@ -6522,9 +6523,12 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.4f);
             }
             const D2D1_RECT_F plus = ProjectNewRect(r);
-            Text(project.name, uiBold_.get(), D2D1::RectF(r.left + 28, r.top, plus.left - 4, r.bottom),
-                 project.folder == workspace_ ? kPrimary : kSecondary);
-            if (hovered && project.folder != DefaultWorkspace()) {  // the general one's "+" is the top "new chat"
+            const bool general = project.folder == DefaultWorkspace();  // its "+" starts the general chat
+            const uint32_t nameColor = project.folder == workspace_ ? kPrimary : kSecondary;
+            ProjectIcon({r.left + 31.f, c.y}, general, nameColor);
+            Text(general ? L"Общие чаты" : project.name, uiBold_.get(),
+                 D2D1::RectF(r.left + 46, r.top, plus.left - 4, r.bottom), nameColor);
+            if (hovered) {
                 const bool on = hover_.target == Target::ProjectNew;
                 if (on) {
                     Fill(plus, 6.f, kLine);
@@ -6538,7 +6542,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             continue;
         }
         // A project's chats stand in under its head; the general ones are a section of their own.
-        const float indent = project.folder == DefaultWorkspace() ? 0.f : kProjectIndent;
+        const float indent = kProjectIndent;
         const D2D1_RECT_F chat = D2D1::RectF(r.left + indent, r.top, r.right, r.bottom);
         if (rows_[row].session == kDraft) {  // the new chat that is open: lit, in its project
             Fill(lit(chat), 8.f, kRaised);

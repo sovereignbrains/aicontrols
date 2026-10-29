@@ -211,8 +211,9 @@ constexpr float kUsageWidth = 380.f;
 constexpr float kPanelPad = 16.f;
 constexpr float kSecretRow = 38.f;
 constexpr float kFieldHeight = 34.f;
-constexpr float kTabHeight = 40.f;  // the sidebar's switch between the general chats and the projects
-constexpr float kTabIcon = 1.35f;   // its marks' scale over the list's own (bigger, as they stand alone)
+constexpr float kSearchHeight = 30.f;  // the sidebar's search, with the projects' "+" at its right
+constexpr float kTabHeight = 32.f;  // the sidebar's switch between the general chats and the projects
+constexpr float kTabIcon = 1.1f;    // its marks' scale over the list's own (bigger, as they stand alone)
 constexpr float kSecretsNote = 40.f;
 constexpr float kUsageRow = 58.f;
 constexpr float kUsageNote = 24.f;  // Grok's popup: a line under its one bar
@@ -563,8 +564,7 @@ enum class Target {
     ChatMore,     // row: the same: "⋯" on a chat under the pointer, its menu
     SearchClear,  // "×" in the search while it filters the list
     SideTab,      // row: 0 the general chats, 1 the projects: what the list below shows
-    AddProject,   // "+" beside the projects' label: a folder or a GitHub repository
-    ProjectsLabel,  // the "projects" label: how that list is ordered
+    AddProject,   // "+" beside the search on the projects' tab: a folder or a GitHub repository (right click: their order)
     ModelRow,     // row: an index into the models
     AutoToggle,   // "Auto" atop the models
     FastToggle,   // "Fast" in the Grok row's options
@@ -624,8 +624,7 @@ struct Geometry {
     D2D1_RECT_F newItem{};  // the sidebar's "new chat" row
     D2D1_RECT_F tabs{};     // the switch over the search: the general chats | the projects
     std::array<D2D1_RECT_F, 2> sideTabs{};
-    D2D1_RECT_F addProject{};  // "+" at the right of the projects' label
-    D2D1_RECT_F projectsLabel{};  // "Проекты" and the order: click to choose it
+    D2D1_RECT_F addProject{};  // "+" at the right of the search, on the projects' tab
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
     std::array<D2D1_RECT_F, 3> links{};        // the connect screen's rows (in the middle of an empty chat)
     std::array<D2D1_RECT_F, 3> linkButtons{};  // ... each one's button at its right
@@ -1131,14 +1130,12 @@ private:
     };
     static constexpr size_t kHead = SIZE_MAX;
     static constexpr size_t kDraft = SIZE_MAX - 1;
-    static constexpr size_t kLabel = SIZE_MAX - 2;
     struct SideRow {  // one row of the list: a project's head, or one of its chats
         size_t project = 0;
         // An index into its sessions; kHead: the project's own row; kDraft: the open chat, not saved yet (a new
-        // one): it shows which project it is in; kLabel: the "projects" label between the general chats and them.
+        // one): it shows which project it is in.
         size_t session = kHead;
     };
-    size_t labelRow_ = SIZE_MAX;  // where the label is in rows_ (none while nothing is built)
     // The switch at the sidebar's top, as Claude's app has one between its modes: the general chats as a flat list,
     // or the projects with theirs. It follows the open chat (SetWorkspace); a search looks through both.
     bool projectsTab_ = false;
@@ -2436,8 +2433,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             case Target::ProjectNew:
                 ShowProjectMenu(hit.row, screen);
                 return 0;
-            case Target::ProjectsLabel:
+            case Target::AddProject:
                 ShowProjectOrderMenu();
+                return 0;
+            case Target::SideTab:  // the projects' tab: how they are ordered
+                if (hit.row == 1) {
+                    ShowProjectOrderMenu();
+                }
                 return 0;
             case Target::TermTab:
             case Target::TermTabClose:
@@ -2844,10 +2846,6 @@ void ChatWindow::OnClick(float x, float y) {
         keepFocus = true;
         break;
     }
-    case Target::ProjectsLabel:
-        ShowProjectOrderMenu();
-        keepFocus = true;
-        break;
     case Target::ModelChip:
         OpenPopup(Popup::Models);
         break;
@@ -3210,28 +3208,25 @@ Geometry ChatWindow::Layout() const {
 
     if (sidebarWidth > 0) {
         g.sidebar = D2D1::RectF(0, kHeader, sidebarWidth, g.height);
-        g.tabs = D2D1::RectF(10, kHeader + 8, sidebarWidth - 10, kHeader + 8 + kTabHeight);
+        g.tabs = D2D1::RectF(10, kHeader + 6, sidebarWidth - 10, kHeader + 6 + kTabHeight);
         const float tabMiddle = (g.tabs.left + g.tabs.right) / 2;
         g.sideTabs[0] = D2D1::RectF(g.tabs.left + 4, g.tabs.top + 4, tabMiddle, g.tabs.bottom - 4);
         g.sideTabs[1] = D2D1::RectF(tabMiddle, g.tabs.top + 4, g.tabs.right - 4, g.tabs.bottom - 4);
-        g.search = D2D1::RectF(10, g.tabs.bottom + 8, sidebarWidth - 10, g.tabs.bottom + 8 + kFieldHeight);
+        g.search = D2D1::RectF(10, g.tabs.bottom + 6, sidebarWidth - 10, g.tabs.bottom + 6 + kSearchHeight);
+        if (projectsTab_) {  // the way to another project, beside the search
+            g.addProject = D2D1::RectF(g.search.right - kSearchHeight, g.search.top, g.search.right, g.search.bottom);
+            g.search.right = g.addProject.left - 6;
+        }
         g.newItem = D2D1::RectF(6, g.search.bottom + 2, sidebarWidth - 6, g.search.bottom + 2);  // none: the general head has the "+"
         // At the bottom, the settings' end: the secrets over the account.
         // The account's row with the secrets' padlock at its right end, as Claude's app keeps its small button there.
         g.secrets = D2D1::RectF(sidebarWidth - 6 - 34, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
         g.account = D2D1::RectF(6, g.secrets.top, g.secrets.left - 2, g.secrets.bottom);
-        g.listTop = g.newItem.bottom + 6;  // the general chats come first, the "projects" label is a row after them
+        g.listTop = g.newItem.bottom + 4;
         g.listBottom = g.account.top - 10;
         if (update_) {
             g.update = D2D1::RectF(10, g.account.top - 10 - 34, sidebarWidth - 10, g.account.top - 10);
             g.listBottom = g.update.top - 8;
-        }
-        // The label and its "+" are where their row is, while it is in view.
-        if (labelRow_ < rows_.size()) {
-            if (const D2D1_RECT_F row = SideRowRect(g, labelRow_); row.right > row.left) {
-                g.addProject = ProjectNewRect(row);
-                g.projectsLabel = D2D1::RectF(row.left, row.top + 2.f, g.addProject.left - 4, row.bottom - 2.f);
-            }
         }
     }
     if (termWidth > 0) {
@@ -3419,14 +3414,11 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.addProject, x, y)) {
             return {Target::AddProject};
         }
-        if (Inside(g.projectsLabel, x, y)) {
-            return {Target::ProjectsLabel};
-        }
         if (y >= g.listTop && y < g.listBottom) {
             const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
             if (row < rows_.size() && row < firstRow_ + SidebarRows(g)) {
-                if (rows_[row].session == kDraft || rows_[row].session == kLabel) {
-                    return {};  // the chat that is open already; the label's own hits are tested above
+                if (rows_[row].session == kDraft) {
+                    return {};  // the chat that is open already
                 }
                 if (rows_[row].session != kHead) {
                     return Inside(ChatMoreRect(row, SideRowRect(g, row)), x, y) ? Hit{Target::ChatMore, row}
@@ -7129,13 +7121,26 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             constexpr float kIconBox = 22.f;  // room for the mark: about 20 DIPs across at kTabIcon
             const float left = (r.left + r.right - (kIconBox + 6.f + nameWidth)) / 2;
             const float middle = (r.top + r.bottom) / 2;
-            ProjectIcon({left + kIconBox / 2, middle}, !projects, color, kTabIcon);
+            if (projects) {  // the projects come from GitHub as well as from folders
+                GithubIcon({left + kIconBox / 2, middle}, color, 17.f);
+            } else {
+                ProjectIcon({left + kIconBox / 2, middle}, true, color, kTabIcon);
+            }
             Text(name, uiBold_.get(), D2D1::RectF(left + kIconBox + 6.f, r.top, r.right, r.bottom), color);
             if (!shown && ParkedIn(projects)) {
                 brush_->SetColor(Color(kAccent));
                 target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(r.right - 9.f, r.top + 9.f), 3.5f, 3.5f), brush_.get());
             }
         }
+    }
+
+    if (projectsTab_) {  // the way to another project: a folder or a GitHub repository
+        const bool active = hover_.target == Target::AddProject;
+        Fill(g.addProject, 8.f, active ? kLine : kRaised);
+        const D2D1_POINT_2F c{(g.addProject.left + g.addProject.right) / 2, (g.addProject.top + g.addProject.bottom) / 2};
+        const uint32_t color = active ? kPrimary : kSecondary;
+        Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
+        Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
     }
 
     // Search: drawn here, so there is no blinking caret.
@@ -7259,37 +7264,6 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         }
         // The lit rows keep a gap between them, so the open chat and a hovered head do not run into one.
         const auto lit = [](const D2D1_RECT_F& rect) { return D2D1::RectF(rect.left, rect.top + 2.f, rect.right, rect.bottom - 2.f); };
-        if (rows_[row].session == kLabel) {
-            // The projects' label (click: how they are ordered), and "+" for another one.
-            const D2D1_RECT_F plus = ProjectNewRect(r);
-            const D2D1_RECT_F label = D2D1::RectF(r.left, r.top + 2.f, plus.left - 4, r.bottom - 2.f);
-            const bool onLabel = hover_.target == Target::ProjectsLabel;
-            if (onLabel) {
-                Fill(label, 6.f, kRaised);
-            }
-            const uint32_t labelColor = onLabel ? kPrimary : kSecondary;
-            GithubIcon({r.left + 17.f, (r.top + r.bottom) / 2}, labelColor);
-            const float textLeft = r.left + 31;
-            const float textRight = plus.left - 4;
-            // The tab above is called "Проекты" already: here it is the way they are ordered, and "+".
-            Text(L"Порядок", ui_.get(), D2D1::RectF(textLeft, r.top, textRight, r.bottom), labelColor);
-            const std::wstring mode = std::wstring(L" · ") + ProjectOrderWord();
-            const float nameWidth = TextWidth(L"Порядок", ui_.get());
-            const float modeWidth = TextWidth(mode, ui_.get());
-            if (nameWidth + modeWidth <= textRight - textLeft) {
-                Text(mode, ui_.get(), D2D1::RectF(textLeft + nameWidth, r.top, textLeft + nameWidth + modeWidth + 4, r.bottom),
-                     labelColor);
-            }
-            const bool active = hover_.target == Target::AddProject;
-            if (active) {
-                Fill(plus, 6.f, kRaised);
-            }
-            const uint32_t color = active ? kPrimary : kSecondary;
-            const D2D1_POINT_2F c{(plus.left + plus.right) / 2, (plus.top + plus.bottom) / 2};
-            Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
-            Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
-            continue;
-        }
         const Project& project = projects_[rows_[row].project];
         const bool hovered = (hover_.target == Target::HistoryRow || hover_.target == Target::ProjectRow ||
                               hover_.target == Target::ProjectNew || hover_.target == Target::ChatMore) &&
@@ -8000,9 +7974,6 @@ bool ChatWindow::ListHeld() const {
 }
 
 std::wstring ChatWindow::RowKey(size_t row) const {
-    if (rows_[row].session == kLabel) {
-        return L"|label";
-    }
     const Project& project = projects_[rows_[row].project];
     std::wstring key = project.folder + L'|';
     if (rows_[row].session == kHead || rows_[row].session == kDraft) {
@@ -9697,7 +9668,9 @@ std::wstring ChatWindow::TooltipText() {
     case Target::SearchClear:
         return L"Сбросить поиск (Esc)";
     case Target::SideTab:
-        return hover_.row == 1 ? L"Проекты: папки и репозитории, у каждого свои чаты" : L"Общие чаты: не из проекта";
+        return hover_.row == 1 ? std::wstring(L"Проекты: папки и репозитории, у каждого свои чаты. Правый клик — порядок: ") +
+                                     ProjectOrderWord()
+                               : std::wstring(L"Общие чаты: не из проекта");
     case Target::ProjectRow:
         return RowProject(hover_.row) != nullptr ? RowProject(hover_.row)->folder : std::wstring();
     case Target::ProjectNew:
@@ -9706,8 +9679,6 @@ std::wstring ChatWindow::TooltipText() {
         }
         return RowProject(hover_.row) != nullptr ? L"Новый чат в проекте «" + RowProject(hover_.row)->name + L"»"
                                                  : std::wstring();
-    case Target::ProjectsLabel:
-        return std::wstring(L"Порядок: ") + ProjectOrderWord() + L". Нажать, чтобы сменить";
     case Target::AddProject:
         return L"Добавить проект: папку на этом компьютере или репозиторий GitHub";
     case Target::NewChat:
@@ -9982,8 +9953,6 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return SearchClearRect(g);
     case Target::AddProject:
         return g.addProject;
-    case Target::ProjectsLabel:
-        return g.projectsLabel;
     case Target::NewChat:
         return g.newItem;
     default:
@@ -10306,8 +10275,7 @@ void ChatWindow::ClosePopup() {
 void ChatWindow::FilterSessions(bool pickFirst) {
     const std::wstring query = Lowercase(searchText_);
     rows_.clear();
-    labelRow_ = SIZE_MAX;
-    // The general chats first, with the top "new chat" they belong to; then the "projects" label and the projects.
+    // The general chats first, with the top "new chat" they belong to; then the projects.
     std::vector<size_t> order;
     for (size_t p = 0; p < projects_.size(); ++p) {
         if (projects_[p].folder == DefaultWorkspace()) {
@@ -10316,8 +10284,6 @@ void ChatWindow::FilterSessions(bool pickFirst) {
             order.push_back(p);
         }
     }
-    const size_t generalIndex = order.empty() ? 0 : order.front();
-    bool labelled = false;
     const bool searching = !query.empty();
     for (const size_t p : order) {
         const Project& project = projects_[p];
@@ -10334,11 +10300,6 @@ void ChatWindow::FilterSessions(bool pickFirst) {
         }
         if (!query.empty() && !named && chats.empty()) {
             continue;
-        }
-        if (!labelled && project.folder != DefaultWorkspace()) {
-            labelled = true;
-            labelRow_ = rows_.size();
-            rows_.push_back({generalIndex, kLabel});
         }
         // A project's head; the general chats' is their tab's "new chat" (a search has none: it is no place for it).
         if (!(general && searching)) {
@@ -10358,10 +10319,6 @@ void ChatWindow::FilterSessions(bool pickFirst) {
                 rows_.push_back({p, i});
             }
         }
-    }
-    if (!labelled && query.empty() && projectsTab_) {  // no project yet: the label is still the way to add one
-        labelRow_ = rows_.size();
-        rows_.push_back({generalIndex, kLabel});
     }
     if (pickFirst) {
         firstRow_ = 0;
@@ -10413,8 +10370,8 @@ void ChatWindow::ShowSideRow(size_t row) {
 }
 
 bool ChatWindow::RowSelectable(size_t row) const {
-    if (row >= rows_.size() || rows_[row].session == kDraft || rows_[row].session == kLabel) {
-        return false;  // the new chat is the one already open; the label is no place to stand
+    if (row >= rows_.size() || rows_[row].session == kDraft) {
+        return false;  // the new chat is the one already open
     }
     return !(rows_[row].session == kHead && projects_[rows_[row].project].folder == DefaultWorkspace());
 }
@@ -10578,7 +10535,7 @@ void ChatWindow::ShowProjectOrderMenu() {
     AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Added), kAdded,
                 L"Как добавлены	правый клик — выше и ниже");
     const Geometry g = Layout();
-    POINT screen{ToPx(g.projectsLabel.left), ToPx(g.projectsLabel.bottom)};
+    POINT screen{ToPx(g.sideTabs[1].left), ToPx(g.sideTabs[1].bottom + 2.f)};
     ClientToScreen(hwnd_, &screen);
     switch (Menu(menu.get(), screen)) {
     case kRecent:

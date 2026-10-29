@@ -1079,12 +1079,14 @@ private:
     };
     static constexpr size_t kHead = SIZE_MAX;
     static constexpr size_t kDraft = SIZE_MAX - 1;
+    static constexpr size_t kLabel = SIZE_MAX - 2;
     struct SideRow {  // one row of the list: a project's head, or one of its chats
         size_t project = 0;
         // An index into its sessions; kHead: the project's own row; kDraft: the open chat, not saved yet (a new
-        // one): it shows which project it is in.
+        // one): it shows which project it is in; kLabel: the "projects" label between the general chats and them.
         size_t session = kHead;
     };
+    size_t labelRow_ = SIZE_MAX;  // where the label is in rows_ (none while nothing is built)
     void RebuildRows();  // the rows again (the open chat changed), where the list was scrolled
     void ListChanged();  // in the background: the list again now, or once the pointer lets it go
     bool ListHeld() const;
@@ -3103,13 +3105,18 @@ Geometry ChatWindow::Layout() const {
         // The account's row with the secrets' padlock at its right end, as Claude's app keeps its small button there.
         g.secrets = D2D1::RectF(sidebarWidth - 6 - 34, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
         g.account = D2D1::RectF(6, g.secrets.top, g.secrets.left - 2, g.secrets.bottom);
-        g.addProject = D2D1::RectF(sidebarWidth - 10 - 24, g.newItem.bottom + 7, sidebarWidth - 10, g.newItem.bottom + 31);
-        g.projectsLabel = D2D1::RectF(6, g.newItem.bottom + 4, g.addProject.left - 4, g.newItem.bottom + 32);
-        g.listTop = g.newItem.bottom + 8 + 26;  // under the "projects" label
+        g.listTop = g.newItem.bottom + 6;  // the general chats come first, the "projects" label is a row after them
         g.listBottom = g.account.top - 10;
         if (update_) {
             g.update = D2D1::RectF(10, g.account.top - 10 - 34, sidebarWidth - 10, g.account.top - 10);
             g.listBottom = g.update.top - 8;
+        }
+        // The label and its "+" are where their row is, while it is in view.
+        if (labelRow_ < rows_.size()) {
+            if (const D2D1_RECT_F row = SideRowRect(g, labelRow_); row.right > row.left) {
+                g.addProject = ProjectNewRect(row);
+                g.projectsLabel = D2D1::RectF(row.left, row.top + 2.f, g.addProject.left - 4, row.bottom - 2.f);
+            }
         }
     }
     if (termWidth > 0) {
@@ -3298,8 +3305,8 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (y >= g.listTop && y < g.listBottom) {
             const auto row = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
             if (row < rows_.size() && row < firstRow_ + SidebarRows(g)) {
-                if (rows_[row].session == kDraft) {
-                    return {};  // the chat that is open already
+                if (rows_[row].session == kDraft || rows_[row].session == kLabel) {
+                    return {};  // the chat that is open already; the label's own hits are tested above
                 }
                 if (rows_[row].session != kHead) {
                     return Inside(ChatMoreRect(row, SideRowRect(g, row)), x, y) ? Hit{Target::ChatMore, row}
@@ -6415,33 +6422,6 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Line({c.x, c.y + 2.f}, {c.x, c.y + 4.f}, color, 1.5f);
     }
 
-    {  // the projects' label (click: how they are ordered), and "+" for another one
-        const bool onLabel = hover_.target == Target::ProjectsLabel;
-        if (onLabel) {
-            Fill(g.projectsLabel, 6.f, kRaised);
-        }
-        const uint32_t labelColor = onLabel ? kPrimary : kSecondary;
-        const float textLeft = g.sidebar.left + 16;
-        const float textTop = g.newItem.bottom + 8;
-        const float textBottom = textTop + 22;
-        const float textRight = g.addProject.left - 4;
-        Text(L"Проекты", ui_.get(), D2D1::RectF(textLeft, textTop, textRight, textBottom), labelColor);
-        const std::wstring mode = std::wstring(L" · ") + ProjectOrderWord();
-        const float nameWidth = TextWidth(L"Проекты", ui_.get());
-        const float modeWidth = TextWidth(mode, ui_.get());
-        if (nameWidth + modeWidth <= textRight - textLeft) {
-            Text(mode, ui_.get(),
-                 D2D1::RectF(textLeft + nameWidth, textTop, textLeft + nameWidth + modeWidth + 4, textBottom), labelColor);
-        }
-        const bool active = hover_.target == Target::AddProject;
-        if (active) {
-            Fill(g.addProject, 6.f, kRaised);
-        }
-        const uint32_t color = active ? kPrimary : kSecondary;
-        const D2D1_POINT_2F c{(g.addProject.left + g.addProject.right) / 2, (g.addProject.top + g.addProject.bottom) / 2};
-        Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
-        Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
-    }
     if (rows_.empty()) {
         Text(L"Ничего не найдено", ui_.get(),
              D2D1::RectF(g.sidebar.left + 16, g.listTop, g.sidebar.right - 10, g.listTop + kHistoryRow), kSecondary);
@@ -6463,6 +6443,35 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         }
         // The lit rows keep a gap between them, so the open chat and a hovered head do not run into one.
         const auto lit = [](const D2D1_RECT_F& rect) { return D2D1::RectF(rect.left, rect.top + 2.f, rect.right, rect.bottom - 2.f); };
+        if (rows_[row].session == kLabel) {
+            // The projects' label (click: how they are ordered), and "+" for another one.
+            const D2D1_RECT_F plus = ProjectNewRect(r);
+            const D2D1_RECT_F label = D2D1::RectF(r.left, r.top + 2.f, plus.left - 4, r.bottom - 2.f);
+            const bool onLabel = hover_.target == Target::ProjectsLabel;
+            if (onLabel) {
+                Fill(label, 6.f, kRaised);
+            }
+            const uint32_t labelColor = onLabel ? kPrimary : kSecondary;
+            const float textLeft = r.left + 10;
+            const float textRight = plus.left - 4;
+            Text(L"Проекты", ui_.get(), D2D1::RectF(textLeft, r.top, textRight, r.bottom), labelColor);
+            const std::wstring mode = std::wstring(L" · ") + ProjectOrderWord();
+            const float nameWidth = TextWidth(L"Проекты", ui_.get());
+            const float modeWidth = TextWidth(mode, ui_.get());
+            if (nameWidth + modeWidth <= textRight - textLeft) {
+                Text(mode, ui_.get(), D2D1::RectF(textLeft + nameWidth, r.top, textLeft + nameWidth + modeWidth + 4, r.bottom),
+                     labelColor);
+            }
+            const bool active = hover_.target == Target::AddProject;
+            if (active) {
+                Fill(plus, 6.f, kRaised);
+            }
+            const uint32_t color = active ? kPrimary : kSecondary;
+            const D2D1_POINT_2F c{(plus.left + plus.right) / 2, (plus.top + plus.bottom) / 2};
+            Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
+            Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
+            continue;
+        }
         const Project& project = projects_[rows_[row].project];
         const bool hovered = (hover_.target == Target::HistoryRow || hover_.target == Target::ProjectRow ||
                               hover_.target == Target::ProjectNew || hover_.target == Target::ChatMore) &&
@@ -6533,8 +6542,9 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         const D2D1_RECT_F chat = D2D1::RectF(r.left + indent, r.top, r.right, r.bottom);
         if (rows_[row].session == kDraft) {  // the new chat that is open: lit, in its project
             Fill(lit(chat), 8.f, kRaised);
+            Fill(D2D1::RectF(chat.left + 2.f, chat.top + 9.f, chat.left + 5.f, chat.bottom - 9.f), 1.5f, kAccent);
             agent(chat, GrokSelected(), std::nullopt, kRaised);
-            Text(L"Новый чат", ui_.get(), D2D1::RectF(chat.left + 24, chat.top, chat.right - 8, chat.bottom), kAccent);
+            Text(L"Новый чат", ui_.get(), D2D1::RectF(chat.left + 24, chat.top, chat.right - 8, chat.bottom), kPrimary);
             continue;
         }
         const SessionInfo& session = project.sessions[rows_[row].session];
@@ -6554,11 +6564,16 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             }
             continue;
         }
-        const bool raised = hovered || (searchFocus_ && row == selected_);
+        const bool current = IsOpenChat(project.folder, session);
+        // The open chat stands out: a lit ground and a bar of the accent, its title the brightest; the others are
+        // quieter, so the eye finds it at once (and brighten under the pointer).
+        const bool raised = current || hovered || (searchFocus_ && row == selected_);
         if (raised) {
             Fill(lit(chat), 8.f, kRaised);
         }
-        const bool current = IsOpenChat(project.folder, session);
+        if (current) {
+            Fill(D2D1::RectF(chat.left + 2.f, chat.top + 9.f, chat.left + 5.f, chat.bottom - 9.f), 1.5f, kAccent);
+        }
         const Parked* parked = ParkedChat(project.folder, session);
         const bool grok = session.parts.empty() ? session.grok : session.parts.back().grok;
         const bool both = std::ranges::any_of(session.parts, [&](const SessionPart& part) { return part.grok != grok; });
@@ -6608,7 +6623,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                                  brush_.get());
         }
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
-             D2D1::RectF(chat.left + 24, chat.top, titleRight, chat.bottom), current ? kAccent : kPrimary);
+             D2D1::RectF(chat.left + 24, chat.top, titleRight, chat.bottom),
+             current || raised ? kPrimary : Mix(kSecondary, kPrimary, 0.3f));
     }
     if (sliding) {
         target_->PopAxisAlignedClip();
@@ -7134,6 +7150,9 @@ bool ChatWindow::ListHeld() const {
 }
 
 std::wstring ChatWindow::RowKey(size_t row) const {
+    if (rows_[row].session == kLabel) {
+        return L"|label";
+    }
     const Project& project = projects_[rows_[row].project];
     std::wstring key = project.folder + L'|';
     if (rows_[row].session == kHead || rows_[row].session == kDraft) {
@@ -9407,7 +9426,19 @@ void ChatWindow::ClosePopup() {
 void ChatWindow::FilterSessions(bool pickFirst) {
     const std::wstring query = Lowercase(searchText_);
     rows_.clear();
+    labelRow_ = SIZE_MAX;
+    // The general chats first, with the top "new chat" they belong to; then the "projects" label and the projects.
+    std::vector<size_t> order;
     for (size_t p = 0; p < projects_.size(); ++p) {
+        if (projects_[p].folder == DefaultWorkspace()) {
+            order.insert(order.begin(), p);
+        } else {
+            order.push_back(p);
+        }
+    }
+    const size_t generalIndex = order.empty() ? 0 : order.front();
+    bool labelled = false;
+    for (const size_t p : order) {
         const Project& project = projects_[p];
         const bool named = !query.empty() && Lowercase(project.name).find(query) != std::wstring::npos;
         std::vector<size_t> chats;
@@ -9418,6 +9449,11 @@ void ChatWindow::FilterSessions(bool pickFirst) {
         }
         if (!query.empty() && !named && chats.empty()) {
             continue;
+        }
+        if (!labelled && project.folder != DefaultWorkspace()) {
+            labelled = true;
+            labelRow_ = rows_.size();
+            rows_.push_back({generalIndex, kLabel});
         }
         rows_.push_back({p, kHead});  // the general chats': their section's label, it folds too
         const bool folded = query.empty() && ProjectFolded(project.folder);
@@ -9433,6 +9469,10 @@ void ChatWindow::FilterSessions(bool pickFirst) {
                 rows_.push_back({p, i});
             }
         }
+    }
+    if (!labelled && query.empty()) {  // no project yet: the label is still the way to add one
+        labelRow_ = rows_.size();
+        rows_.push_back({generalIndex, kLabel});
     }
     if (pickFirst) {
         firstRow_ = 0;
@@ -9484,8 +9524,8 @@ void ChatWindow::ShowSideRow(size_t row) {
 }
 
 bool ChatWindow::RowSelectable(size_t row) const {
-    if (row >= rows_.size() || rows_[row].session == kDraft) {
-        return false;  // the new chat is the one already open
+    if (row >= rows_.size() || rows_[row].session == kDraft || rows_[row].session == kLabel) {
+        return false;  // the new chat is the one already open; the label is no place to stand
     }
     return !(rows_[row].session == kHead && projects_[rows_[row].project].folder == DefaultWorkspace());
 }

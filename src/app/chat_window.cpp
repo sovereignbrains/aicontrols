@@ -1159,6 +1159,7 @@ private:
     void Check(D2D1_POINT_2F center, uint32_t color);
     void AgentIcon(D2D1_POINT_2F center, float radius, bool grok, uint32_t ground);
     void ProjectIcon(D2D1_POINT_2F center, bool general, uint32_t color);
+    void GithubIcon(D2D1_POINT_2F center, uint32_t color);
     static float ItemWidth(const FeedItem& item, float column);
     void MeasureFeed(float column, float view);
     void MeasureRest();
@@ -3657,7 +3658,7 @@ void ChatWindow::AgentIcon(D2D1_POINT_2F c, float r, bool grok, uint32_t ground)
     Line({c.x - r * 0.95f, c.y + r * 0.95f}, {c.x + r * 1.0f, c.y - r * 1.0f}, kGrokDot, r * 0.26f);
 }
 
-// A project's mark, GitHub's repository book; the general chats' is a speech bubble.
+// A project's mark, a folder; the general chats' is a speech bubble.
 void ChatWindow::ProjectIcon(D2D1_POINT_2F c, bool general, uint32_t color) {
     brush_->SetColor(Color(color));
     if (general) {
@@ -3667,6 +3668,17 @@ void ChatWindow::ProjectIcon(D2D1_POINT_2F c, bool general, uint32_t color) {
         Line({c.x - 4.5f, c.y + 7.f}, {c.x + 0.5f, c.y + 4.f}, color, 1.5f);
         return;
     }
+    // A folder: a body with a tab on its top left.
+    const D2D1_RECT_F body = D2D1::RectF(c.x - 7.f, c.y - 4.f, c.x + 7.f, c.y + 6.f);
+    target_->DrawRoundedRectangle(D2D1::RoundedRect(body, 2.f, 2.f), brush_.get(), 1.5f, round_.get());
+    Line({c.x - 7.f, c.y - 4.f}, {c.x - 7.f, c.y - 6.f}, color, 1.5f);
+    Line({c.x - 7.f, c.y - 6.f}, {c.x - 2.5f, c.y - 6.f}, color, 1.5f);
+    Line({c.x - 2.5f, c.y - 6.f}, {c.x - 0.5f, c.y - 4.f}, color, 1.5f);
+}
+
+// GitHub's mark, before the projects' label: the projects come from there as well as from folders.
+void ChatWindow::GithubIcon(D2D1_POINT_2F c, uint32_t color) {
+    brush_->SetColor(Color(color));
     if (!githubMark_) {
         githubMark_ = GithubMark(d2d_.get());
     }
@@ -6602,7 +6614,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 Fill(label, 6.f, kRaised);
             }
             const uint32_t labelColor = onLabel ? kPrimary : kSecondary;
-            const float textLeft = r.left + 10;
+            GithubIcon({r.left + 17.f, (r.top + r.bottom) / 2}, labelColor);
+            const float textLeft = r.left + 31;
             const float textRight = plus.left - 4;
             Text(L"Проекты", ui_.get(), D2D1::RectF(textLeft, r.top, textRight, r.bottom), labelColor);
             const std::wstring mode = std::wstring(L" · ") + ProjectOrderWord();

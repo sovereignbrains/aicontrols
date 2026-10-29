@@ -157,6 +157,14 @@ constexpr UINT kUndoTime = 8000;       // ms
 constexpr UINT_PTR kGlideTimer = 14;
 constexpr UINT kGlideFrame = 10;       // ms; a step goes by the time that passed, not by the tick
 constexpr float kGlideTau = 36.f;      // ms: in this much the gap closes to about a third
+// The feed out of sight is laid out at a new width when frames stop coming this long, a spell of it at a time.
+constexpr UINT_PTR kMeasureTimer = 15;
+constexpr UINT kMeasureWait = 30;      // ms
+constexpr std::chrono::milliseconds kMeasureSpell{5};
+// An edge between panels lights up only when the pointer stays on it, or when it is taken: passing by on the way to
+// the list's scroll bar beside it, it lit and went out like a second bar (29.10.2026, his: 'какк будто 2 скрола').
+constexpr UINT_PTR kEdgeTimer = 16;
+constexpr UINT kEdgeDelay = 300;       // ms
 constexpr UINT kPanFrame = 16;           // ms
 constexpr float kPanStill = 10.f;
 constexpr ULONGLONG kPanHold = 300;      // ms
@@ -1146,7 +1154,12 @@ private:
     void Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha = 1.f);
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width = 1.6f);
     void Check(D2D1_POINT_2F center, uint32_t color);
-    void MeasureFeed(float column);
+    static float ItemWidth(const FeedItem& item, float column);
+    void MeasureFeed(float column, float view);
+    void MeasureRest();
+    void MeasureItem(FeedItem& item, float column);
+    std::pair<size_t, float> TopOfView() const;
+    void BackToView(std::pair<size_t, float> top);
     float FeedHeight() const;
     std::wstring StatusLine() const;
     void ScrollBy(float delta);
@@ -1462,6 +1475,7 @@ private:
     std::wstring tipText_;      // the hint for what is under the pointer ("" for nothing)
     HWND tip_ = nullptr;        // ... shown in a window of its own, made when first needed
     bool tipShown_ = false;
+    bool edgeLit_ = false;  // the edge under the pointer has been there kEdgeDelay, or was taken
     D2D1_POINT_2F tipAt_{};     // where the pointer was when it appeared
     Rename renaming_ = Rename::None;
     WPARAM renameTab_ = 0;      // the tab's id
@@ -2008,11 +2022,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             trackingMouse_ = TrackMouseEvent(&track) != FALSE;
         }
         const D2D1_POINT_2F at = CursorDip(lParam);
-        const bool overSplit = hover_.target == Target::SplitSidebar || hover_.target == Target::SplitTerminal;
         mouse_ = at;
-        if (overSplit) {
-            Refresh();  // the lit stretch of the edge follows the pointer
-        }
         if (pan_ != Scroller::None) {  // the middle button's scrolling: its frames move the list
             return 0;
         }
@@ -2064,6 +2074,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (const Hit hit = HitTest(at.x, at.y); !(hit == hover_)) {
             hover_ = hit;
+            edgeLit_ = false;
+            KillTimer(hwnd_, kEdgeTimer);
+            if (hit.target == Target::SplitSidebar || hit.target == Target::SplitTerminal) {
+                SetTimer(hwnd_, kEdgeTimer, kEdgeDelay, nullptr);
+            }
             if (hit.target == Target::HistoryRow || hit.target == Target::ChatMore) {
                 selected_ = hit.row;
             } else if (hit.target == Target::ModelRow) {
@@ -2120,6 +2135,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (const Target target = HitTest(at.x, at.y).target;
             popup_ == Popup::None && (target == Target::SplitSidebar || target == Target::SplitTerminal)) {
             dragging_ = target;
+            edgeLit_ = true;  // and it stays lit under the pointer once let go
+            KillTimer(hwnd_, kEdgeTimer);
             SetCapture(hwnd_);
             return 0;
         }
@@ -2446,6 +2463,12 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             Refresh();
         } else if (wParam == kGlideTimer) {
             GlideStep();
+        } else if (wParam == kMeasureTimer) {
+            MeasureRest();
+        } else if (wParam == kEdgeTimer) {
+            KillTimer(hwnd_, kEdgeTimer);
+            edgeLit_ = true;
+            Refresh();
         } else if (wParam == kSlideTimer) {
             if (std::chrono::steady_clock::now() - slideStart_ >= std::chrono::milliseconds(static_cast<int>(kSlideTime))) {
                 KillTimer(hwnd_, kSlideTimer);
@@ -3462,6 +3485,7 @@ void ChatWindow::PlaceChildren() {
     }
     MoveChild(input_, Layout().text);
     SendMessageW(input_, EM_REQUESTRESIZE, 0, 0);
+    UpdateWindow(input_);  // drawn in its new place now, with the window's frame, not one later (it ghosted)
     PlaceSecretFields();
     SyncTerminalSize();
     PlacePreview();
@@ -3505,73 +3529,168 @@ void ChatWindow::Check(D2D1_POINT_2F c, uint32_t color) {
     Line({c.x - 1.5f, c.y + 3.5f}, {c.x + 5.f, c.y - 3.5f}, color, 1.6f);
 }
 
-void ChatWindow::MeasureFeed(float column) {
+float ChatWindow::ItemWidth(const FeedItem& item, float column) {
+    if (item.kind == Kind::Approval) {
+        return column - 2 * kCardPad;
+    }
+    return item.kind == Kind::User ? column * 0.85f - 2 * kBubblePad : column;
+}
+
+// A new width lays out anew only what is in sight; the rest keeps its old height until a pause (MeasureRest)
+// (29.10.2026, his: 'подвердилось ощущения что фпс 10 когда эту хуйню захватываю за грань', 'чем меньше окно тем
+// хуевее ощущается': a long chat was laid out whole at every step of an edge, 85 ms a frame). Meanwhile the feed
+// keeps to the item at its top, so heights that change above it do not move what is read.
+void ChatWindow::MeasureFeed(float column, float view) {
+    const auto stale = [&](const FeedItem& item) { return item.layout && item.layoutWidth != ItemWidth(item, column); };
+    bool any = false;
     for (FeedItem& item : feed_) {
-        float width = item.kind == Kind::User ? column * 0.85f - 2 * kBubblePad : column;
-        if (item.kind == Kind::Approval) {
-            width = column - 2 * kCardPad;
-        }
-        if (item.layout && item.layoutWidth == width) {
-            if (item.kind == Kind::Approval) {
-                item.height = ApprovalHeight(item);  // the buttons go once it is decided
-            } else if (item.kind == Kind::User) {
-                // The same: the column may have changed.
-                const float pictures = LayoutImages(item, D2D1::RectF(column * 0.15f, 0, column, 0), true);
-                item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
-                item.height = item.bubbleTop + (item.text.empty() ? 0.f : item.layoutHeight + 2 * kBubblePad);
-            }
-            continue;
-        }
-        IDWriteTextFormat* format = item.kind == Kind::Notice ? (item.leading ? noticeLeading_.get() : notice_.get())
-                                                              : body_.get();
-        if (item.kind == Kind::Approval) {
-            format = mono_.get();
-        }
-        item.layout.reset();
-        std::wstring shown;  // an assistant message without its markup
-        const std::wstring* source = &item.text;
-        if (item.kind == Kind::Assistant) {
-            // Tables wrap inside their cells to the column; one character short, so rounding never wraps a line.
-            const float advance = cellW_ * kCodeSize / 12.5f;
-            const size_t tableChars = static_cast<size_t>(std::max(width / advance - 1.f, 1.f));
-            MdText md = ParseMarkdown(item.text, tableChars);
-            shown = std::move(md.text);
-            item.spans = std::move(md.spans);
-            source = &shown;
-        } else if (item.kind == Kind::Approval && !item.output.empty()) {
-            shown = item.text + L"\n\n";
-            item.outputStart = shown.size();
-            shown += OutputPreview(item.output);
-            source = &shown;
-        }
-        if (FAILED(dwrite_->CreateTextLayout(source->c_str(), static_cast<UINT32>(source->size()), format,
-                                             std::max(width, 1.f), 1e6f, item.layout.put()))) {
-            item.height = 0;
-            continue;
-        }
-        if (item.kind == Kind::Assistant) {
-            StyleMarkdown(item);
-        }
-        item.shown = *source;
-        item.layoutWidth = width;
-        DWRITE_TEXT_METRICS metrics{};
-        item.layout->GetMetrics(&metrics);
-        item.textWidth = metrics.widthIncludingTrailingWhitespace;
-        item.layoutHeight = metrics.height;
-        if (item.kind == Kind::Approval) {  // a picture Grok made, under the text
-            LayoutImages(item, D2D1::RectF(kCardPad, kCardPad + kCardTitle + 4.f + metrics.height + kCardPad, column - kCardPad, 0),
-                         false);
-        }
-        item.height = item.kind == Kind::Approval ? ApprovalHeight(item) : metrics.height;
-        if (item.kind == Kind::Assistant) {
-            item.whoHeight = item.who.empty() ? 0.f : kWhoRow;
-            item.height += item.whoHeight;
-        }
-        if (item.kind == Kind::User) {  // the pictures, then the bubble (none for pictures alone)
+        if (!item.layout) {
+            MeasureItem(item, column);
+        } else if (stale(item)) {
+            any = true;
+        } else if (item.kind == Kind::Approval) {
+            item.height = ApprovalHeight(item);  // the buttons go once it is decided
+        } else if (item.kind == Kind::User) {
+            // The same: the column may have changed.
             const float pictures = LayoutImages(item, D2D1::RectF(column * 0.15f, 0, column, 0), true);
             item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
-            item.height = item.bubbleTop + (item.text.empty() ? 0.f : metrics.height + 2 * kBubblePad);
+            item.height = item.bubbleTop + (item.text.empty() ? 0.f : item.layoutHeight + 2 * kBubblePad);
         }
+    }
+    if (!any) {
+        return;
+    }
+    // What is in sight and a screen's worth round it, so the wheel mostly comes to items laid out already.
+    const auto top = TopOfView();
+    if (stick_) {
+        float above = 0;
+        for (size_t i = feed_.size(); i-- > 0 && above < 2 * view;) {
+            if (stale(feed_[i])) {
+                MeasureItem(feed_[i], column);
+            }
+            above += feed_[i].height + kGap;
+        }
+    } else if (top.first < feed_.size()) {
+        float below = 0;
+        for (size_t i = top.first; i < feed_.size() && below < 2 * view; ++i) {
+            if (stale(feed_[i])) {
+                MeasureItem(feed_[i], column);
+            }
+            below += feed_[i].height * (i == top.first ? 1.f - top.second : 1.f) + kGap;
+        }
+        float above = 0;
+        for (size_t i = top.first; i-- > 0 && above < view;) {
+            if (stale(feed_[i])) {
+                MeasureItem(feed_[i], column);
+            }
+            above += feed_[i].height + kGap;
+        }
+    }
+    BackToView(top);
+    if (std::ranges::any_of(feed_, stale)) {
+        SetTimer(hwnd_, kMeasureTimer, kMeasureWait, nullptr);  // each frame puts the pause off again
+    }
+}
+
+// In a pause: the rest of the feed at the new width, a few milliseconds at a time, the latest first.
+void ChatWindow::MeasureRest() {
+    KillTimer(hwnd_, kMeasureTimer);
+    const float column = Layout().column;
+    const auto top = TopOfView();
+    const auto start = std::chrono::steady_clock::now();
+    for (size_t i = feed_.size(); i-- > 0;) {
+        FeedItem& item = feed_[i];
+        if (item.layout && item.layoutWidth != ItemWidth(item, column)) {
+            MeasureItem(item, column);
+            if (std::chrono::steady_clock::now() - start > kMeasureSpell) {
+                break;
+            }
+        }
+    }
+    BackToView(top);
+    Refresh();  // its frame sets the timer again for what is left
+}
+
+// The item at the top of the view, and how far into it as a share of its height.
+std::pair<size_t, float> ChatWindow::TopOfView() const {
+    float y = kGap;
+    for (size_t i = 0; i < feed_.size(); ++i) {
+        const float height = feed_[i].height;
+        if (y + height + kGap > scroll_) {
+            return {i, height > 0 ? std::clamp((scroll_ - y) / height, 0.f, 1.f) : 0.f};
+        }
+        y += height + kGap;
+    }
+    return {feed_.size(), 0.f};
+}
+
+// The feed put back to the same place in that item, whatever changed above it. Following the end, it finds the end.
+void ChatWindow::BackToView(std::pair<size_t, float> top) {
+    if (stick_ || top.first >= feed_.size()) {
+        return;
+    }
+    float y = kGap;
+    for (size_t i = 0; i < top.first; ++i) {
+        y += feed_[i].height + kGap;
+    }
+    const float to = y + feed_[top.first].height * top.second;
+    if (glide_ && std::isfinite(*glide_)) {
+        *glide_ += to - scroll_;  // a glide under way goes on to the same text
+    }
+    scroll_ = to;
+}
+
+void ChatWindow::MeasureItem(FeedItem& item, float column) {
+    const float width = ItemWidth(item, column);
+    IDWriteTextFormat* format = item.kind == Kind::Notice ? (item.leading ? noticeLeading_.get() : notice_.get())
+                                                          : body_.get();
+    if (item.kind == Kind::Approval) {
+        format = mono_.get();
+    }
+    item.layout.reset();
+    std::wstring shown;  // an assistant message without its markup
+    const std::wstring* source = &item.text;
+    if (item.kind == Kind::Assistant) {
+        // Tables wrap inside their cells to the column; one character short, so rounding never wraps a line.
+        const float advance = cellW_ * kCodeSize / 12.5f;
+        const size_t tableChars = static_cast<size_t>(std::max(width / advance - 1.f, 1.f));
+        MdText md = ParseMarkdown(item.text, tableChars);
+        shown = std::move(md.text);
+        item.spans = std::move(md.spans);
+        source = &shown;
+    } else if (item.kind == Kind::Approval && !item.output.empty()) {
+        shown = item.text + L"\n\n";
+        item.outputStart = shown.size();
+        shown += OutputPreview(item.output);
+        source = &shown;
+    }
+    if (FAILED(dwrite_->CreateTextLayout(source->c_str(), static_cast<UINT32>(source->size()), format,
+                                         std::max(width, 1.f), 1e6f, item.layout.put()))) {
+        item.height = 0;
+        return;
+    }
+    if (item.kind == Kind::Assistant) {
+        StyleMarkdown(item);
+    }
+    item.shown = *source;
+    item.layoutWidth = width;
+    DWRITE_TEXT_METRICS metrics{};
+    item.layout->GetMetrics(&metrics);
+    item.textWidth = metrics.widthIncludingTrailingWhitespace;
+    item.layoutHeight = metrics.height;
+    if (item.kind == Kind::Approval) {  // a picture Grok made, under the text
+        LayoutImages(item, D2D1::RectF(kCardPad, kCardPad + kCardTitle + 4.f + metrics.height + kCardPad, column - kCardPad, 0),
+                     false);
+    }
+    item.height = item.kind == Kind::Approval ? ApprovalHeight(item) : metrics.height;
+    if (item.kind == Kind::Assistant) {
+        item.whoHeight = item.who.empty() ? 0.f : kWhoRow;
+        item.height += item.whoHeight;
+    }
+    if (item.kind == Kind::User) {  // the pictures, then the bubble (none for pictures alone)
+        const float pictures = LayoutImages(item, D2D1::RectF(column * 0.15f, 0, column, 0), true);
+        item.bubbleTop = pictures > 0 && !item.text.empty() ? pictures + kImageGap : pictures;
+        item.height = item.bubbleTop + (item.text.empty() ? 0.f : metrics.height + 2 * kBubblePad);
     }
 }
 
@@ -3672,13 +3791,10 @@ void ChatWindow::Paint() {
     PaintSidebar(g);
     PaintTerminal(g);
     for (const Target split : {Target::SplitSidebar, Target::SplitTerminal}) {  // the edge lights up to be dragged
-        if (hover_.target == split || dragging_ == split) {
+        if ((hover_.target == split && edgeLit_) || dragging_ == split) {
             const float x = split == Target::SplitSidebar ? g.areaLeft : g.area;
-            // Only a stretch around the pointer, not the whole height: it says "here" without a line across the window.
-            constexpr float kHalf = 40.f;
-            const float top = std::clamp(mouse_.y - kHalf, kHeader, g.height);
-            const float bottom = std::clamp(mouse_.y + kHalf, kHeader, g.height);
-            Fill(D2D1::RectF(x - 1.f, top, x + 1.f, bottom), 1.f, kAccent);
+            // All of it: a stretch round the pointer looked like a scroll bar's thumb next to the list's own.
+            Fill(D2D1::RectF(x - 1.f, kHeader, x + 1.f, g.height), 0.f, kAccent);
         }
     }
     if (pan_ != Scroller::None) {  // where the middle button went down: the farther from it, the faster
@@ -3721,7 +3837,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
         Text(hello, greeting_.get(), D2D1::RectF(left, middle - 40, left + g.column, middle), kPrimary);
     }
 
-    MeasureFeed(g.column);
+    MeasureFeed(g.column, g.feed.bottom - g.feed.top);
     maxScroll_ = std::max(0.f, FeedHeight() - (g.feed.bottom - g.feed.top));
     if (stick_) {
         scroll_ = maxScroll_;
@@ -3732,6 +3848,10 @@ void ChatWindow::PaintFeed(const Geometry& g) {
     float y = g.feed.top + kGap - scroll_;
     for (FeedItem& item : feed_) {
         item.top = y;
+        if (item.layout && y + item.height >= g.feed.top && y <= g.feed.bottom
+            && item.layoutWidth != ItemWidth(item, g.column)) {
+            MeasureItem(item, g.column);  // came into sight before the pause got to it
+        }
         const bool visible = item.layout && y + item.height >= g.feed.top && y <= g.feed.bottom;
         if (visible && item.kind == Kind::Approval) {
             PaintApproval(g, item, left);

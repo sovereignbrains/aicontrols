@@ -613,6 +613,7 @@ struct Geometry {
     D2D1_RECT_F model{};
     D2D1_RECT_F effort{};  // empty when the model has no effort levels
     D2D1_RECT_F permission{};
+    D2D1_RECT_F project{};  // the chat's project, at the left of the chips' row under the box
     D2D1_RECT_F send{};
     D2D1_RECT_F popup{};   // the open panel
     // History.
@@ -3044,8 +3045,7 @@ Geometry ChatWindow::Layout() const {
     // sidebar is hidden; "save the memory" right after it, as it is about this chat and its project.
     g.titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
     const float titleMost = (updateInHeader ? g.update.left : g.terminalBtn.left) - 12 - kButton - 6;
-    const float titleWidth = TextWidth(folderName_ + L"  /  ", header_.get()) +
-                             TextWidth(title_.empty() ? L"Новый чат" : title_, header_.get()) + 2.f;
+    const float titleWidth = TextWidth(title_.empty() ? L"Новый чат" : title_, header_.get()) + 2.f;
     g.titleRight = std::max(g.titleLeft, std::min(g.titleLeft + titleWidth, titleMost));
     g.memory = D2D1::RectF(g.titleRight + 6, buttonTop, g.titleRight + 6 + kButton, buttonTop + kButton);
 
@@ -3091,6 +3091,7 @@ Geometry ChatWindow::Layout() const {
     g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
     const float permissionWidth = TextWidth(PermissionName(), ui_.get()) + 18;
     g.permission = D2D1::RectF(g.model.left - 2 - permissionWidth, chipTop, g.model.left - 2, chipBottom);
+    g.project = D2D1::RectF(left + 4, chipsTop, std::max(left + 4, g.permission.left - 8), chipsBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
         const float centerX = left + g.column / 2;
@@ -4193,12 +4194,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
     }
-    {  // the chat's project before its title: "aicontrols / Новый чат"
-        const std::wstring project = folderName_ + L"  /  ";
-        const float projectRight = std::min(titleLeft + TextWidth(project, header_.get()), titleRight);
-        Text(project, header_.get(), D2D1::RectF(titleLeft, 0, projectRight, kHeader), kSecondary);
-        Text(title, header_.get(), D2D1::RectF(projectRight, 0, titleRight, kHeader), kTitle);
-    }
+    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);  // its project is under the box
 
 
     {  // save the memory: an arrow up out of a tray (into the cloud); dimmed while it works
@@ -4339,6 +4335,13 @@ void ChatWindow::PaintInput(const Geometry& g) {
         const uint32_t color = active ? kPrimary : kSecondary;
         Line({c.x - 6.f, c.y}, {c.x + 6.f, c.y}, color, 1.6f);
         Line({c.x, c.y - 6.f}, {c.x, c.y + 6.f}, color, 1.6f);
+    }
+
+    if (g.project.right - g.project.left > 60.f) {  // the project the chat is in, where the row had room
+        ProjectIcon({g.project.left + 7.f, (g.project.top + g.project.bottom) / 2}, workspace_ == DefaultWorkspace(),
+                    kSecondary);
+        Text(folderName_, ui_.get(), D2D1::RectF(g.project.left + 20, g.project.top, g.project.right, g.project.bottom),
+             kSecondary);
     }
 
     // The model, then its effort in a box of its own, as in Claude's app.

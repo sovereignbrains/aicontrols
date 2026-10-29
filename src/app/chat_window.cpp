@@ -165,7 +165,7 @@ constexpr UINT kSlideFrame = 16;       // ms
 constexpr float kSlideTime = 220.f;    // ms
 // A chat deleted from the list keeps its row a while, "Вернуть" on it, instead of a question asked first.
 constexpr UINT_PTR kUndoTimer = 13;
-constexpr UINT kUndoTime = 8000;       // ms
+constexpr UINT kUndoTime = 5000;       // ms
 // The wheel over the feed glides, it does not jump: a notch moves where the feed is going, the feed eases there.
 constexpr UINT_PTR kGlideTimer = 14;
 constexpr UINT kGlideFrame = 10;       // ms; a step goes by the time that passed, not by the tick
@@ -1139,6 +1139,7 @@ private:
     // The switch at the sidebar's top, as Claude's app has one between its modes: the general chats as a flat list,
     // or the projects with theirs. It follows the open chat (SetWorkspace); a search looks through both.
     bool projectsTab_ = false;
+    std::wstring NewChatFolder() const;  // where the top "new chat" starts one: the tab's place
     void SetSideTab(bool projects);
     bool ParkedIn(bool projects) const;  // a chat answering aside, in the tab that is not shown: its dot on the tab
     void RebuildRows();  // the rows again (the open chat changed), where the list was scrolled
@@ -2554,6 +2555,9 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
         } else if (wParam == kUndoTimer) {
             FinishDelete();
+            if (doomed_ && doomed_->gone) {  // its row goes now, not when the pointer leaves the list
+                RefreshSessions();
+            }
             Refresh();
         } else if (wParam == kGlideTimer) {
             GlideStep();
@@ -2894,8 +2898,8 @@ void ChatWindow::OnClick(float x, float y) {
         SubmitSecret();
         keepFocus = true;
         break;
-    case Target::NewChat:  // as in Claude's app: the top one is the general chat's; a project's is its "+"
-        NewChatIn(DefaultWorkspace());
+    case Target::NewChat:  // in the tab's own place: the open project on the projects' tab, else the general chat
+        NewChatIn(NewChatFolder());
         break;
     case Target::Attach:
         PickFiles();
@@ -3052,7 +3056,11 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             return 1;
         }
         if (filter.wParam == 'N' && control) {  // the top "new chat"
-            NewChatIn(DefaultWorkspace());
+            NewChatIn(NewChatFolder());
+            return 1;
+        }
+        if (filter.wParam == 'B' && control) {  // the sidebar in and out
+            SetSidebarOpen(!sidebarOpen_);
             return 1;
         }
         if (filter.wParam == 'H' && control) {
@@ -3213,16 +3221,15 @@ Geometry ChatWindow::Layout() const {
         g.sideTabs[0] = D2D1::RectF(g.tabs.left + 4, g.tabs.top + 4, tabMiddle, g.tabs.bottom - 4);
         g.sideTabs[1] = D2D1::RectF(tabMiddle, g.tabs.top + 4, g.tabs.right - 4, g.tabs.bottom - 4);
         g.search = D2D1::RectF(10, g.tabs.bottom + 6, sidebarWidth - 10, g.tabs.bottom + 6 + kSearchHeight);
-        if (projectsTab_) {  // the way to another project, beside the search
-            g.addProject = D2D1::RectF(g.search.right - kSearchHeight, g.search.top, g.search.right, g.search.bottom);
-            g.search.right = g.addProject.left - 6;
-        }
-        g.newItem = D2D1::RectF(6, g.search.bottom + 2, sidebarWidth - 6, g.search.bottom + 2);  // none: the general head has the "+"
+        // The button before the search: a new chat; on the projects' tab, a new project (the other is not there).
+        const D2D1_RECT_F lead = D2D1::RectF(g.search.left, g.search.top, g.search.left + kSearchHeight, g.search.bottom);
+        (projectsTab_ ? g.addProject : g.newItem) = lead;
+        g.search.left = lead.right + 6;
         // At the bottom, the settings' end: the secrets over the account.
         // The account's row with the secrets' padlock at its right end, as Claude's app keeps its small button there.
         g.secrets = D2D1::RectF(sidebarWidth - 6 - 34, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
         g.account = D2D1::RectF(6, g.secrets.top, g.secrets.left - 2, g.secrets.bottom);
-        g.listTop = g.newItem.bottom + 4;
+        g.listTop = g.search.bottom + 6;
         g.listBottom = g.account.top - 10;
         if (update_) {
             g.update = D2D1::RectF(10, g.account.top - 10 - 34, sidebarWidth - 10, g.account.top - 10);
@@ -3423,9 +3430,6 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 if (rows_[row].session != kHead) {
                     return Inside(ChatMoreRect(row, SideRowRect(g, row)), x, y) ? Hit{Target::ChatMore, row}
                                                                                 : Hit{Target::HistoryRow, row};
-                }
-                if (projects_[rows_[row].project].folder == DefaultWorkspace()) {
-                    return {Target::ProjectNew, row};  // the chats tab's head is "new chat", all of it
                 }
                 return Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
                                                                           : Hit{Target::ProjectRow, row};
@@ -4568,14 +4572,16 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     }
     for (const Target button : {Target::SidebarToggle, Target::TerminalToggle}) {
         const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle : g.terminalBtn;
-        const bool active = hover_.target == button || (button == Target::SidebarToggle && sidebarOpen_) ||
-                            (button == Target::TerminalToggle && terminalOpen_);
+        const bool active = hover_.target == button || (button == Target::TerminalToggle && terminalOpen_);
         if (active) {
             Fill(r, 6.f, kRaised);
         }
         const D2D1_POINT_2F c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
         const uint32_t color = active ? kPrimary : kSecondary;
-        if (button == Target::SidebarToggle) {  // a window with its left column marked
+        if (button == Target::SidebarToggle) {  // a window with its left column: filled while the sidebar is shown
+            if (sidebarOpen_) {
+                Fill(D2D1::RectF(c.x - 7.3f, c.y - 5.8f, c.x - 3.f, c.y + 5.8f), 1.5f, color, 0.55f);
+            }
             brush_->SetColor(Color(color));
             target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 8.f, c.y - 6.5f, c.x + 8.f, c.y + 6.5f), 2.5f, 2.5f),
                                           brush_.get(), 1.4f);
@@ -7134,11 +7140,12 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         }
     }
 
-    if (projectsTab_) {  // the way to another project: a folder or a GitHub repository
-        const bool active = hover_.target == Target::AddProject;
-        Fill(g.addProject, 8.f, active ? kLine : kRaised);
-        const D2D1_POINT_2F c{(g.addProject.left + g.addProject.right) / 2, (g.addProject.top + g.addProject.bottom) / 2};
-        const uint32_t color = active ? kPrimary : kSecondary;
+    {  // before the search: a new chat; on the projects' tab, a new project (a folder or a GitHub repository)
+        const D2D1_RECT_F button = projectsTab_ ? g.addProject : g.newItem;
+        const bool active = hover_.target == (projectsTab_ ? Target::AddProject : Target::NewChat);
+        Fill(button, 8.f, active ? kLine : kRaised);
+        const D2D1_POINT_2F c{(button.left + button.right) / 2, (button.top + button.bottom) / 2};
+        const uint32_t color = active ? kPrimary : kAccent;
         Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.5f);
         Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
     }
@@ -7281,25 +7288,6 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             }
             AgentIcon({x, y}, 5.f, grok);
         };
-        if (rows_[row].session == kHead && project.folder == DefaultWorkspace()) {
-            // The general chats' head, over their flat list: "new chat", lit while the open chat is a new one.
-            const bool fresh = project.folder == workspace_ && std::ranges::none_of(project.sessions, [&](const SessionInfo& s) {
-                                   return SameChat(s, OpenId());
-                               });
-            if (hovered || fresh) {
-                Fill(lit(r), 8.f, kRaised);
-            }
-            if (fresh) {
-                Fill(D2D1::RectF(r.left + 2.f, r.top + 9.f, r.left + 5.f, r.bottom - 9.f), 1.5f, kAccent);
-            }
-            const D2D1_POINT_2F c{r.left + 13.f, (r.top + r.bottom) / 2};
-            const uint32_t color = hovered || fresh ? kPrimary : kAccent;
-            Line({c.x - 5.f, c.y}, {c.x + 5.f, c.y}, color, 1.7f);
-            Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.7f);
-            Text(L"Новый чат", ui_.get(), D2D1::RectF(r.left + 24, r.top, r.right - 8, r.bottom),
-                 hovered || fresh ? kPrimary : Mix(kSecondary, kPrimary, 0.3f));
-            continue;
-        }
         if (rows_[row].session == kHead) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
             // chat in it under the pointer, else how many chats it has. The keyboard's row lights up too.
@@ -7315,10 +7303,9 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.4f);
             }
             const D2D1_RECT_F plus = ProjectNewRect(r);
-            const bool general = project.folder == DefaultWorkspace();  // its "+" starts the general chat
             const uint32_t nameColor = project.folder == workspace_ ? kPrimary : kSecondary;
-            ProjectIcon({r.left + 32.f, c.y}, general, nameColor, 1.2f);
-            Text(general ? L"Общие чаты" : project.name, uiBold_.get(),
+            ProjectIcon({r.left + 32.f, c.y}, false, nameColor, 1.2f);
+            Text(project.name, uiBold_.get(),
                  D2D1::RectF(r.left + 46, r.top, plus.left - 4, r.bottom), nameColor);
             if (hovered) {
                 const bool on = hover_.target == Target::ProjectNew;
@@ -7524,6 +7511,10 @@ std::string ChatWindow::MemoryPrompt() const {
 }
 
 // The tab chosen: the list is the other side's from the top; what was typed in the search stays (it looks through both).
+std::wstring ChatWindow::NewChatFolder() const {
+    return projectsTab_ && workspace_ != DefaultWorkspace() ? workspace_ : DefaultWorkspace();
+}
+
 void ChatWindow::SetSideTab(bool projects) {
     if (projectsTab_ == projects) {
         return;
@@ -9562,7 +9553,7 @@ void ChatWindow::OpenFile(const std::wstring& path) {
 std::wstring ChatWindow::TooltipText() {
     switch (hover_.target) {
     case Target::SidebarToggle:
-        return sidebarOpen_ ? L"Скрыть боковую панель" : L"Показать боковую панель";
+        return sidebarOpen_ ? L"Скрыть боковую панель (Ctrl+B)" : L"Показать боковую панель (Ctrl+B)";
     case Target::TerminalToggle:
         return terminalOpen_ ? L"Скрыть терминал" : L"Показать терминал";
     case Target::WinMin:
@@ -9674,9 +9665,6 @@ std::wstring ChatWindow::TooltipText() {
     case Target::ProjectRow:
         return RowProject(hover_.row) != nullptr ? RowProject(hover_.row)->folder : std::wstring();
     case Target::ProjectNew:
-        if (RowProject(hover_.row) != nullptr && RowProject(hover_.row)->folder == DefaultWorkspace()) {
-            return L"Новый чат (Ctrl+N)";
-        }
         return RowProject(hover_.row) != nullptr ? L"Новый чат в проекте «" + RowProject(hover_.row)->name + L"»"
                                                  : std::wstring();
     case Target::AddProject:
@@ -9936,7 +9924,7 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         break;
     case Target::ProjectNew:
         if (const D2D1_RECT_F r = SideRowRect(g, row); r.right > r.left) {
-            return row < rows_.size() && projects_[rows_[row].project].folder == DefaultWorkspace() ? r : ProjectNewRect(r);
+            return ProjectNewRect(r);
         }
         break;
     case Target::SideTab:
@@ -10301,8 +10289,7 @@ void ChatWindow::FilterSessions(bool pickFirst) {
         if (!query.empty() && !named && chats.empty()) {
             continue;
         }
-        // A project's head; the general chats' is their tab's "new chat" (a search has none: it is no place for it).
-        if (!(general && searching)) {
+        if (!general) {  // the general chats are a flat list: their "new chat" is the button by the search
             rows_.push_back({p, kHead});
         }
         const bool folded = query.empty() && !general && ProjectFolded(project.folder);
@@ -10373,7 +10360,7 @@ bool ChatWindow::RowSelectable(size_t row) const {
     if (row >= rows_.size() || rows_[row].session == kDraft) {
         return false;  // the new chat is the one already open
     }
-    return !(rows_[row].session == kHead && projects_[rows_[row].project].folder == DefaultWorkspace());
+    return true;
 }
 
 void ChatWindow::NudgeSelection(int dir) {

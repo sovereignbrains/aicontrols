@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 
+#include "core/gdrive.h"
 #include "core/secrets.h"
 #include "core/tools.h"
 
@@ -188,7 +189,7 @@ int main() {
             if (id == "r1") {
                 Expect(body["result"]["protocolVersion"] == "2025-06-18", "initialize echoes the version");
             } else if (id == "r2") {
-                Expect(body["result"]["tools"].size() == 7, "tools/list has seven tools");
+                Expect(body["result"]["tools"].size() == 9, "tools/list has nine tools");
             } else if (id == "r3") {
                 Expect(body["id"] == 2 && body["result"]["isError"] == false &&
                            Has(body["result"]["content"][0]["text"], "crlf.txt"),
@@ -246,6 +247,25 @@ int main() {
                "a server's password is named as a server, apart from the secrets", withServer);
         Expect(!aic::ToolNeedsApproval("list_chats") && !aic::ToolNeedsApproval("read_chat", {{"id", "x"}}),
                "reading the client's chats asks nothing");
+        Expect(!aic::ToolNeedsApproval("drive_search") && !aic::ToolNeedsApproval("drive_read", {{"id", "x"}}),
+               "reading the Drive asks nothing");
+        Expect(aic::GoogleDrive::Query({{"text", "it's"}, {"folder", "F1"}, {"q", "mimeType = 'x'"}}) ==
+                   "trashed = false and fullText contains 'it\\'s' and 'F1' in parents and (mimeType = 'x')",
+               "the Drive query escapes and joins");
+        Expect(aic::GoogleDrive::ExportType("application/vnd.google-apps.spreadsheet") == "text/csv" &&
+                   aic::GoogleDrive::ExportType("application/vnd.google-apps.folder").empty(),
+               "Google files export as text where they can");
+        Expect(aic::GoogleDrive::TextFile("application/octet-stream", "notes.MD") &&
+                   !aic::GoogleDrive::TextFile("application/pdf", "a.pdf"),
+               "text files are told from binary ones");
+        Expect(aic::GoogleDrive::UrlEncode("a b/ы") == "a%20b%2F%D1%8B", "url encoding");
+        {
+            aic::SecretStore empty((dir / "no-drive.bin").wstring());
+            std::atomic<bool> noCancel = false;
+            const aic::ToolResult result = aic::GoogleDrive(empty).Search({{"text", "x"}}, noCancel);
+            Expect(result.isError && Has(result.text, "GDRIVE_CLIENT_ID"), "Drive without its secrets says what is missing",
+                   result.text);
+        }
         const std::string prompt = aic::Tools::SystemPrompt();
         Expect(Has(prompt, "mcp__aic__") && Has(prompt, "`on`") && Has(prompt, "language the user writes"),
                "system prompt");

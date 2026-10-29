@@ -29,6 +29,7 @@ add_library(aic_core STATIC
   src/core/chat_export.cpp
   src/core/claude_install.cpp
   src/core/claude_process.cpp
+  src/core/gdrive.cpp
   src/core/github.cpp
   src/core/grok_process.cpp
   src/core/highlight.cpp

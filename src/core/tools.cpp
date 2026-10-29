@@ -19,6 +19,7 @@
 #include <wil/resource.h>
 
 #include "core/chat_export.h"
+#include "core/gdrive.h"
 #include "core/store.h"
 
 namespace aic {
@@ -582,7 +583,8 @@ std::string GrokToolName(const std::string& fullName) {
 }
 
 bool ReadOnlyTool(const std::string& name) {
-    return name == "read_file" || name == "list_directory" || name == "list_chats" || name == "read_chat";
+    return name == "read_file" || name == "list_directory" || name == "list_chats" || name == "read_chat" ||
+           name == "drive_search" || name == "drive_read";
 }
 
 bool ToolNeedsApproval(const std::string& name, const Json& input) {
@@ -718,6 +720,12 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
     if (name == "list_chats") {
         return {L"Список чатов", project.empty() ? L"все проекты" : project};
     }
+    if (name == "drive_search") {
+        return {L"Поиск на Google Диске", ToWide(StringArg(input, "text") + " " + StringArg(input, "q"))};
+    }
+    if (name == "drive_read") {
+        return {L"Прочитать с Google Диска", ToWide(StringArg(input, "id"))};
+    }
     if (name == "read_chat") {
         return {L"Прочитать чат", ToWide(StringArg(input, "id")) + (project.empty() ? L"" : L"\n" + project)};
     }
@@ -758,7 +766,8 @@ std::string Tools::SystemPrompt() {
     return "You are running inside AIControls, a native Windows chat client, on the user's computer. Claude Code's "
            "own local tools are off: use only the mcp__aic__* tools run_command, read_file, list_directory, "
            "write_file and edit_file, and list_chats and read_chat for this client's other chats (Claude's and "
-           "Grok's): when the user points to another chat, read it rather than guess. On this computer run_command is PowerShell 5.1 (non-interactive). Paths are "
+           "Grok's): when the user points to another chat, read it rather than guess. drive_search and drive_read "
+           "read the user's Google Drive: when they speak of a file there, search it rather than ask for a path. On this computer run_command is PowerShell 5.1 (non-interactive). Paths are "
            "paths on this computer; relative ones resolve against the chat's working directory. Every run_command, "
            "write_file and edit_file call, and anything aimed at a server, is shown to the user for approval, so "
            "keep commands focused and say briefly why you run them. "
@@ -859,6 +868,26 @@ Json Tools::Definitions() const {
                       {"offset", {{"type", "integer"}, {"minimum", 1}, {"description", "First line to read, from 1"}}},
                       {"limit", {{"type", "integer"}, {"minimum", 1}, {"description", "How many lines (default 2000)"}}}},
                      Json::array({"id"}))}},
+        Json{{"name", "drive_search"},
+             {"description",
+              "Search the user's Google Drive (read only), newest first: name, id, type, modified, bytes. `text` finds "
+              "words in names and contents; `folder` lists one folder by id; `q` is Drive's own query syntax "
+              "(e.g. mimeType = 'application/pdf'). The first call opens the browser for the user's Google sign-in."},
+             {"inputSchema",
+              Schema({{"text", str},
+                      {"folder", {{"type", "string"}, {"description", "A folder's id: only what is in it"}}},
+                      {"q", {{"type", "string"}, {"description", "Drive query syntax, added with `and`"}}},
+                      {"limit", {{"type", "integer"}, {"minimum", 1}, {"maximum", 100}, {"description", "Default 20"}}}},
+                     Json::array())}},
+        Json{{"name", "drive_read"},
+             {"description",
+              "Read a file from the user's Google Drive as text: Docs, Sheets (first sheet, CSV) and Slides, and text "
+              "files; up to 60 KB at a time, read on with offset (bytes). The id is from drive_search."},
+             {"inputSchema",
+              Schema({{"id", {{"type", "string"}, {"description", "The file's id, from drive_search"}}},
+                      {"offset", {{"type", "integer"}, {"minimum", 0}, {"description", "First byte to read"}}},
+                      {"limit", {{"type", "integer"}, {"minimum", 1}, {"maximum", 60000}, {"description", "How many bytes"}}}},
+                     Json::array({"id"}))}},
     });
 }
 
@@ -881,6 +910,10 @@ ToolResult Tools::Execute(const std::string& name, const Json& input, const std:
             result = ListChats(input);
         } else if (name == "read_chat") {
             result = ReadChat(input);
+        } else if (name == "drive_search") {
+            result = GoogleDrive(secrets_).Search(input, cancel);
+        } else if (name == "drive_read") {
+            result = GoogleDrive(secrets_).Read(input, cancel);
         } else {
             return Error("Unknown tool: " + name);
         }

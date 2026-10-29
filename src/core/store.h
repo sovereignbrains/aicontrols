@@ -80,6 +80,8 @@ struct Settings {
     std::string claudeModels;
     // Grok's fast tier (its "…-build-fast" model, twice the price): what the Grok row picks.
     bool grokFast = false;
+    // "Позже" on the accounts' screen: it no longer opens by itself while the chosen agent can answer.
+    bool connectLater = false;
     // What runs without a card: "" asks before anything that changes something, "edits" writes files on this
     // computer unasked (commands and servers still ask), "all" asks nothing.
     std::string permissions;

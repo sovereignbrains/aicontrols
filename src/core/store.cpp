@@ -1247,6 +1247,7 @@ Settings LoadSettings() {
     settings.claudeModel = JsonStr(data, "claudeModel");
     settings.connectors = JsonAt(data, "connectors").is_boolean() && JsonAt(data, "connectors").get<bool>();
     settings.grokFast = JsonAt(data, "grokFast").is_boolean() && JsonAt(data, "grokFast").get<bool>();
+    settings.connectLater = JsonAt(data, "connectLater").is_boolean() && JsonAt(data, "connectLater").get<bool>();
     const auto number = [&](const char* key, long long fallback) {
         const Json& value = JsonAt(data, key);
         return value.is_number() ? value.get<long long>() : fallback;
@@ -1311,6 +1312,7 @@ void SaveSettings(const Settings& settings) {
                 {"claudeModel", settings.claudeModel},
                 {"connectors", settings.connectors},
                 {"grokFast", settings.grokFast},
+                {"connectLater", settings.connectLater},
                 {"sessionPercent", settings.sessionPercent},
                 {"sessionResets", settings.sessionResets},
                 {"weekPercent", settings.weekPercent},

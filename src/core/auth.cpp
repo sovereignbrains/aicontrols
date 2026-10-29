@@ -152,4 +152,47 @@ std::string FindLoginUrl(const std::string& output) {
     return output.substr(start, end - start);
 }
 
+std::wstring GrokAuthFile() {
+    std::array<wchar_t, 2048> profile{};
+    const DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile.data(), static_cast<DWORD>(profile.size()));
+    if (length == 0 || length >= profile.size()) {
+        return {};
+    }
+    return std::wstring(profile.data(), length) + L"\\.grok\\auth.json";
+}
+
+std::string GrokSignedInEmail(const std::string& authJson) {
+    const Json data = Json::parse(authJson, nullptr, false);
+    if (!data.is_object()) {
+        return {};
+    }
+    for (const auto& [name, account] : data.items()) {
+        if (!account.is_object() || (JsonStr(account, "key").empty() && JsonStr(account, "refresh_token").empty())) {
+            continue;
+        }
+        const std::string email = JsonStr(account, "email");
+        return email.empty() ? "-" : email;
+    }
+    return {};
+}
+
+std::string GrokSignedIn() {
+    const std::wstring path = GrokAuthFile();
+    wil::unique_hfile file(path.empty() ? INVALID_HANDLE_VALUE
+                                        : CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                                                                      FILE_SHARE_DELETE,
+                                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file) {
+        return {};
+    }
+    std::string text;
+    std::array<char, 8192> buffer{};
+    DWORD got = 0;
+    while (text.size() < (1u << 20) && ReadFile(file.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr) &&
+           got > 0) {
+        text.append(buffer.data(), got);
+    }
+    return GrokSignedInEmail(text);
+}
+
 }  // namespace aic

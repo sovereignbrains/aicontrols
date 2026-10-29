@@ -43,4 +43,12 @@ AuthStatus QueryAuthStatus(const std::wstring& claudeExe, const std::wstring& pr
 // The first https:// link in the CLI's login output (the page to open when the browser did not), or "".
 std::string FindLoginUrl(const std::string& output);
 
+// Where the Grok CLI keeps its sign-in: %USERPROFILE%\.grok\auth.json.
+std::wstring GrokAuthFile();
+// The account in that file's text, as `grok login` leaves it ({"https://auth.x.ai::<id>": {"email", "key", ...}}):
+// its email, or "-" for an account without one; empty when no one is signed in.
+std::string GrokSignedInEmail(const std::string& authJson);
+// The same from the file itself.
+std::string GrokSignedIn();
+
 }  // namespace aic

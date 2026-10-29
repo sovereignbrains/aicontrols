@@ -37,6 +37,7 @@ add_library(aic_core STATIC
   src/core/markdown.cpp
   src/core/memory_writer.cpp
   src/core/model_router.cpp
+  src/core/oauth.cpp
   src/core/pty.cpp
   src/core/secrets.cpp
   src/core/store.cpp
@@ -45,6 +46,25 @@ add_library(aic_core STATIC
   src/core/vt_screen.cpp
   src/core/voice.cpp)
 target_include_directories(aic_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# The GitHub OAuth App AIControls signs in with, built in from GITHUB_OAUTH_ID and GITHUB_OAUTH_SECRET in the
+# environment (the stored secrets of these names win at run time). Without them the header keeps what an earlier
+# configure wrote, or is empty: then only stored secrets can sign in. The build folder is not in git, nor is this.
+set(AIC_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/generated)
+if (DEFINED ENV{GITHUB_OAUTH_ID} AND DEFINED ENV{GITHUB_OAUTH_SECRET})
+  set(AIC_GITHUB_OAUTH_ID "$ENV{GITHUB_OAUTH_ID}")
+  set(AIC_GITHUB_OAUTH_SECRET "$ENV{GITHUB_OAUTH_SECRET}")
+elseif (EXISTS ${AIC_GENERATED}/github_app.h)
+  set(AIC_GITHUB_KEEP ON)
+endif()
+if (NOT AIC_GITHUB_KEEP)
+  file(CONFIGURE OUTPUT ${AIC_GENERATED}/github_app.h CONTENT
+"#pragma once
+inline constexpr const char* kBuiltGithubClientId = \"@AIC_GITHUB_OAUTH_ID@\";
+inline constexpr const char* kBuiltGithubClientSecret = \"@AIC_GITHUB_OAUTH_SECRET@\";
+" @ONLY)
+endif()
+target_include_directories(aic_core PRIVATE ${AIC_GENERATED})
 target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 wintrust windowscodecs winhttp bcrypt winmm)
 
 add_executable(aicontrols WIN32

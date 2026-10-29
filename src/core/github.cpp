@@ -2,76 +2,107 @@
 
 #include <windows.h>
 
-#include <winhttp.h>
-
 #include <chrono>
 #include <filesystem>
 #include <format>
 
 #include <nlohmann/json.hpp>
-#include <wil/resource.h>
 
 #include "core/auth.h"
 #include "core/claude_process.h"
+#include "core/oauth.h"
+#include "github_app.h"
 
 namespace aic {
 namespace {
 
-using unique_hinternet = wil::unique_any<HINTERNET, decltype(&::WinHttpCloseHandle), ::WinHttpCloseHandle>;
+// The rights a token from the sign-in carries: the repositories, private ones too, and their workflows (a push
+// that touches .github/workflows needs it).
+constexpr std::string_view kGithubScope = "repo workflow";
+constexpr auto kGithubWait = std::chrono::minutes(3);
 
-// One GET to api.github.com; the body on HTTP 200, else empty with `error` set.
-std::string GithubGet(const std::wstring& path, const std::string& token, std::string& error) {
-    unique_hinternet session(WinHttpOpen(L"AIControls", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                                         WINHTTP_NO_PROXY_BYPASS, 0));
-    if (!session) {
-        error = "WinHttpOpen failed";
-        return {};
-    }
-    WinHttpSetTimeouts(session.get(), 10000, 10000, 15000, 30000);
-    unique_hinternet connection(WinHttpConnect(session.get(), L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0));
-    unique_hinternet request(connection ? WinHttpOpenRequest(connection.get(), L"GET", path.c_str(), nullptr,
-                                                             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                                             WINHTTP_FLAG_SECURE)
-                                        : nullptr);
-    if (!request) {
-        error = "cannot reach api.github.com";
-        return {};
-    }
+// One GET to api.github.com; the body on HTTP 200, else empty with `error` set and `status` (0: no answer).
+std::string GithubGet(const std::wstring& path, const std::string& token, std::string& error, int* status = nullptr) {
     const std::wstring headers = L"Authorization: Bearer " + ToWide(token) +
                                  L"\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n";
-    if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(-1L), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(request.get(), nullptr)) {
-        error = std::format("request failed (error {})", GetLastError());
+    const HttpsReply reply = HttpsRequest(L"GET", L"api.github.com", path, headers);
+    if (status) {
+        *status = reply.status;
+    }
+    if (reply.status == 0) {
+        error = "cannot reach api.github.com: " + reply.error;
         return {};
     }
-    DWORD status = 0;
-    DWORD size = sizeof(status);
-    WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                        &status, &size, WINHTTP_NO_HEADER_INDEX);
-    std::string body;
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request.get(), &available) || available == 0) {
-            break;
-        }
-        std::string chunk(available, '\0');
-        DWORD got = 0;
-        if (!WinHttpReadData(request.get(), chunk.data(), available, &got) || got == 0) {
-            break;
-        }
-        body.append(chunk.data(), got);
-    }
-    if (status != 200) {
-        error = std::format("GitHub answered {}", status);
-        if (status == 401) {
+    if (reply.status != 200) {
+        error = std::format("GitHub answered {}", reply.status);
+        if (reply.status == 401) {
             error += ": the token is not accepted";
         }
         return {};
     }
-    return body;
+    return reply.body;
 }
 
 }  // namespace
+
+GithubApp BuiltGithubApp() {
+    return {kBuiltGithubClientId, kBuiltGithubClientSecret};
+}
+
+GithubLogin WhoIsGithub(const std::string& token) {
+    GithubLogin who;
+    if (token.empty()) {
+        who.rejected = true;
+        who.error = "no GITHUB secret";
+        return who;
+    }
+    int status = 0;
+    const std::string body = GithubGet(L"/user", token, who.error, &status);
+    who.rejected = status == 401;
+    who.login = JsonStr(Json::parse(body, nullptr, false), "login");
+    if (!body.empty() && who.login.empty()) {
+        who.error = "GitHub's answer has no login";
+    }
+    return who;
+}
+
+GithubSignIn SignInGithub(const GithubApp& app, const std::atomic<bool>& cancel) {
+    GithubSignIn result;
+    if (app.clientId.empty() || app.clientSecret.empty()) {
+        result.error = "this build has no GitHub app: set GITHUB_OAUTH_ID and GITHUB_OAUTH_SECRET in the secrets";
+        return result;
+    }
+    const std::string authorize =
+        "https://github.com/login/oauth/authorize?" + FormBody({{"client_id", app.clientId}, {"scope", std::string(kGithubScope)}});
+    const auto exchange = [&](const OAuthGrant& grant) {
+        const HttpsReply reply = HttpsRequest(L"POST", L"github.com", L"/login/oauth/access_token",
+                                              std::wstring(kFormHeaders) + L"Accept: application/json\r\n",
+                                              FormBody({{"client_id", app.clientId},
+                                                        {"client_secret", app.clientSecret},
+                                                        {"code", grant.code},
+                                                        {"redirect_uri", grant.redirect},
+                                                        {"code_verifier", grant.verifier}}));
+        const Json data = Json::parse(reply.body, nullptr, false);
+        result.token = JsonStr(data, "access_token");
+        if (result.token.empty()) {  // GitHub says no with a 200 and {error, error_description}
+            const std::string why = JsonStr(data, "error_description");
+            result.error = "GitHub's token request failed: " +
+                           (!why.empty() ? why : reply.status == 0 ? reply.error : std::format("HTTP {}", reply.status));
+            return OAuthPage("GitHub не подключился: " + result.error, false);
+        }
+        const GithubLogin who = WhoIsGithub(result.token);
+        result.login = who.login;
+        return OAuthPage(who.login.empty() ? std::string("GitHub подключён. Эту вкладку можно закрыть.")
+                                           : "GitHub подключён: " + who.login + ". Эту вкладку можно закрыть.",
+                         true);
+    };
+    std::string error;
+    if (BrowserSignIn(authorize, "/callback", "GitHub", exchange, cancel, kGithubWait, error) != BrowserEnd::Answered) {
+        result.error = error;
+        result.cancelled = cancel;
+    }
+    return result;
+}
 
 std::vector<GithubRepo> ParseGithubRepos(const std::string& json) {
     std::vector<GithubRepo> repos;

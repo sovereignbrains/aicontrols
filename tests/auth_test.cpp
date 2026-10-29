@@ -45,6 +45,16 @@ int main() {
            "login URL");
     Expect(aic::FindLoginUrl("no link here").empty(), "no URL");
 
+    // Grok's auth.json.
+    Expect(aic::GrokSignedInEmail(R"({"https://auth.x.ai::1f2e":{"key":"k","email":"g@x.ai","refresh_token":"r"}})") ==
+               "g@x.ai",
+           "Grok's account");
+    Expect(aic::GrokSignedInEmail(R"({"https://auth.x.ai::1f2e":{"key":"k"}})") == "-", "Grok's account without an email");
+    Expect(aic::GrokSignedInEmail(R"({"https://auth.x.ai::1f2e":{"email":"g@x.ai"}})").empty(), "no key, no account");
+    Expect(aic::GrokSignedInEmail("{}").empty() && aic::GrokSignedInEmail("").empty() &&
+               aic::GrokSignedInEmail("[1]").empty(),
+           "no one signed in");
+
     // The runner.
     aic::CliResult r = aic::RunCli(L"cmd.exe /c echo hello-cli& echo to-stderr 1>&2& exit 3", L"", 20);
     Expect(r.started && r.exitCode == 3 && Has(r.output, "hello-cli") && Has(r.output, "to-stderr"),

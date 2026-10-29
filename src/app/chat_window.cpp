@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <format>
@@ -106,6 +107,13 @@ constexpr UINT kCloneDone = WM_APP + 11;  // CloneDone*: `git clone` ended
 constexpr UINT kVoiceText = WM_APP + 16;    // VoiceResult*: what was said, as text
 constexpr UINT kUsage = WM_APP + 15;        // PlanUsage*: the plan's limits as claude.ai has them
 constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed and pushed
+constexpr UINT kGithubDone = WM_APP + 17;   // GithubDone*: the token checked, or the browser's sign-in ended
+
+struct GithubDone {
+    bool check = false;     // the saved token asked of the API, not a sign-in
+    bool rejected = false;  // ... and turned down
+    GithubSignIn result;
+};
 
 struct ReposResult {
     std::vector<GithubRepo> repos;
@@ -165,6 +173,15 @@ constexpr std::chrono::milliseconds kMeasureSpell{5};
 // the list's scroll bar beside it, it lit and went out like a second bar (29.10.2026, his: 'какк будто 2 скрола').
 constexpr UINT_PTR kEdgeTimer = 16;
 constexpr UINT kEdgeDelay = 300;       // ms
+// The connect screen: a row per account, the one at work turning its arc.
+constexpr UINT_PTR kConnectTimer = 17;
+constexpr UINT kConnectFrame = 33;     // ms
+constexpr float kLinkWidth = 440.f;
+constexpr float kLinkHeight = 58.f;
+constexpr size_t kClaudeLink = 0;      // the rows, in the order "Войти во все" goes through them
+constexpr size_t kGrokLink = 1;
+constexpr size_t kGithubLink = 2;
+constexpr size_t kNoLink = 3;
 constexpr UINT kPanFrame = 16;           // ms
 constexpr float kPanStill = 10.f;
 constexpr ULONGLONG kPanHold = 300;      // ms
@@ -504,11 +521,11 @@ enum class Target {
     WinMin,    // the window's own buttons, drawn in the header (the system caption is gone)
     WinMax,
     WinClose,
-    SignIn,
-    InstallClaude,  // the install screen's button, and the same button while it works
-    CancelInstall,
-    CancelLogin,
-    CopyLoginUrl,
+    ConnectAll,     // the connect screen: "Войти во все"
+    ConnectCancel,  // ... the same button while a row works
+    ConnectRow,     // row: the account (Claude, Grok, GitHub): its own "Войти" or "Повторить"
+    ConnectLink,    // row: the same: Claude's sign-in link, copied, while the browser waits
+    ConnectLater,   // "Позже" under it, or "Закрыть" when nothing is missing
     Account,  // the sidebar's account row
     TerminalToggle,
     TermTab,       // row: the tab
@@ -600,8 +617,10 @@ struct Geometry {
     D2D1_RECT_F addProject{};  // "+" at the right of the projects' label
     D2D1_RECT_F projectsLabel{};  // "Проекты" and the order: click to choose it
     D2D1_RECT_F account{};  // the sidebar's account row, at the bottom
-    D2D1_RECT_F signIn{};   // the sign-in screen's buttons (in the middle of an empty chat)
-    D2D1_RECT_F signAlt{};
+    std::array<D2D1_RECT_F, 3> links{};        // the connect screen's rows (in the middle of an empty chat)
+    std::array<D2D1_RECT_F, 3> linkButtons{};  // ... each one's button at its right
+    D2D1_RECT_F connectAll{};
+    D2D1_RECT_F connectLater{};
     float listBottom = 0;
     D2D1_RECT_F feed{};
     D2D1_RECT_F box{};
@@ -971,24 +990,46 @@ private:
     void MergeModels();
     void RefreshAuth();
     void SignIn();
-    void CancelSignIn();
     void SignOut();
     void OnAuthStatus(const AuthStatus& status);
     void OnLoginDone(const LoginDone& done);
     void OnLogoutDone();
     void ShowAccountMenu();
-    void PaintSignIn(const Geometry& g);
+
+    // The connect screen: Claude, Grok and GitHub, a row each, signed in one after another in the user's own
+    // browser (where the Google session already is), never two at once. It comes up over an empty chat when
+    // something is missing, and leaves for the chat once all three are in.
+    enum class LinkState { Checking, Missing, Working, Done, Failed };
+    struct AccountLink {
+        LinkState state = LinkState::Checking;
+        std::wstring who;   // the account, once known
+        std::wstring note;  // the step it is on while it works; why it failed; that it could not be checked
+    };
+    bool ConnectShown() const { return connectOpen_ && !HasConversation(); }
+    bool LinksDone() const;
+    AccountLink ClaudeLink() const;
+    AccountLink GrokLink() const;
+    void CheckLinks();
+    void LinksChecked();
+    void OpenConnect();
+    void ConnectAll();
+    void Connect(size_t row);
+    void ConnectGithub();
+    void CancelConnect();
+    void StepClaude();
+    void FinishLink(size_t row, bool ok, std::wstring text);
+    void NextLink();
+    void OnGithubDone(const GithubDone& done);
+    void PaintConnect(const Geometry& g);
 
     // The CLI itself: fetched when it is missing, updated from the account menu.
     bool ClaudeUpdateAvailable() const { return ClaudeVersionLess(claudeVersion_, claudeLatest_); }
     void InstallClaudeCli();
     void InstallGrokCli();
     void UpdateClaudeCli();
-    void CancelSetup() { setupCancel_ = true; }
     void OnSetupEvent(const SetupEvent& event);
     void CheckClaudeVersions();
     void OnClaudeVersions(const ClaudeVersions& versions);
-    void PaintInstall(const Geometry& g);
     std::wstring AccountName() const;
     std::wstring AccountPlan() const;
 
@@ -1159,7 +1200,7 @@ private:
     void Check(D2D1_POINT_2F center, uint32_t color);
     void AgentIcon(D2D1_POINT_2F center, float radius, bool grok, uint32_t ground);
     void ProjectIcon(D2D1_POINT_2F center, bool general, uint32_t color);
-    void GithubIcon(D2D1_POINT_2F center, uint32_t color);
+    void GithubIcon(D2D1_POINT_2F center, uint32_t color, float size = 13.f);
     static float ItemWidth(const FeedItem& item, float column);
     void MeasureFeed(float column, float view);
     void MeasureRest();
@@ -1259,6 +1300,7 @@ private:
     bool StartClaude();
     void FillGallery();  // --gallery: one sample of every kind of feed item, awkward data included
     bool gallery_ = false;
+    bool galleryConnect_ = false;  // --gallery connect: the connect screen instead, its rows in each state
     void Restart();
     void ResetChat();
     void NewChat();
@@ -1356,7 +1398,18 @@ private:
     std::wstring authNote_;          // why the last attempt failed
     std::thread authThread_;
     std::atomic<bool> authCancel_ = false;
-    bool claudeMissing_ = false;     // no claude.exe was found: the install screen takes the empty chat
+    bool authAgain_ = false;         // asked while a call ran: its answer may be from before, so ask once more
+    std::array<AccountLink, 3> links_;  // Claude, Grok, GitHub, as the connect screen shows them
+    std::deque<size_t> chain_;       // "Войти во все": the rows still to go after the one at work
+    size_t connectRow_ = kNoLink;    // the row at work: one browser at a time
+    bool connectOpen_ = false;       // the connect screen is up (it shows over an empty chat)
+    bool linksSettled_ = false;      // every row has been checked once, after the start
+    bool claudeLoginTried_ = false;  // the Claude row at work has been through `auth login`
+    bool linkCancelled_ = false;     // "Отмена": the row at work goes back to missing, not to failed
+    std::thread githubThread_;       // the token's check, or the browser's sign-in
+    bool githubBusy_ = false;        // ... runs
+    std::atomic<bool> githubCancel_ = false;
+    bool claudeMissing_ = false;     // no claude.exe was found: the connect screen takes the empty chat
     bool setupBusy_ = false;         // the installer or the updater runs
     bool setupInstalling_ = false;   // ... and has the build already
     unsigned setupPercent_ = 0;
@@ -1562,6 +1615,7 @@ int ChatWindow::Run(int show) {
                                                                   &LocalFree);
         for (int i = 1; args && i < count; ++i) {
             gallery_ = gallery_ || std::wstring_view(args.get()[i]) == L"--gallery";
+            galleryConnect_ = galleryConnect_ || (gallery_ && std::wstring_view(args.get()[i]) == L"connect");
         }
     }
     SetSettingsReadOnly(gallery_);
@@ -1671,6 +1725,7 @@ int ChatWindow::Run(int show) {
         return static_cast<int>(galleryMessage.wParam);
     }
     RefreshAuth();
+    CheckLinks();
     LoadRepos();
     CheckClaudeVersions();
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
@@ -1894,6 +1949,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case kAuthStatus: {
         const std::unique_ptr<AuthStatus> payload(reinterpret_cast<AuthStatus*>(lParam));
         OnAuthStatus(*payload);
+        return 0;
+    }
+    case kGithubDone: {
+        const std::unique_ptr<GithubDone> payload(reinterpret_cast<GithubDone*>(lParam));
+        OnGithubDone(*payload);
         return 0;
     }
     case kAuthUrl: {
@@ -2442,6 +2502,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             CheckPreview();
         } else if (wParam == kVoiceTimer) {
             Refresh();
+        } else if (wParam == kConnectTimer) {
+            if (connectRow_ == kNoLink || !ConnectShown()) {
+                KillTimer(hwnd_, kConnectTimer);
+            }
+            Refresh();
         } else if (wParam == kUsageTimer) {
             FetchUsage();
             if (GrokRunning()) {
@@ -2558,6 +2623,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (authThread_.joinable()) {
             authThread_.join();
         }
+        githubCancel_ = true;  // and GitHub's: its page in the browser stops waiting
+        if (githubThread_.joinable()) {
+            githubThread_.join();
+        }
         setupCancel_ = true;  // so does an install or an update
         if (setupThread_.joinable()) {
             setupThread_.join();
@@ -2654,26 +2723,31 @@ void ChatWindow::OnClick(float x, float y) {
         }
         return;
     }
-    case Target::SignIn:
-        SignIn();
+    case Target::ConnectAll:
+        ConnectAll();
         break;
-    case Target::InstallClaude:
-        InstallClaudeCli();
+    case Target::ConnectCancel:
+        CancelConnect();
         break;
-    case Target::CancelInstall:
-        CancelSetup();
+    case Target::ConnectRow:
+        chain_.clear();  // this one alone
+        Connect(hit.row);
         break;
-    case Target::CancelLogin:
-        CancelSignIn();
-        break;
-    case Target::CopyLoginUrl:
+    case Target::ConnectLink:
         if (SetClipboardText(hwnd_, ToWide(loginUrl_))) {
-            Flash(L"Ссылка скопирована");
+            Flash(L"Ссылка на вход скопирована: откройте её в нужном браузере");
         }
+        break;
+    case Target::ConnectLater:
+        if (!LinksDone() && !settings_.connectLater) {  // it comes up by itself only while the chat cannot work
+            settings_.connectLater = true;
+            SaveSettings(settings_);
+        }
+        connectOpen_ = false;
         break;
     case Target::Account:
         if (SignedOut()) {
-            SignIn();
+            OpenConnect();
         } else {
             ShowAccountMenu();
         }
@@ -3096,10 +3170,18 @@ Geometry ChatWindow::Layout() const {
     g.project = D2D1::RectF(left + 4, chipsTop, std::max(left + 4, g.permission.left - 8), chipsBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
+        // A title, three rows, the main button and "later" under it: all of it about 330 tall, round the middle.
         const float centerX = left + g.column / 2;
-        const float middle = (g.feed.top + g.feed.bottom) / 2;
-        g.signIn = D2D1::RectF(centerX - 90, middle + 28, centerX + 90, middle + 28 + 38);
-        g.signAlt = D2D1::RectF(centerX - 90, g.signIn.bottom + 10, centerX + 90, g.signIn.bottom + 10 + 34);
+        const float half = std::min(kLinkWidth, g.column) / 2;
+        float y = (g.feed.top + g.feed.bottom) / 2 - 110;
+        for (size_t i = 0; i < g.links.size(); ++i) {
+            g.links[i] = D2D1::RectF(centerX - half, y, centerX + half, y + kLinkHeight);
+            const float middle = y + kLinkHeight / 2;
+            g.linkButtons[i] = D2D1::RectF(g.links[i].right - 12 - 96, middle - 15, g.links[i].right - 12, middle + 15);
+            y += kLinkHeight + 8;
+        }
+        g.connectAll = D2D1::RectF(centerX - 95, y + 16, centerX + 95, y + 16 + 38);
+        g.connectLater = D2D1::RectF(centerX - 60, g.connectAll.bottom + 8, centerX + 60, g.connectAll.bottom + 34);
     }
 
     if (sidebarWidth > 0) {
@@ -3361,15 +3443,31 @@ Hit ChatWindow::HitTest(float x, float y) const {
     if (Inside(g.update, x, y)) {
         return {Target::Update};
     }
-    if (claudeMissing_ && !HasConversation() && Inside(g.signIn, x, y)) {
-        return {setupBusy_ ? Target::CancelInstall : Target::InstallClaude};
-    }
-    if (SignedOut() && !HasConversation()) {
-        if (Inside(g.signIn, x, y)) {
-            return {loginWaiting_ ? Target::CancelLogin : Target::SignIn};
+    if (ConnectShown()) {
+        for (size_t i = 0; i < links_.size(); ++i) {
+            if (!Inside(g.linkButtons[i], x, y)) {
+                continue;
+            }
+            const LinkState state = links_[i].state;
+            if (i == connectRow_ && i == kClaudeLink && loginWaiting_ && !loginUrl_.empty()) {
+                return {Target::ConnectLink, i};
+            }
+            if (connectRow_ == kNoLink && (state == LinkState::Missing || state == LinkState::Failed)) {
+                return {Target::ConnectRow, i};
+            }
         }
-        if (loginWaiting_ && !loginUrl_.empty() && Inside(g.signAlt, x, y)) {
-            return {Target::CopyLoginUrl};
+        if (Inside(g.connectAll, x, y)) {
+            if (connectRow_ != kNoLink) {
+                return {Target::ConnectCancel};
+            }
+            if (!LinksDone() && std::ranges::none_of(links_, [](const AccountLink& link) {
+                    return link.state == LinkState::Checking;
+                })) {
+                return {Target::ConnectAll};
+            }
+        }
+        if (connectRow_ == kNoLink && Inside(g.connectLater, x, y)) {
+            return {Target::ConnectLater};
         }
     }
     if (Inside(g.feed, x, y)) {
@@ -3677,17 +3775,16 @@ void ChatWindow::ProjectIcon(D2D1_POINT_2F c, bool general, uint32_t color) {
 }
 
 // GitHub's mark, before the projects' label: the projects come from there as well as from folders.
-void ChatWindow::GithubIcon(D2D1_POINT_2F c, uint32_t color) {
+void ChatWindow::GithubIcon(D2D1_POINT_2F c, uint32_t color, float size) {
     brush_->SetColor(Color(color));
     if (!githubMark_) {
         githubMark_ = GithubMark(d2d_.get());
     }
     if (githubMark_) {
-        constexpr float kSize = 13.f;
         D2D1_MATRIX_3X2_F before{};
         target_->GetTransform(&before);
-        target_->SetTransform(D2D1::Matrix3x2F::Scale(kSize / 16.f, kSize / 16.f) *
-                              D2D1::Matrix3x2F::Translation(c.x - kSize / 2, c.y - kSize / 2) * before);
+        target_->SetTransform(D2D1::Matrix3x2F::Scale(size / 16.f, size / 16.f) *
+                              D2D1::Matrix3x2F::Translation(c.x - size / 2, c.y - size / 2) * before);
         target_->FillGeometry(githubMark_.get(), brush_.get());
         target_->SetTransform(before);
     }
@@ -4008,10 +4105,8 @@ void ChatWindow::Paint() {
 
 void ChatWindow::PaintFeed(const Geometry& g) {
     const float left = g.left;
-    if (claudeMissing_ && !HasConversation()) {
-        PaintInstall(g);
-    } else if (SignedOut() && !HasConversation()) {
-        PaintSignIn(g);
+    if (ConnectShown()) {
+        PaintConnect(g);
     } else if (!HasConversation()) {
         const std::wstring hello = userName_.empty() ? L"Что дальше?" : L"Что дальше, " + ToWide(userName_) + L"?";
         const float middle = (g.feed.top + g.feed.bottom) / 2;
@@ -5617,11 +5712,13 @@ std::wstring ChatWindow::AccountPlan() const {
 
 void ChatWindow::RefreshAuth() {
     if (authWorking_) {
+        authAgain_ = true;
         return;
     }
     if (authThread_.joinable()) {
         authThread_.join();
     }
+    authAgain_ = false;
     authWorking_ = true;
     const HWND hwnd = hwnd_;
     authThread_ = std::thread([hwnd] {
@@ -5634,7 +5731,19 @@ void ChatWindow::RefreshAuth() {
 
 void ChatWindow::OnAuthStatus(const AuthStatus& status) {
     authWorking_ = false;
+    if (authAgain_) {  // e.g. asked before claude.exe was installed
+        RefreshAuth();
+        return;
+    }
     auth_ = status;
+    if (connectRow_ == kClaudeLink) {
+        if (!setupBusy_ && !loginWaiting_) {
+            StepClaude();
+        }
+    } else if (links_[kClaudeLink].state != LinkState::Failed || status.loggedIn) {
+        links_[kClaudeLink] = ClaudeLink();
+        LinksChecked();
+    }
     if (status.known && status.loggedIn && !status.email.empty()) {
         userName_ = status.email.substr(0, status.email.find('@'));
     }
@@ -5696,10 +5805,6 @@ void ChatWindow::SignIn() {
         }
     });
     Refresh();
-}
-
-void ChatWindow::CancelSignIn() {
-    authCancel_ = true;  // the thread ends the CLI and reports back
 }
 
 void ChatWindow::OnLoginDone(const LoginDone& done) {
@@ -5777,10 +5882,14 @@ void ChatWindow::ShowAccountMenu() {
     AppendMenuW(menu.get(), MF_STRING | (setupBusy_ ? MF_GRAYED : 0), ClaudeUpdateAvailable() ? 4 : 5,
                 ClaudeUpdateAvailable() ? update.c_str() : L"Проверить обновления Claude");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, 6, L"Подключения: Claude, Grok, GitHub…");
     AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из аккаунта");
     switch (Menu(menu.get(), screen, true)) {
     case 2:
         SignOut();
+        break;
+    case 6:
+        OpenConnect();
         break;
     case 4:
         UpdateClaudeCli();
@@ -5846,28 +5955,35 @@ void ChatWindow::InstallGrokCli() {
     setupBusy_ = true;
     setupPercent_ = 0;
     setupCancel_ = false;
-    Flash(L"Скачиваю Grok…", 60000);
+    const bool installed = !FindGrokExe().empty();
+    links_[kGrokLink].note = installed ? L"Жду вход в браузере" : L"Загружаю…";
+    if (!ConnectShown()) {
+        Flash(installed ? L"Войдите в аккаунт x.ai в открывшемся браузере" : L"Скачиваю Grok…", 60000);
+    }
     const HWND hwnd = hwnd_;
     const std::atomic<bool>* cancel = &setupCancel_;
-    setupThread_ = std::thread([hwnd, cancel] {
+    setupThread_ = std::thread([hwnd, cancel, installed] {
         std::string error;
-        bool ok = InstallGrok(
+        bool ok = installed || InstallGrok(
             PickProxy(), cancel,
             [hwnd](unsigned percent, bool) { PostSetup(hwnd, SetupEvent{percent, false, false, false, false, true, {}}); },
             error);
-        std::array<wchar_t, 2048> profile{};
-        const DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile.data(), static_cast<DWORD>(profile.size()));
-        const std::wstring auth = std::wstring(profile.data(), length < profile.size() ? length : 0) + L"\\.grok\\auth.json";
-        if (ok && GetFileAttributesW(auth.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (ok && GrokSignedIn().empty()) {
             PostSetup(hwnd, SetupEvent{100, true, false, false, false, true, {}});
             const CliResult run = RunCli(L"\"" + FindGrokExe() + L"\" login --oauth", PickProxy(), 300, cancel);
-            if (run.cancelled || run.timedOut || !run.started || run.exitCode != 0) {
+            if (run.cancelled) {
+                ok = false;
+                error = "Cancelled";
+            } else if (run.timedOut || !run.started || run.exitCode != 0) {
                 ok = false;
                 error = run.timedOut ? "Не дождался входа в Grok"
                                      : (run.output.size() > 300 ? run.output.substr(run.output.size() - 300) : run.output);
                 if (error.empty()) {
                     error = "Вход в Grok не удался (код " + std::to_string(run.exitCode) + ")";
                 }
+            } else if (GrokSignedIn().empty()) {
+                ok = false;
+                error = "Grok не сохранил вход";
             }
         }
         PostSetup(hwnd, SetupEvent{100, false, true, ok, false, true, std::move(error)});
@@ -5923,21 +6039,32 @@ void ChatWindow::OnSetupEvent(const SetupEvent& event) {
     if (event.grok) {
         if (!event.finished) {
             if (event.installing) {
-                Flash(L"Grok скачан. Войдите в аккаунт x.ai в открывшемся браузере", 300000);
+                links_[kGrokLink].note = L"Жду вход в браузере";
+                if (!ConnectShown()) {
+                    Flash(L"Grok скачан. Войдите в аккаунт x.ai в открывшемся браузере", 300000);
+                }
             } else if (event.percent != setupPercent_) {
                 setupPercent_ = event.percent;
-                Flash(L"Скачиваю Grok… " + std::to_wstring(event.percent) + L"%", 60000);
+                links_[kGrokLink].note = L"Загружаю… " + std::to_wstring(event.percent) + L"%";
+                if (!ConnectShown()) {
+                    Flash(L"Скачиваю Grok… " + std::to_wstring(event.percent) + L"%", 60000);
+                }
             }
+            Refresh();
             return;
         }
         setupBusy_ = false;
-        if (event.ok) {
-            Flash(L"Grok установлен", 5000);
-            StartClaude();
+        if (!ConnectShown()) {
+            Flash(event.ok ? std::wstring(L"Grok подключён") : std::wstring(), event.ok ? 5000 : 1);
+        }
+        const std::wstring why = event.error == "Cancelled" ? std::wstring(L"Отменено.") : ToWide(event.error);
+        if (connectRow_ == kGrokLink) {
+            FinishLink(kGrokLink, event.ok, event.ok ? GrokLink().who : why);
         } else {
-            Flash(L"", 1);
-            Add(Kind::Error, L"Grok не установился: " +
-                                 (event.error == "Cancelled" ? std::wstring(L"отменено.") : ToWide(event.error)));
+            links_[kGrokLink] = GrokLink();
+        }
+        if (event.ok && GrokSelected() && !running_) {
+            StartClaude();  // the chat waited for it
         }
         Refresh();
         return;
@@ -5955,10 +6082,15 @@ void ChatWindow::OnSetupEvent(const SetupEvent& event) {
         claudeMissing_ = FindClaudeExe().empty();
         CheckClaudeVersions();
         RefreshAuth();
-        StartClaude();
+        if (!running_) {  // a Grok chat that runs meanwhile goes on
+            StartClaude();
+        }
         Flash(event.update ? L"Claude обновлён" : L"Claude установлен", 5000);
     } else {
         setupNote_ = event.error == "Cancelled" ? std::wstring(L"Отменено.") : ToWide(event.error);
+        if (!event.update && connectRow_ == kClaudeLink) {
+            FinishLink(kClaudeLink, false, setupNote_);
+        }
         if (event.update) {  // the old CLI is still there: back to work with it
             Flash(L"Не удалось обновить Claude: " + setupNote_, 8000);
             StartClaude();
@@ -5994,54 +6126,417 @@ void ChatWindow::OnClaudeVersions(const ClaudeVersions& versions) {
     Refresh();
 }
 
-// In place of the greeting while claude.exe is missing: what it is, and the button that fetches it.
-void ChatWindow::PaintInstall(const Geometry& g) {
-    const float middle = (g.feed.top + g.feed.bottom) / 2;
-    Text(L"Нужен Claude", greeting_.get(), D2D1::RectF(g.left, middle - 40, g.left + g.column, middle), kPrimary);
-    std::wstring hint = L"Клиенту нужна программа claude.exe. Скачаю её с downloads.claude.ai и проверю контрольную сумму.";
-    if (setupBusy_) {
-        hint = setupInstalling_ ? std::wstring(L"Устанавливаю…") : L"Загружаю… " + std::to_wstring(setupPercent_) + L"%";
+// ---- The connect screen ----------------------------------------------------------------------------------
+
+namespace {
+
+constexpr const wchar_t* kLinkNames[] = {L"Claude", L"Grok", L"GitHub"};
+constexpr const wchar_t* kLinkHints[] = {L"Подписка Pro или Max", L"Аккаунт x.ai",
+                                         L"Репозитории в проекты, сохранение памяти"};
+
+}  // namespace
+
+bool ChatWindow::LinksDone() const {
+    return std::ranges::all_of(links_, [](const AccountLink& link) { return link.state == LinkState::Done; });
+}
+
+ChatWindow::AccountLink ChatWindow::ClaudeLink() const {
+    if (FindClaudeExe().empty()) {
+        return {LinkState::Missing, {}, L"Не установлен: скачаю с downloads.claude.ai"};
     }
-    Text(hint, notice_.get(), D2D1::RectF(g.left, middle + 2, g.left + g.column, middle + 24), kSecondary);
-    const bool onMain = hover_.target == Target::InstallClaude || hover_.target == Target::CancelInstall;
-    if (setupBusy_) {
-        Fill(g.signIn, 9.f, onMain ? kLine : kRaised);
-        Text(L"Отмена", button_.get(), g.signIn, kPrimary);
-    } else {
-        Fill(g.signIn, 9.f, kAccent, onMain ? 0.85f : 1.f);
-        Text(L"Установить", button_.get(), g.signIn, kPrimary);
+    if (!auth_.known) {  // not answered yet; or `auth status` had no answer, which is not held against the chat
+        return authWorking_ ? AccountLink{} : AccountLink{LinkState::Done, {}, L"Вход не удалось проверить"};
     }
-    if (!setupNote_.empty()) {
-        Text(setupNote_, notice_.get(), D2D1::RectF(g.left, g.signIn.bottom + 12, g.left + g.column, g.signIn.bottom + 52),
-             kDanger);
+    if (!auth_.loggedIn) {
+        return {LinkState::Missing, {}, {}};
+    }
+    return {LinkState::Done, ToWide(auth_.email), {}};
+}
+
+ChatWindow::AccountLink ChatWindow::GrokLink() const {
+    if (FindGrokExe().empty()) {
+        return {LinkState::Missing, {}, L"Не установлен: скачаю с x.ai"};
+    }
+    const std::string email = GrokSignedIn();
+    if (email.empty()) {
+        return {LinkState::Missing, {}, {}};
+    }
+    return {LinkState::Done, email == "-" ? std::wstring() : ToWide(email), {}};
+}
+
+// What is signed in already: Claude's comes with RefreshAuth's answer, Grok's file is read here, GitHub's token is
+// asked of its API on a thread.
+void ChatWindow::CheckLinks() {
+    if (connectRow_ != kNoLink) {
+        return;
+    }
+    if (!authWorking_) {
+        links_[kClaudeLink] = ClaudeLink();
+    }
+    links_[kGrokLink] = GrokLink();
+    if (githubBusy_) {
+        return;
+    }
+    const std::string token = secrets_.Get("GITHUB").value_or("");
+    if (token.empty()) {
+        links_[kGithubLink] = {LinkState::Missing, {}, {}};
+        LinksChecked();
+        return;
+    }
+    links_[kGithubLink] = {};
+    if (githubThread_.joinable()) {
+        githubThread_.join();
+    }
+    githubBusy_ = true;
+    const HWND hwnd = hwnd_;
+    githubThread_ = std::thread([hwnd, token] {
+        GithubLogin who = WhoIsGithub(token);
+        auto done = std::make_unique<GithubDone>();
+        done->check = true;
+        done->rejected = who.rejected;
+        done->result.login = std::move(who.login);
+        done->result.error = std::move(who.error);
+        if (PostMessageW(hwnd, kGithubDone, 0, reinterpret_cast<LPARAM>(done.get()))) {
+            done.release();
+        }
+    });
+}
+
+// Once every row has been checked after the start, the screen comes up by itself: always when the chat's own agent
+// is missing, and until "Позже" when anything is.
+void ChatWindow::LinksChecked() {
+    if (linksSettled_ ||
+        std::ranges::any_of(links_, [](const AccountLink& link) { return link.state == LinkState::Checking; })) {
+        return;
+    }
+    linksSettled_ = true;
+    const bool agentMissing = links_[GrokSelected() ? kGrokLink : kClaudeLink].state != LinkState::Done;
+    if (agentMissing || (!settings_.connectLater && !LinksDone())) {
+        connectOpen_ = true;
+        Refresh();
     }
 }
 
-// In place of the greeting while nobody is signed in: what to do, and the sign-in button.
-void ChatWindow::PaintSignIn(const Geometry& g) {
-    const float middle = (g.feed.top + g.feed.bottom) / 2;
-    Text(L"Войдите в аккаунт Claude", greeting_.get(), D2D1::RectF(g.left, middle - 40, g.left + g.column, middle),
-         kPrimary);
-    const std::wstring hint = loginWaiting_ ? L"Откройте страницу входа в браузере и подтвердите вход."
-                                            : L"Нужна подписка Claude (Pro или Max): без входа чат не отвечает.";
-    Text(hint, notice_.get(), D2D1::RectF(g.left, middle + 2, g.left + g.column, middle + 24), kSecondary);
-
-    const bool onMain = hover_.target == Target::SignIn || hover_.target == Target::CancelLogin;
-    if (loginWaiting_) {
-        Fill(g.signIn, 9.f, onMain ? kLine : kRaised);
-        Text(L"Отмена", button_.get(), g.signIn, kPrimary);
-        if (!loginUrl_.empty()) {
-            const bool onAlt = hover_.target == Target::CopyLoginUrl;
-            Fill(g.signAlt, 9.f, onAlt ? kLine : kRaised);
-            Text(L"Копировать ссылку", button_.get(), g.signAlt, kPrimary);
-        }
-    } else {
-        Fill(g.signIn, 9.f, kAccent, onMain ? 0.85f : 1.f);
-        Text(authWorking_ ? L"Проверяю…" : L"Войти", button_.get(), g.signIn, kPrimary);
+// From the account menu: over an empty chat, a new one if this one has a conversation.
+void ChatWindow::OpenConnect() {
+    if (HasConversation()) {
+        NewChat();
     }
-    if (!authNote_.empty()) {
-        const float top = (loginWaiting_ && !loginUrl_.empty() ? g.signAlt.bottom : g.signIn.bottom) + 12;
-        Text(authNote_, notice_.get(), D2D1::RectF(g.left, top, g.left + g.column, top + 40), kDanger);
+    connectOpen_ = true;
+    CheckLinks();
+    Refresh();
+}
+
+// One row after another, the missing and the failed ones; a failure does not stop the rest.
+void ChatWindow::ConnectAll() {
+    if (connectRow_ != kNoLink) {
+        return;
+    }
+    chain_.clear();
+    for (size_t i = 0; i < links_.size(); ++i) {
+        if (links_[i].state == LinkState::Missing || links_[i].state == LinkState::Failed) {
+            chain_.push_back(i);
+        }
+    }
+    NextLink();
+}
+
+void ChatWindow::Connect(size_t row) {
+    if (connectRow_ != kNoLink || row >= links_.size()) {
+        return;
+    }
+    if (row != kGithubLink && setupBusy_) {  // Claude's update, say: the installer does one thing at a time
+        links_[row] = {LinkState::Failed, {}, L"Идёт другая установка: повторите, когда она кончится"};
+        NextLink();
+        return;
+    }
+    connectRow_ = row;
+    linkCancelled_ = false;
+    links_[row] = {LinkState::Working, {}, {}};
+    SetTimer(hwnd_, kConnectTimer, kConnectFrame, nullptr);
+    switch (row) {
+    case kClaudeLink:
+        claudeLoginTried_ = false;
+        if (FindClaudeExe().empty()) {
+            InstallClaudeCli();  // then RefreshAuth, whose answer goes on in StepClaude
+        } else if (authWorking_) {
+            RefreshAuth();  // asked again once the call that runs now ends
+        } else {
+            StepClaude();
+        }
+        break;
+    case kGrokLink:
+        InstallGrokCli();  // fetched if missing, then `grok login --oauth` if nobody is signed in
+        break;
+    default:
+        ConnectGithub();
+        break;
+    }
+    Refresh();
+}
+
+// GitHub's OAuth app, in the browser as well: no code to type, no Git Credential Manager. The token goes to the
+// GITHUB secret, where the repositories' list and the memory's push take it from.
+void ChatWindow::ConnectGithub() {
+    GithubApp app = BuiltGithubApp();
+    const std::optional<std::string> id = secrets_.Get("GITHUB_OAUTH_ID");
+    const std::optional<std::string> secret = secrets_.Get("GITHUB_OAUTH_SECRET");
+    if (id && secret && !id->empty() && !secret->empty()) {  // a build without its own app, or another app
+        app = {*id, *secret};
+    }
+    if (githubThread_.joinable()) {
+        githubThread_.join();
+    }
+    githubBusy_ = true;
+    githubCancel_ = false;
+    links_[kGithubLink].note = L"Жду вход в браузере";
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &githubCancel_;
+    githubThread_ = std::thread([hwnd, app, cancel] {
+        auto done = std::make_unique<GithubDone>();
+        done->result = SignInGithub(app, *cancel);
+        if (PostMessageW(hwnd, kGithubDone, 0, reinterpret_cast<LPARAM>(done.get()))) {
+            done.release();
+        }
+    });
+}
+
+// "Отмена": the row at work stops (its thread reports back), the rest of the chain is dropped.
+void ChatWindow::CancelConnect() {
+    chain_.clear();
+    linkCancelled_ = true;
+    switch (connectRow_) {
+    case kClaudeLink:
+        setupCancel_ = true;
+        authCancel_ = true;
+        break;
+    case kGrokLink:
+        setupCancel_ = true;
+        break;
+    case kGithubLink:
+        githubCancel_ = true;
+        break;
+    default:
+        break;
+    }
+    Refresh();
+}
+
+// The Claude row's next step, each time the account's state comes back while it is at work: signed in, done; not
+// yet, `auth login` in the browser; still not after it, failed.
+void ChatWindow::StepClaude() {
+    if (auth_.known && auth_.loggedIn) {
+        FinishLink(kClaudeLink, true, ToWide(auth_.email));
+        return;
+    }
+    if (linkCancelled_ || claudeLoginTried_) {
+        FinishLink(kClaudeLink, false, authNote_.empty() ? std::wstring(L"Вход не сохранился") : authNote_);
+        return;
+    }
+    claudeLoginTried_ = true;
+    SignIn();
+    if (!loginWaiting_) {
+        FinishLink(kClaudeLink, false, authNote_);
+    }
+}
+
+// A row has ended: in (text: the account) or not (text: why); a cancelled one is just missing again. Then the next
+// row of "Войти во все".
+void ChatWindow::FinishLink(size_t row, bool ok, std::wstring text) {
+    AccountLink& link = links_[row];
+    if (ok) {
+        link = {LinkState::Done, std::move(text), {}};
+    } else if (linkCancelled_) {
+        link = {LinkState::Missing, {}, {}};
+    } else {
+        link = {LinkState::Failed, {}, text.empty() ? std::wstring(L"Не получилось") : std::move(text)};
+        if (!ConnectShown()) {
+            Add(Kind::Error, std::wstring(kLinkNames[row]) + L" не подключился: " + link.note);
+        }
+    }
+    if (connectRow_ == row) {
+        connectRow_ = kNoLink;
+        NextLink();
+    }
+    Refresh();
+}
+
+void ChatWindow::NextLink() {
+    while (!chain_.empty()) {
+        const size_t row = chain_.front();
+        chain_.pop_front();
+        if (links_[row].state != LinkState::Done) {
+            Connect(row);
+            return;
+        }
+    }
+    linkCancelled_ = false;
+    if (connectOpen_ && LinksDone()) {  // all in: on to the chat, and the taskbar says so if the browser is in front
+        connectOpen_ = false;
+        Flash(L"Всё подключено: Claude, Grok и GitHub", 5000);
+        FLASHWINFO flash{sizeof(flash), hwnd_, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+        FlashWindowEx(&flash);
+    }
+}
+
+void ChatWindow::OnGithubDone(const GithubDone& done) {
+    githubBusy_ = false;
+    const GithubSignIn& result = done.result;
+    if (done.check) {
+        if (done.rejected) {
+            links_[kGithubLink] = {LinkState::Missing, {}, L"Сохранённый токен больше не действует"};
+        } else if (!result.login.empty()) {
+            links_[kGithubLink] = {LinkState::Done, ToWide(result.login), {}};
+        } else {  // no answer: the token is kept, it may well work
+            links_[kGithubLink] = {LinkState::Done, {}, L"Не удалось проверить: " + ToWide(result.error)};
+        }
+        LinksChecked();
+        Refresh();
+        return;
+    }
+    if (result.token.empty()) {
+        FinishLink(kGithubLink, false, ToWide(result.error));
+        return;
+    }
+    secrets_.Set("GITHUB", result.token);
+    if (!secrets_.Save()) {
+        FinishLink(kGithubLink, false, L"Токен получен, но секреты не сохранились");
+        return;
+    }
+    FinishLink(kGithubLink, true, ToWide(result.login));
+    LoadRepos();
+}
+
+// A title, a row per account (its mark, its name, who it is or what goes on, its button or its state at the right),
+// "Войти во все" under them, and "Позже".
+void ChatWindow::PaintConnect(const Geometry& g) {
+    const float top = g.links[0].top;
+    Text(L"Подключения", greeting_.get(), D2D1::RectF(g.left, top - 66, g.left + g.column, top - 36), kPrimary);
+    Text(L"По очереди, в вашем браузере: там, где вы уже вошли в Google", notice_.get(),
+         D2D1::RectF(g.left, top - 32, g.left + g.column, top - 12), kSecondary);
+    const float turn = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count() % 900) / 900.f;
+    const auto spinner = [&](D2D1_POINT_2F c, uint32_t color) {
+        D2D1_MATRIX_3X2_F before{};
+        target_->GetTransform(&before);
+        target_->SetTransform(D2D1::Matrix3x2F::Rotation(turn * 360.f, c) * before);
+        Ring(c, 8.f, 0.3f, color);
+        target_->SetTransform(before);
+    };
+    for (size_t i = 0; i < links_.size(); ++i) {
+        const AccountLink& link = links_[i];
+        const D2D1_RECT_F& row = g.links[i];
+        const D2D1_RECT_F& button = g.linkButtons[i];
+        const bool working = i == connectRow_;
+        const bool failed = link.state == LinkState::Failed;
+        Fill(row, 10.f, kRaised);
+        if (working || failed) {  // the row at work has an accent edge, a failed one a red one
+            brush_->SetColor(Color(failed ? kDanger : kAccent, failed ? 0.85f : 0.6f));
+            target_->DrawRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(row.left + 0.5f, row.top + 0.5f, row.right - 0.5f, row.bottom - 0.5f),
+                                  10.f, 10.f),
+                brush_.get(), 1.f);
+        }
+        const float middle = (row.top + row.bottom) / 2;
+        if (i == kGithubLink) {
+            GithubIcon({row.left + 28.f, middle}, kPrimary, 20.f);
+        } else {
+            AgentIcon({row.left + 28.f, middle}, 11.f, i == kGrokLink, kRaised);
+        }
+        const float textLeft = row.left + 54.f;
+        float textRight = button.left - 10.f;
+
+        std::wstring status;
+        uint32_t statusColor = kSecondary;
+        switch (link.state) {
+        case LinkState::Checking:
+            status = L"Проверяю…";
+            break;
+        case LinkState::Missing:
+            status = link.note.empty() ? kLinkHints[i] : link.note;
+            break;
+        case LinkState::Working:
+            if (i == kClaudeLink) {
+                status = setupBusy_ ? (setupInstalling_ ? std::wstring(L"Устанавливаю…")
+                                                        : L"Загружаю… " + std::to_wstring(setupPercent_) + L"%")
+                                    : loginWaiting_ ? L"Жду вход в браузере" : L"Проверяю…";
+            } else {
+                status = link.note.empty() ? std::wstring(L"Проверяю…") : link.note;
+            }
+            if (linkCancelled_) {
+                status = L"Отменяю…";
+            }
+            break;
+        case LinkState::Done:
+            status = !link.who.empty() ? link.who : link.note.empty() ? std::wstring(L"Подключён") : link.note;
+            break;
+        case LinkState::Failed:
+            status = link.note;
+            statusColor = kDanger;
+            break;
+        }
+
+        // At the right: the row's button while it can be pressed, its arc while it works, a check once it is in.
+        const bool onButton = hover_.row == i &&
+                              (hover_.target == Target::ConnectRow || hover_.target == Target::ConnectLink);
+        if (working) {
+            if (i == kClaudeLink && loginWaiting_ && !loginUrl_.empty()) {
+                Fill(button, 8.f, onButton ? kLine : kWindow);
+                Text(L"Ссылка", button_.get(), button, kPrimary);
+                spinner({button.left - 18.f, middle}, kAccent);
+                textRight = button.left - 32.f;
+            } else {
+                spinner({button.right - 14.f, middle}, kAccent);
+            }
+        } else if (link.state == LinkState::Checking) {
+            spinner({button.right - 14.f, middle}, kSecondary);
+        } else if (link.state == LinkState::Done) {
+            Check({button.right - 14.f, middle}, link.who.empty() && !link.note.empty() ? kSecondary : kAccent);
+        } else {
+            const bool free = connectRow_ == kNoLink;
+            Fill(button, 8.f, onButton ? kAccent : kLine, free ? (onButton ? 0.85f : 1.f) : 0.45f);
+            Text(failed ? L"Повторить" : L"Войти", button_.get(), button, free ? kPrimary : kSecondary);
+        }
+
+        Text(kLinkNames[i], uiBold_.get(), D2D1::RectF(textLeft, row.top + 11, textRight, row.top + 29), kPrimary);
+        const float room = textRight - textLeft;  // the status on one line: a long one is cut, its tooltip has it whole
+        status = status.substr(0, status.find(L'\n'));
+        if (TextWidth(status, ui_.get()) > room) {
+            while (!status.empty() && TextWidth(status + L"…", ui_.get()) > room) {
+                status.pop_back();
+            }
+            status += L"…";
+        }
+        Text(status, ui_.get(), D2D1::RectF(textLeft, row.top + 31, textRight, row.bottom - 7), statusColor);
+    }
+
+    // The main button: all the missing ones, or the one; "Отмена" while a row works.
+    const size_t missing = static_cast<size_t>(std::ranges::count_if(links_, [](const AccountLink& link) {
+        return link.state == LinkState::Missing || link.state == LinkState::Failed;
+    }));
+    const bool checking =
+        std::ranges::any_of(links_, [](const AccountLink& link) { return link.state == LinkState::Checking; });
+    const bool onMain = hover_.target == Target::ConnectAll || hover_.target == Target::ConnectCancel;
+    if (connectRow_ != kNoLink) {
+        Fill(g.connectAll, 9.f, onMain ? kLine : kRaised);
+        Text(linkCancelled_ ? L"Отменяю…" : L"Отмена", button_.get(), g.connectAll, kPrimary);
+    } else if (LinksDone()) {
+        Text(L"Всё подключено", notice_.get(), g.connectAll, kSecondary);
+    } else {
+        std::wstring label = L"Войти во все";
+        if (missing == 1) {
+            const auto one = std::ranges::find_if(links_, [](const AccountLink& link) {
+                return link.state == LinkState::Missing || link.state == LinkState::Failed;
+            });
+            label = L"Подключить " + std::wstring(kLinkNames[one - links_.begin()]);
+        }
+        Fill(g.connectAll, 9.f, kAccent, checking ? 0.45f : onMain ? 0.85f : 1.f);
+        Text(checking ? std::wstring(L"Проверяю…") : label, button_.get(), g.connectAll, kPrimary);
+    }
+    if (connectRow_ == kNoLink) {
+        Text(LinksDone() ? L"Закрыть" : L"Позже", notice_.get(), g.connectLater,
+             hover_.target == Target::ConnectLater ? kPrimary : kSecondary);
     }
 }
 
@@ -8894,7 +9389,14 @@ std::wstring ChatWindow::TooltipText() {
         return L"Поиск (Ctrl+H): стрелки, Enter, влево свернуть. Alt+↑↓ чаты, Alt+←→ проекты";
     case Target::Account:
         return ClaudeUpdateAvailable() ? L"Аккаунт · вышел Claude " + ToWide(claudeLatest_)
-                                       : std::wstring(L"Аккаунт, версия Claude, выход");
+                                       : std::wstring(L"Аккаунт, подключения, версия Claude, выход");
+    case Target::ConnectRow:  // a failure in full: the row has room for its start only
+        return hover_.row < links_.size() && links_[hover_.row].state == LinkState::Failed ? links_[hover_.row].note
+                                                                                            : std::wstring();
+    case Target::ConnectLink:
+        return L"Скопировать ссылку на вход: если браузер не открылся или открылся не тот";
+    case Target::ConnectAll:
+        return L"Claude, Grok и GitHub по очереди, в браузере по умолчанию; уже подключённые пропускаются";
     case Target::TermAdd:
         return L"Новый терминал";
     case Target::TermTabClose:
@@ -9194,6 +9696,11 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.send;
     case Target::Account:
         return g.account;
+    case Target::ConnectRow:
+    case Target::ConnectLink:
+        return row < g.linkButtons.size() ? g.links[row] : D2D1_RECT_F{};
+    case Target::ConnectAll:
+        return g.connectAll;
     case Target::TermAdd:
         return g.termAdd;
     case Target::PreviewWide:
@@ -10281,8 +10788,16 @@ bool ChatWindow::StartClaude() {
     const bool grok = GrokSelected();
     options.exe = grok ? FindGrokExe() : FindClaudeExe();
     claudeMissing_ = !grok && options.exe.empty();
-    if (grok && options.exe.empty()) {
-        InstallGrokCli();  // its own Flash tells how far it is; once in place it starts the chat
+    if (options.exe.empty() && !HasConversation()) {  // the connect screen offers to fetch it
+        connectOpen_ = true;
+        if (connectRow_ == kNoLink) {
+            links_[grok ? kGrokLink : kClaudeLink] = grok ? GrokLink() : ClaudeLink();
+        }
+        Refresh();
+        return false;
+    }
+    if (grok && options.exe.empty()) {  // chosen in a conversation: fetched at once, its Flash tells how far it is
+        Connect(kGrokLink);
         return false;
     }
     if (options.exe.empty()) {
@@ -10565,7 +11080,10 @@ void ChatWindow::Submit() {
         return;
     }
     if (SignedOut()) {
-        Flash(L"Сначала войдите в аккаунт", 3000);
+        Flash(L"Сначала войдите в Claude", 3000);
+        if (!HasConversation()) {
+            connectOpen_ = true;
+        }
         return;
     }
     if (!running_ && !StartClaude()) {
@@ -11003,6 +11521,16 @@ void ChatWindow::Add(Kind kind, std::wstring text, bool leading) {
 }
 
 void ChatWindow::FillGallery() {
+    if (galleryConnect_) {
+        links_[kClaudeLink] = {LinkState::Done, L"someone@gmail.com", {}};
+        links_[kGrokLink] = {LinkState::Working, {}, L"Жду вход в браузере"};
+        links_[kGithubLink] = {LinkState::Failed, {},
+                               L"GitHub refused the sign-in: access_denied — The user has denied your application access, "
+                               L"а это длинный хвост, который в строку не влезет"};
+        connectRow_ = kGrokLink;
+        connectOpen_ = true;
+        return;
+    }
     const std::wstring longPath =
         L"C:\\Users\\user\\.claude\\projects\\C--Users-user-AppData-Roaming-ssh-desktop-app-claude-workspace\\memory\\project_aicontrols.md";
     const std::wstring longWord = L"Сверхдлинноеслововбезединогопробеладлятогочтобыпроверитьпереносстрокивузкойколонкеиобрезку";

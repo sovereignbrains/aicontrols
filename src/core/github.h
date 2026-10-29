@@ -15,6 +15,35 @@ struct GithubRepo {
     bool isPrivate = false;
 };
 
+// The OAuth App AIControls signs in to GitHub as. For a native app its secret is no secret (RFC 8252: anyone can
+// read it out of the exe); what keeps a token safe is the loopback redirect and PKCE.
+struct GithubApp {
+    std::string clientId;
+    std::string clientSecret;
+};
+// The one built in (empty when the build had no GITHUB_OAUTH_ID and GITHUB_OAUTH_SECRET).
+GithubApp BuiltGithubApp();
+
+// Whose the token is. `rejected`: GitHub said 401 (or there is no token), so it has to be had again; an error
+// without it is the network, and says nothing about the token.
+struct GithubLogin {
+    std::string login;
+    std::string error;
+    bool rejected = false;
+};
+GithubLogin WhoIsGithub(const std::string& token);
+
+// GitHub's sign-in in the user's browser (the web flow to 127.0.0.1, PKCE): a token for the repositories and
+// their workflows, and whose it is. Waits for the browser up to 3 minutes; `token` empty with `error` set when
+// it did not come (`cancelled` when `cancel` ended it).
+struct GithubSignIn {
+    std::string token;
+    std::string login;
+    std::string error;
+    bool cancelled = false;
+};
+GithubSignIn SignInGithub(const GithubApp& app, const std::atomic<bool>& cancel);
+
 // The repositories the token can reach, the most recently pushed first (GitHub's REST API, up to 300).
 // On failure the list is empty and `error` says why.
 std::vector<GithubRepo> ListGithubRepos(const std::string& token, std::string& error);

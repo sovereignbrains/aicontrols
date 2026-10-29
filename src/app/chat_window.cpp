@@ -1419,6 +1419,7 @@ private:
     wil::unique_hbrush fieldBrush_;
 
     wil::com_ptr<ID2D1Factory> d2d_;
+wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when first drawn
     wil::com_ptr<IDWriteFactory> dwrite_;
     wil::com_ptr<IWICImagingFactory> wic_;
     wil::com_ptr<IDWriteFontCollection> fonts_;
@@ -3531,6 +3532,114 @@ void ChatWindow::Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float wi
     target_->DrawLine(a, b, brush_.get(), width, round_.get());
 }
 
+// GitHub's mark (Octicons' mark-github, 16 by 16), parsed from its path data: M, C, c, s, l, h, v, A and z are all it uses.
+static wil::com_ptr<ID2D1PathGeometry> GithubMark(ID2D1Factory* factory) {
+    static constexpr const char* kPath =
+        "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94"
+        "-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07"
+        "-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27"
+        ".68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95"
+        ".29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z";
+    wil::com_ptr<ID2D1PathGeometry> geometry;
+    wil::com_ptr<ID2D1GeometrySink> sink;
+    if (FAILED(factory->CreatePathGeometry(geometry.put())) || FAILED(geometry->Open(sink.put()))) {
+        return {};
+    }
+    const char* p = kPath;
+    const auto number = [&p]() {
+        while (*p == ' ' || *p == ',') {
+            ++p;
+        }
+        const char* start = p;
+        if (*p == '-') {
+            ++p;
+        }
+        while (*p >= '0' && *p <= '9') {
+            ++p;
+        }
+        if (*p == '.') {
+            ++p;
+            while (*p >= '0' && *p <= '9') {
+                ++p;
+            }
+        }
+        return std::strtof(start, nullptr);
+    };
+    const auto more = [&p]() {
+        while (*p == ' ' || *p == ',') {
+            ++p;
+        }
+        return *p == '-' || *p == '.' || (*p >= '0' && *p <= '9');
+    };
+    D2D1_POINT_2F at{}, start{};
+    bool open = false;
+    char cmd = 0;
+    while (*p != 0) {
+        while (*p == ' ') {
+            ++p;
+        }
+        if (*p == 0) {
+            break;
+        }
+        if (std::isalpha(static_cast<unsigned char>(*p))) {
+            cmd = *p++;
+        }
+        const bool rel = cmd >= 'a';
+        const float ox = rel ? at.x : 0.f, oy = rel ? at.y : 0.f;
+        switch (cmd) {
+        case 'M': {
+            const float x = number(), y = number();
+            at = start = {x, y};
+            sink->BeginFigure(at, D2D1_FIGURE_BEGIN_FILLED);
+            open = true;
+            cmd = 'L';
+            break;
+        }
+        case 'C':
+        case 'c': {
+            do {
+                const D2D1_POINT_2F a{ox + number(), oy + number()};
+                const D2D1_POINT_2F b{ox + number(), oy + number()};
+                const D2D1_POINT_2F e{ox + number(), oy + number()};
+                sink->AddBezier(D2D1::BezierSegment(a, b, e));
+                at = e;
+                if (rel) {
+                    break;  // the offsets are from the segment's start: one at a time
+                }
+            } while (more());
+            break;
+        }
+        case 'L':
+        case 'l': {
+            at = {ox + number(), oy + number()};
+            sink->AddLine(at);
+            break;
+        }
+        case 'A': {
+            const float rx = number(), ry = number(), rot = number();
+            const bool large = number() != 0.f, sweep = number() != 0.f;
+            at = {number(), number()};
+            sink->AddArc(D2D1::ArcSegment(at, D2D1::SizeF(rx, ry), rot,
+                                          sweep ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                                          large ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
+            break;
+        }
+        case 'Z':
+        case 'z':
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            open = false;
+            at = start;
+            break;
+        default:
+            return {};
+        }
+    }
+    if (open) {
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    }
+    return SUCCEEDED(sink->Close()) ? geometry : wil::com_ptr<ID2D1PathGeometry>();
+}
+
 // The agent's mark: Claude's twelve-spoke star, Grok's ring cut by a slash (`ground` is what the slash cuts with).
 void ChatWindow::AgentIcon(D2D1_POINT_2F c, float r, bool grok, uint32_t ground) {
     if (!grok) {
@@ -3552,17 +3661,24 @@ void ChatWindow::AgentIcon(D2D1_POINT_2F c, float r, bool grok, uint32_t ground)
 void ChatWindow::ProjectIcon(D2D1_POINT_2F c, bool general, uint32_t color) {
     brush_->SetColor(Color(color));
     if (general) {
-        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 6.f, c.y - 5.f, c.x + 6.f, c.y + 3.5f), 2.5f, 2.5f),
-                                      brush_.get(), 1.4f, round_.get());
-        Line({c.x - 2.5f, c.y + 3.5f}, {c.x - 3.5f, c.y + 6.f}, color, 1.4f);
-        Line({c.x - 3.5f, c.y + 6.f}, {c.x + 0.5f, c.y + 3.5f}, color, 1.4f);
+        target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 7.5f, c.y - 6.f, c.x + 7.5f, c.y + 4.f), 3.f, 3.f),
+                                      brush_.get(), 1.5f, round_.get());
+        Line({c.x - 3.f, c.y + 4.f}, {c.x - 4.5f, c.y + 7.f}, color, 1.5f);
+        Line({c.x - 4.5f, c.y + 7.f}, {c.x + 0.5f, c.y + 4.f}, color, 1.5f);
         return;
     }
-    target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 5.f, c.y - 6.f, c.x + 5.f, c.y + 6.f), 1.8f, 1.8f),
-                                  brush_.get(), 1.4f, round_.get());
-    Line({c.x - 5.f, c.y + 2.5f}, {c.x + 5.f, c.y + 2.5f}, color, 1.4f);
-    Line({c.x - 2.f, c.y + 6.f}, {c.x - 2.f, c.y + 2.5f}, color, 1.4f);
-    Line({c.x - 2.f, c.y + 6.f}, {c.x, c.y + 4.5f}, color, 1.4f);
+    if (!githubMark_) {
+        githubMark_ = GithubMark(d2d_.get());
+    }
+    if (githubMark_) {
+        constexpr float kSize = 13.f;
+        D2D1_MATRIX_3X2_F before{};
+        target_->GetTransform(&before);
+        target_->SetTransform(D2D1::Matrix3x2F::Scale(kSize / 16.f, kSize / 16.f) *
+                              D2D1::Matrix3x2F::Translation(c.x - kSize / 2, c.y - kSize / 2) * before);
+        target_->FillGeometry(githubMark_.get(), brush_.get());
+        target_->SetTransform(before);
+    }
 }
 
 void ChatWindow::Check(D2D1_POINT_2F c, uint32_t color) {
@@ -3826,6 +3942,18 @@ void ChatWindow::Paint() {
     target_->BeginDraw();
     target_->Clear(Color(kWindow));
     PaintFeed(g);
+    if (scroll_ > 0.f) {  // what scrolls up under the header melts into it, not cut by a hard edge
+        const float fade = std::min(scroll_, 28.f);
+        const D2D1_GRADIENT_STOP stops[2] = {{0.f, Color(kWindow, 1.f)}, {1.f, Color(kWindow, 0.f)}};
+        wil::com_ptr<ID2D1GradientStopCollection> collection;
+        wil::com_ptr<ID2D1LinearGradientBrush> melt;
+        if (SUCCEEDED(target_->CreateGradientStopCollection(stops, 2, collection.put())) &&
+            SUCCEEDED(target_->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties({0.f, g.feed.top}, {0.f, g.feed.top + fade}), collection.get(),
+                melt.put()))) {
+            target_->FillRectangle(D2D1::RectF(g.areaLeft, g.feed.top, g.area, g.feed.top + fade), melt.get());
+        }
+    }
     PaintHeader(g);
     PaintWindowButtons(g);
     PaintInput(g);
@@ -6509,7 +6637,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 x = chat.left + 15.f;
                 target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 6.f, 6.f), brush_.get());
             }
-            AgentIcon({x, y}, 5.5f, grok, ground);
+            AgentIcon({x, y}, 5.f, grok, ground);
         };
         if (rows_[row].session == kHead) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new

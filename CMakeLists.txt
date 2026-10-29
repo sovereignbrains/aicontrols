@@ -91,7 +91,8 @@ endforeach()
 #   aic_store_probe   the titles of the real chats; --delete <id>
 #   aic_memory_probe  the memory folder committed and pushed (GITHUB in the environment)
 #   aic_bridge_probe  the CLIs' way out listening, for curl -x; --no-direct: as with the VPN off
-foreach(name e2e grok github store memory bridge)
+#   aic_signin_probe  the GitHub browser sign-in with the built-in app: prints the login, keeps no token
+foreach(name e2e grok github store memory bridge signin)
   add_executable(aic_${name}_probe tests/probes/${name}_probe.cpp)
   target_link_libraries(aic_${name}_probe PRIVATE aic_core)
 endforeach()

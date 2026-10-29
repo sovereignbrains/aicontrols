@@ -61,58 +61,67 @@ std::string ChatTime(const FILETIME& time) {
 
 std::optional<std::string> ChatMarkdown(const std::wstring& workspace, const std::string& id) {
     const std::vector<SessionInfo> sessions = ListSessions(workspace);
-    const auto session = std::ranges::find(sessions, id, &SessionInfo::id);
+    const auto session = std::ranges::find_if(sessions, [&](const SessionInfo& chat) { return SameChat(chat, id); });
     if (session == sessions.end()) {
         return std::nullopt;
     }
-    bool truncated = false;
-    const std::vector<TranscriptEntry> entries = LoadTranscript(workspace, id, SIZE_MAX, truncated);
-    const std::string agent = session->grok ? "Grok" : "Claude";
+    const bool both = std::ranges::any_of(session->parts, &SessionPart::grok) &&
+                      !std::ranges::all_of(session->parts, &SessionPart::grok);
     std::string out = "# " + ToUtf8(session->title.empty() ? L"Без названия" : session->title) + "\n\n";
-    out += std::format("{} · {} · `{}`\n", agent, ChatTime(session->modified), ToUtf8(workspace));
+    out += std::format("{} · {} · `{}`\n", both ? "Claude и Grok" : session->grok ? "Grok" : "Claude",
+                       ChatTime(session->modified), ToUtf8(workspace));
     std::optional<bool> heading;  // whose turn the last heading opened: the user's (true) or the agent's
-    for (const TranscriptEntry& entry : entries) {
-        const bool user = entry.kind == EntryKind::User;
-        if (entry.kind != EntryKind::Compacted && heading != user) {
-            out += "\n## " + (user ? std::string("Пользователь") : agent) + "\n";
-            heading = user;
-        }
-        switch (entry.kind) {
-        case EntryKind::User:
-        case EntryKind::Assistant:
-            if (!entry.text.empty()) {
-                out += "\n" + ToUtf8(entry.text) + "\n";
-            }
-            if (!entry.images.empty()) {
-                out += std::format("\n*[картинок: {}]*\n", entry.images.size());
-            }
-            break;
-        case EntryKind::Compacted:
-            out += "\n---\n\n*Чат сжат: дальше " + agent + " помнил начало по сводке.*\n";
+    for (const SessionPart& part : session->parts) {  // a chat in parts: each CLI's in turn
+        const std::string agent = part.grok ? "Grok" : "Claude";
+        if (&part != &session->parts.front()) {
+            out += "\n---\n\n*Дальше отвечал " + agent + ", с перепиской выше.*\n";
             heading.reset();
-            break;
-        case EntryKind::Tool: {
-            const std::string full = ToUtf8(entry.text);
-            const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
-            const Json input = Json::parse(entry.toolInput, nullptr, false);
-            const ToolSummary summary =
-                !own.empty() && input.is_object() ? SummarizeTool(own, input) : ToolSummary{entry.text, {}};
-            out += "\n<details><summary>🔧 " + ToUtf8(summary.title) + "</summary>\n\n";
-            if (!summary.detail.empty()) {
-                out += Fenced(ToUtf8(summary.detail));
-            }
-            std::string output = ToUtf8(entry.toolOutput);
-            if (GrokOwnTool(own)) {
-                if (const Json made = Json::parse(output, nullptr, false); !JsonStr(made, "path").empty()) {
-                    output = JsonStr(made, "path");  // the picture or video Grok saved
-                }
-            }
-            if (entry.toolAnswered && !output.empty()) {
-                out += std::string(entry.toolFailed ? "\nОшибка:\n\n" : "\nВывод:\n\n") + Fenced(Head(output));
-            }
-            out += "\n</details>\n";
-            break;
         }
+        bool truncated = false;
+        const std::vector<TranscriptEntry> entries = LoadTranscript(workspace, part.id, SIZE_MAX, truncated);
+        for (const TranscriptEntry& entry : entries) {
+            const bool user = entry.kind == EntryKind::User;
+            if (entry.kind != EntryKind::Compacted && heading != user) {
+                out += "\n## " + (user ? std::string("Пользователь") : agent) + "\n";
+                heading = user;
+            }
+            switch (entry.kind) {
+            case EntryKind::User:
+            case EntryKind::Assistant:
+                if (!entry.text.empty()) {
+                    out += "\n" + ToUtf8(entry.text) + "\n";
+                }
+                if (!entry.images.empty()) {
+                    out += std::format("\n*[картинок: {}]*\n", entry.images.size());
+                }
+                break;
+            case EntryKind::Compacted:
+                out += "\n---\n\n*Чат сжат: дальше " + agent + " помнил начало по сводке.*\n";
+                heading.reset();
+                break;
+            case EntryKind::Tool: {
+                const std::string full = ToUtf8(entry.text);
+                const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
+                const Json input = Json::parse(entry.toolInput, nullptr, false);
+                const ToolSummary summary =
+                    !own.empty() && input.is_object() ? SummarizeTool(own, input) : ToolSummary{entry.text, {}};
+                out += "\n<details><summary>🔧 " + ToUtf8(summary.title) + "</summary>\n\n";
+                if (!summary.detail.empty()) {
+                    out += Fenced(ToUtf8(summary.detail));
+                }
+                std::string output = ToUtf8(entry.toolOutput);
+                if (GrokOwnTool(own)) {
+                    if (const Json made = Json::parse(output, nullptr, false); !JsonStr(made, "path").empty()) {
+                        output = JsonStr(made, "path");  // the picture or video Grok saved
+                    }
+                }
+                if (entry.toolAnswered && !output.empty()) {
+                    out += std::string(entry.toolFailed ? "\nОшибка:\n\n" : "\nВывод:\n\n") + Fenced(Head(output));
+                }
+                out += "\n</details>\n";
+                break;
+            }
+            }
         }
     }
     return out;

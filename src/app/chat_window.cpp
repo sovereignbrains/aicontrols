@@ -29,6 +29,8 @@
 #include <format>
 #include <fstream>
 #include <ctime>
+#include <limits>
+#include <map>
 #include <memory>
 #include <numbers>
 #include <optional>
@@ -141,6 +143,20 @@ constexpr float kPuff = 0.18f;           // how much bigger at its fullest
 constexpr UINT_PTR kPanTimer = 9;
 constexpr UINT_PTR kParkedTimer = 10;  // a chat answers in the background: its dot in the sidebar breathes
 constexpr UINT kParkedFrame = 80;      // ms
+// The chats' list holds still under the pointer (29.10.2026, his: a chat went missing, the 4th time): what changes
+// meanwhile waits until it is let go, and then its rows slide to their new places, so a move can be followed.
+constexpr UINT_PTR kListTimer = 11;
+constexpr UINT kListCheck = 250;       // ms
+constexpr UINT_PTR kSlideTimer = 12;
+constexpr UINT kSlideFrame = 16;       // ms
+constexpr float kSlideTime = 220.f;    // ms
+// A chat deleted from the list keeps its row a while, "Вернуть" on it, instead of a question asked first.
+constexpr UINT_PTR kUndoTimer = 13;
+constexpr UINT kUndoTime = 8000;       // ms
+// The wheel over the feed glides, it does not jump: a notch moves where the feed is going, the feed eases there.
+constexpr UINT_PTR kGlideTimer = 14;
+constexpr UINT kGlideFrame = 10;       // ms; a step goes by the time that passed, not by the tick
+constexpr float kGlideTau = 36.f;      // ms: in this much the gap closes to about a third
 constexpr UINT kPanFrame = 16;           // ms
 constexpr float kPanStill = 10.f;
 constexpr ULONGLONG kPanHold = 300;      // ms
@@ -265,6 +281,8 @@ constexpr uint32_t kTitle = 0xc4c6cc;  // the chat's title in the header: quiete
 constexpr uint32_t kAccent = 0x4c92ff;
 constexpr uint32_t kDanger = 0xf06060;
 constexpr uint32_t kWaiting = 0xe8b04c;  // a chat in the background waits for the user's word
+constexpr uint32_t kClaudeDot = 0xd97757;  // who answers: in the feed above a reply, in the list before a chat
+constexpr uint32_t kGrokDot = 0xc8ccd4;
 
 constexpr COLORREF ToColorRef(uint32_t rgb) {
     return RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
@@ -510,6 +528,8 @@ enum class Target {
     HistoryRow,   // row: an index into the sidebar's rows: a chat
     ProjectRow,   // row: the same: a project's head (folds it or opens it)
     ProjectNew,   // row: the same: "+" on the head, a new chat in that project
+    ChatMore,     // row: the same: "⋯" on a chat under the pointer, its menu
+    SearchClear,  // "×" in the search while it filters the list
     AddProject,   // "+" beside the projects' label: a folder or a GitHub repository
     ProjectsLabel,  // the "projects" label: how that list is ordered
     ModelRow,     // row: an index into the models
@@ -851,6 +871,8 @@ private:
     void PaintHeader(const Geometry& g);
     void PaintWindowButtons(const Geometry& g);
     LRESULT HitTestFrame(LPARAM lParam);
+    bool FreeSpace(float x, float y) const;
+    bool BelowHeader(LPARAM screen, LPARAM* client) const;
     void PaintInput(const Geometry& g);
     void PaintPanel(const D2D1_RECT_F& rect);
     void PaintModels(const Geometry& g);
@@ -890,7 +912,10 @@ private:
     // Right-click menus, drawn in the app's style (popup_menu.h); TrackPopupMenu's contract.
     int Menu(HMENU menu, POINT screen, bool above = false) {
         HideTip();
-        return ShowMenu(hwnd_, menu, screen, above, {d2d_.get(), dwrite_.get(), ui_.get(), Dpi()});
+        ++menusOpen_;  // the list holds still under it
+        const int chosen = ShowMenu(hwnd_, menu, screen, above, {d2d_.get(), dwrite_.get(), ui_.get(), Dpi()});
+        --menusOpen_;
+        return chosen;
     }
     void ShowTabMenu(size_t index, POINT screen);
     void ShowSecretMenu(size_t index, POINT screen);
@@ -1053,10 +1078,21 @@ private:
         size_t session = kHead;
     };
     void RebuildRows();  // the rows again (the open chat changed), where the list was scrolled
+    void ListChanged();  // in the background: the list again now, or once the pointer lets it go
+    bool ListHeld() const;
+    std::wstring RowKey(size_t row) const;  // the same row before and after the list is built again
+    float RowSlide(size_t row) const;       // how far off its place it is still drawn
+    void DeleteChat(const std::wstring& folder, const SessionInfo& session);  // gone, back at "Вернуть" a while
+    void UndoDelete();
+    void FinishDelete();  // the deleted chat for good (its time is up, another goes, the window closes)
+    bool IsDoomed(const std::wstring& folder, const SessionInfo& session) const;
     void PaintSidebar(const Geometry& g);
     static size_t SidebarRows(const Geometry& g);
     D2D1_RECT_F SideRowRect(const Geometry& g, size_t row) const;  // empty when it is scrolled out of view
     static D2D1_RECT_F ProjectNewRect(const D2D1_RECT_F& head);
+    D2D1_RECT_F ChatMoreRect(size_t row, const D2D1_RECT_F& r) const;
+    static D2D1_RECT_F SearchClearRect(const Geometry& g);
+    static std::wstring ChatAgents(const SessionInfo& session);  // "Claude", "Claude, затем Grok"…
     const SessionInfo* RowSession(size_t row) const;
     const Project* RowProject(size_t row) const;
     std::optional<size_t> RevealChat(const std::wstring& folder, const std::string& id);  // its row, made visible
@@ -1114,6 +1150,9 @@ private:
     float FeedHeight() const;
     std::wstring StatusLine() const;
     void ScrollBy(float delta);
+    void MoveFeed(float to);
+    void GlideBy(float delta);
+    void GlideStep();
     void CopyItemAt(float y);
     void Flash(std::wstring status, UINT milliseconds = 1500);
 
@@ -1209,11 +1248,21 @@ private:
     struct Parked;
     void SwapChat(Parked& chat);
     void LeaveChat();  // before another chat takes the window: parked when it answers, else ended
+    static std::string DraftKey(const SessionInfo& session);  // its first part's id, which a move or a part keeps
+    std::string OpenDraftKey() const;
+    void StashDraft();                     // what is typed, put aside with the open chat; the input empty
+    void TakeDraft(const std::string& key);  // ... back into the input when that chat is open again
     void OnParked(Parked& chat, const std::function<void()>& handle);
     Parked* ParkedAt(WPARAM generation);
-    const Parked* ParkedChat(const std::wstring& folder, const std::string& key) const;
+    const Parked* ParkedChat(const std::wstring& folder, const SessionInfo& session) const;
     static std::string ParkedKey(const Parked& chat);  // its id in the sidebar (a new one may have none yet)
-    void DropParked(const std::wstring& folder, const std::string& key);
+    void DropParked(const std::wstring& folder, const SessionInfo& session);
+    // The open chat as the list knows it: its session, or right after a switch of CLI (the new one has no id yet)
+    // the one it went on from. Empty: a new chat.
+    const std::string& OpenId() const { return sessionId_.empty() ? chainFrom_ : sessionId_; }
+    bool IsOpenChat(const std::wstring& folder, const SessionInfo& session) const {
+        return folder == workspace_ && SameChat(session, OpenId());
+    }
     bool AnyBusy() const;
     void Submit();
     void OnClaude(const Json& message);
@@ -1250,6 +1299,8 @@ private:
         std::string currentMessageId;
         std::set<std::string> streamed;
         std::string handoff;
+        std::string chainFrom;
+        uint64_t lastSent = 0;
         std::wstring workspace;
         std::wstring folderName;
         std::string autoModel = "sonnet";
@@ -1375,6 +1426,8 @@ private:
     float scroll_ = 0;
     float maxScroll_ = 0;
     bool stick_ = true;  // follow the end of the feed as it grows
+    std::optional<float> glide_;  // where the wheel is taking the feed
+    std::chrono::steady_clock::time_point glideStep_;
 
     POINT caretSet_{-1, -1};  // where FitCaret last put its caret
     LONG caretTop_ = -1;      // below the line's top, px (the font's internal leading)
@@ -1416,6 +1469,18 @@ private:
     std::wstring renameFolder_; // ... and its project's folder
     std::wstring renameText_;
     D2D1_POINT_2F mouse_{-1.f, -1.f};  // the pointer in DIPs; off the window after it leaves
+    int menusOpen_ = 0;          // a right-click menu is up (the pointer is on it, not on the list)
+    bool listStale_ = false;     // the list changed while it was held still
+    std::map<std::wstring, float> rowFrom_;  // a row sliding to its place: how far off it it started (DIPs)
+    std::chrono::steady_clock::time_point slideStart_;
+    struct Doomed {  // the chat deleted last: its row says so, and "Вернуть" while kUndoTime runs
+        std::wstring folder;
+        SessionInfo session;
+        bool open = false;  // it was the open chat: back, it opens again
+        bool gone = false;  // deleted for good; its row waits for the list to be let go
+    };
+    std::optional<Doomed> doomed_;
+    std::map<std::string, std::wstring> drafts_;  // typed and not sent, by DraftKey ("*" + folder: a new chat)
     size_t selected_ = 0;
     // Models: indexes into models_, those the menu shows; "Auto", the Grok row and its fast tier apart
     // (npos: none).
@@ -1442,6 +1507,9 @@ private:
     std::string userName_;
 
     std::string handoff_;  // the chat so far, for the other CLI's first message after a switch to it
+    // ... and the session it goes on from, made one chat with the new one (chats.json) once that has an id.
+    std::string chainFrom_;
+    uint64_t lastSent_ = 0;  // the user's last message in it, FILETIME ticks: its place in the list
     SecretStore secrets_{SecretStore::DefaultPath()};
     std::unique_ptr<Runner> runner_ = std::make_unique<Runner>(secrets_);  // the open chat's
     // The chats that go on while another one is open (28.10.2026, his: Grok sits idle while Claude works in another
@@ -1551,6 +1619,7 @@ int ChatWindow::Run(int show) {
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
+    windowClass.style = CS_HREDRAW | CS_VREDRAW;  // a resize repaints, it does not shift the old picture about
     windowClass.lpfnWndProc = &ChatWindow::Proc;
     windowClass.hInstance = instance_;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -1588,7 +1657,7 @@ int ChatWindow::Run(int show) {
         const std::string id = std::exchange(settings_.reopen, std::string());
         SaveSettings(settings_);
         for (const Project& project : projects_) {
-            const auto found = std::ranges::find(project.sessions, id, &SessionInfo::id);
+            const auto found = std::ranges::find_if(project.sessions, [&](const SessionInfo& s) { return SameChat(s, id); });
             if (project.folder == workspace_ && found != project.sessions.end()) {
                 OpenChat(project.folder, *found);
                 break;
@@ -1759,18 +1828,40 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (wParam == TRUE) {
             auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
             const LONG top = params->rgrc[0].top;
-            DefWindowProcW(hwnd_, WM_NCCALCSIZE, wParam, lParam);
+            // Its answer, not 0: 0 has the old picture copied to the new client area, and while the edge is being
+            // dragged those copies reach the screen before the new frame does (ghosts of the input, of the sidebar).
+            const LRESULT redraw = DefWindowProcW(hwnd_, WM_NCCALCSIZE, wParam, lParam);
             params->rgrc[0].top = top;
             if (IsZoomed(hwnd_)) {
                 const UINT dpi = GetDpiForWindow(hwnd_);
                 params->rgrc[0].top += GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
                                        GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
             }
-            return 0;
+            return redraw;
         }
         break;
     case WM_NCHITTEST:
         return HitTestFrame(lParam);
+    case WM_NCLBUTTONDOWN:
+        if (wParam == HTCAPTION) {  // as a press anywhere: the hint goes, a rename keeps what was typed
+            HideTip();
+            if (renaming_ != Rename::None) {
+                CommitRename();
+            }
+        }
+        break;
+    case WM_NCRBUTTONDOWN:
+    case WM_NCRBUTTONUP:
+    case WM_NCMBUTTONDOWN:
+        // Free space under the header is the client's for the other buttons: its menus there, the middle button's
+        // scrolling; the system menu stays the header's.
+        if (LPARAM client = 0; wParam == HTCAPTION && BelowHeader(lParam, &client)) {
+            if (message == WM_NCRBUTTONDOWN) {
+                return 0;  // not to the default, which would hold the button and open the system menu
+            }
+            return Handle(message == WM_NCRBUTTONUP ? WM_RBUTTONUP : WM_MBUTTONDOWN, 0, client);
+        }
+        break;
     case WM_CTLCOLOREDIT:
         if (const auto field = reinterpret_cast<HWND>(lParam); field == nameEdit_ || field == valueEdit_) {
             const auto dc = reinterpret_cast<HDC>(wParam);
@@ -1877,7 +1968,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             target_->Resize(D2D1::SizeU(LOWORD(lParam), HIWORD(lParam)));
         }
         PlaceChildren();
-        Refresh();
+        // Drawn now, not on WM_PAINT: in the sizing loop the pointer's moves keep coming and WM_PAINT waits behind
+        // them, so the frame on screen would stay one size behind the window for as long as the hand moves.
+        if (wParam != SIZE_MINIMIZED && IsWindowVisible(hwnd_)) {
+            Paint();
+            ValidateRect(hwnd_, nullptr);
+        } else {
+            Refresh();
+        }
         return 0;
     case WM_DPICHANGED: {
         const auto* suggested = reinterpret_cast<const RECT*>(lParam);
@@ -1966,7 +2064,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (const Hit hit = HitTest(at.x, at.y); !(hit == hover_)) {
             hover_ = hit;
-            if (hit.target == Target::HistoryRow) {
+            if (hit.target == Target::HistoryRow || hit.target == Target::ChatMore) {
                 selected_ = hit.row;
             } else if (hit.target == Target::ModelRow) {
                 optionsOpen_ = OptionsFor(hit.row);
@@ -2163,7 +2261,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                    WheelInput(GET_WHEEL_DELTA_WPARAM(wParam))) {
             // the input's own text, beside its scrollbar
         } else if (popup_ == Popup::None) {
-            ScrollBy(steps * 64.f);
+            GlideBy(steps * 64.f);
         }
         return 0;
     }
@@ -2229,6 +2327,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             const Geometry g = Layout();
             switch (const Hit hit = HitTest(at.x, at.y); hit.target) {
             case Target::HistoryRow:
+            case Target::ChatMore:
                 ShowChatMenu(hit.row, screen);
                 return 0;
             case Target::ProjectRow:
@@ -2335,6 +2434,24 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 KillTimer(hwnd_, kParkedTimer);
             }
             Refresh();
+        } else if (wParam == kListTimer) {
+            if (!ListHeld()) {
+                KillTimer(hwnd_, kListTimer);
+                listStale_ = false;
+                RefreshSessions();
+                Refresh();
+            }
+        } else if (wParam == kUndoTimer) {
+            FinishDelete();
+            Refresh();
+        } else if (wParam == kGlideTimer) {
+            GlideStep();
+        } else if (wParam == kSlideTimer) {
+            if (std::chrono::steady_clock::now() - slideStart_ >= std::chrono::milliseconds(static_cast<int>(kSlideTime))) {
+                KillTimer(hwnd_, kSlideTimer);
+                rowFrom_.clear();
+            }
+            Refresh();
         } else if (wParam == kTipTimer) {
             KillTimer(hwnd_, kTipTimer);
             if (!tipText_.empty() && popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ &&
@@ -2396,6 +2513,12 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_DESTROY:
+        if (doomed_ && !doomed_->gone) {  // a chat deleted just before: for good, no "Вернуть" after a restart
+            for (const SessionPart& part : doomed_->session.parts) {
+                DeleteSession(doomed_->folder, part.id);
+            }
+            doomed_.reset();
+        }
         if (webController_) {
             webController_->Close();  // the browser processes go with the window
             webController_.reset();
@@ -2561,9 +2684,22 @@ void ChatWindow::OnClick(float x, float y) {
         keepFocus = true;
         Refresh();
         break;
+    case Target::SearchClear:
+        searchText_.clear();
+        FilterSessions();
+        Refresh();
+        break;
     case Target::HistoryRow:
         OpenSession(hit.row);
         break;
+    case Target::ChatMore: {  // the same menu as at a right click, under the "⋯"
+        const D2D1_RECT_F more = ChatMoreRect(hit.row, SideRowRect(Layout(), hit.row));
+        POINT screen{ToPx(more.left), ToPx(more.bottom + 4.f)};
+        ClientToScreen(hwnd_, &screen);
+        ShowChatMenu(hit.row, screen);
+        keepFocus = true;
+        break;
+    }
     case Target::ProjectRow:
         ToggleProject(hit.row);
         break;
@@ -2783,12 +2919,33 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             Flash(L"останавливаю…");
             return 1;
         }
+        if (filter.wParam == VK_ESCAPE && !searchText_.empty()) {  // a search left on hides chats: off, as its "×"
+            searchText_.clear();
+            FilterSessions(true);
+            Refresh();
+            return 1;
+        }
         if (filter.wParam == 'N' && control) {  // the top "new chat"
             NewChatIn(DefaultWorkspace());
             return 1;
         }
         if (filter.wParam == 'H' && control) {
             FocusSearch();
+            return 1;
+        }
+        if (filter.wParam == VK_F2) {  // the open chat's name, in its row (one not saved yet has none to change)
+            if (!searchText_.empty()) {
+                searchText_.clear();
+                FilterSessions();
+            }
+            for (size_t row = 0; row < rows_.size(); ++row) {
+                const SessionInfo* session = RowSession(row);
+                if (session != nullptr && IsOpenChat(projects_[rows_[row].project].folder, *session)) {
+                    BeginRename(Rename::Chat, row);
+                    return 1;
+                }
+            }
+            Flash(L"Название появится после первого ответа");
             return 1;
         }
         if ((filter.wParam == 'C' || filter.wParam == VK_INSERT) && control) {
@@ -3094,7 +3251,8 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.sidebar, x, y)) {
         if (Inside(g.search, x, y)) {
-            return {Target::SidebarSearch};
+            return !searchText_.empty() && Inside(SearchClearRect(g), x, y) ? Hit{Target::SearchClear}
+                                                                            : Hit{Target::SidebarSearch};
         }
         if (Inside(g.newItem, x, y)) {
             return {Target::NewChat};
@@ -3121,7 +3279,8 @@ Hit ChatWindow::HitTest(float x, float y) const {
                     return {};  // the chat that is open already
                 }
                 if (rows_[row].session != kHead) {
-                    return {Target::HistoryRow, row};
+                    return Inside(ChatMoreRect(row, SideRowRect(g, row)), x, y) ? Hit{Target::ChatMore, row}
+                                                                                : Hit{Target::HistoryRow, row};
                 }
                 if (projects_[rows_[row].project].folder == DefaultWorkspace()) {
                     return {};  // the general chats' label: no fold, no "+" (the top "new chat" is theirs)
@@ -3255,8 +3414,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
 }
 
 void ChatWindow::MoveChild(HWND child, const D2D1_RECT_F& rect) const {
-    MoveWindow(child, ToPx(rect.left), ToPx(rect.top), std::max(0, ToPx(rect.right) - ToPx(rect.left)),
-               std::max(0, ToPx(rect.bottom) - ToPx(rect.top)), TRUE);
+    // Without copying its old bits along: they would trail behind it while the window is resized.
+    SetWindowPos(child, nullptr, ToPx(rect.left), ToPx(rect.top), std::max(0, ToPx(rect.right) - ToPx(rect.left)),
+                 std::max(0, ToPx(rect.bottom) - ToPx(rect.top)), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
 }
 
 void ChatWindow::CreateFonts() {
@@ -3597,7 +3757,7 @@ void ChatWindow::PaintFeed(const Geometry& g) {
             if (item.kind == Kind::Assistant) {
                 if (item.whoHeight > 0) {  // a dot of the agent's colour, then the model
                     const bool grok = item.who.starts_with(L"Grok");
-                    brush_->SetColor(Color(grok ? 0xc8ccd4 : 0xd97757));
+                    brush_->SetColor(Color(grok ? kGrokDot : kClaudeDot));
                     target_->FillEllipse(D2D1::Ellipse({x + 3.5f, y + 8.f}, 3.5f, 3.5f), brush_.get());
                     Text(item.who, small_.get(), D2D1::RectF(x + 13.f, y, left + g.column, y + kWhoRow), kSecondary);
                     textY = y + item.whoHeight;
@@ -3909,10 +4069,38 @@ LRESULT ChatWindow::HitTestFrame(LPARAM lParam) {
     }
     const float x = ToDip(at.x);
     const float y = ToDip(at.y);
-    if (y < kHeader && HitTest(x, y).target == Target::None) {
+    if (HitTest(x, y).target == Target::None && (y < kHeader || FreeSpace(x, y))) {
         return HTCAPTION;
     }
     return HTCLIENT;
+}
+
+// Below the header too, where a press has nothing of its own to do, it takes the window along: the sidebar's empty
+// part, the chat's sides past its column, the strip round the input card, the terminal's row of tabs. The feed's text
+// keeps a margin beside it, as a selection may start just left of a line.
+bool ChatWindow::FreeSpace(float x, float y) const {
+    if (popup_ != Popup::None) {
+        return false;  // a press beside an open panel closes it
+    }
+    const Geometry g = Layout();
+    if (Inside(g.sidebar, x, y)) {
+        return !secretsOpen_ || (!Inside(g.nameField, x, y) && !Inside(g.valueField, x, y));
+    }
+    if (Inside(g.term, x, y)) {
+        return y < g.termScreen.top;
+    }
+    if (Inside(g.feed, x, y)) {
+        return x < g.left - kSide || x > g.left + g.column + kSide || !FeedPointAt(g, x, y);
+    }
+    return x >= g.areaLeft && x < g.area && y >= g.feed.bottom && !Inside(g.box, x, y);
+}
+
+// A press on such space under the header: the point in the client's coordinates, for the client's own handling.
+bool ChatWindow::BelowHeader(LPARAM screen, LPARAM* client) const {
+    POINT at{GET_X_LPARAM(screen), GET_Y_LPARAM(screen)};
+    ScreenToClient(hwnd_, &at);
+    *client = MAKELPARAM(at.x, at.y);
+    return ToDip(at.y) >= kHeader;
 }
 
 // Minimize, maximize (restore when maximized), close: drawn like Windows 11's own.
@@ -5698,16 +5886,21 @@ void ChatWindow::LoadRepos() {
 }
 
 // The chat's folder is `folder`: a project in the sidebar from now on (added at the end), unfolded.
-void ChatWindow::SetWorkspace(const std::wstring& folder) {
+// A folded project stays folded: its open chat shows under the fold (FilterSessions).
+void ChatWindow::SetWorkspace(const std::wstring& path) {
+    // The project as the list spells it: a folder picked again in other letters' case is not a second one.
+    const auto known = std::ranges::find_if(settings_.projects, [&](const std::wstring& project) {
+        return _wcsicmp(project.c_str(), path.c_str()) == 0;
+    });
+    const std::wstring folder = known != settings_.projects.end() ? *known : path;
     workspace_ = folder;
     folderName_ = ProjectName(folder);
     runner_->tools.SetCwd(folder);
     const bool general = folder == DefaultWorkspace();
     settings_.workspace = general ? std::wstring() : folder;
-    if (!general && std::ranges::find(settings_.projects, folder) == settings_.projects.end()) {
+    if (!general && known == settings_.projects.end()) {
         settings_.projects.push_back(folder);
     }
-    std::erase(settings_.closedProjects, folder);
     SaveSettings(settings_);
 }
 
@@ -5719,6 +5912,7 @@ void ChatWindow::SwitchWorkspace(const std::wstring& folder) {
     LeaveChat();
     SetWorkspace(folder);
     StartClaude();
+    TakeDraft("*" + ToUtf8(workspace_));
     RefreshSessions();
     PlaceChildren();
     Flash(L"Проект: " + folderName_, 2500);
@@ -5957,9 +6151,19 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
 
     // Search: drawn here, so there is no blinking caret.
     Fill(g.search, 8.f, kRaised);
-    if (searchFocus_) {
-        brush_->SetColor(Color(kAccent, 0.75f));
+    if (searchFocus_ || !searchText_.empty()) {  // typed into, or filtering the list: then chats are hidden
+        brush_->SetColor(Color(kAccent, searchFocus_ ? 0.75f : 0.45f));
         target_->DrawRoundedRectangle(D2D1::RoundedRect(g.search, 8.f, 8.f), brush_.get(), 1.f);
+    }
+    if (!searchText_.empty()) {  // the filter off, at a click (or Esc)
+        const D2D1_RECT_F clear = SearchClearRect(g);
+        const bool on = hover_.target == Target::SearchClear;
+        if (on) {
+            Fill(clear, 6.f, kLine);
+        }
+        const D2D1_POINT_2F c{(clear.left + clear.right) / 2, (clear.top + clear.bottom) / 2};
+        Line({c.x - 4.f, c.y - 4.f}, {c.x + 4.f, c.y + 4.f}, on ? kPrimary : kSecondary, 1.4f);
+        Line({c.x - 4.f, c.y + 4.f}, {c.x + 4.f, c.y - 4.f}, on ? kPrimary : kSecondary, 1.4f);
     }
     {  // a magnifier
         const D2D1_POINT_2F c{g.search.left + 18.f, (g.search.top + g.search.bottom) / 2};
@@ -5967,7 +6171,9 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         target_->DrawEllipse(D2D1::Ellipse({c.x - 1.f, c.y - 1.f}, 4.5f, 4.5f), brush_.get(), 1.4f);
         Line({c.x + 2.5f, c.y + 2.5f}, {c.x + 5.5f, c.y + 5.5f}, kSecondary, 1.4f);
     }
-    const D2D1_RECT_F field = D2D1::RectF(g.search.left + 34, g.search.top, g.search.right - 10, g.search.bottom);
+    const D2D1_RECT_F field = D2D1::RectF(g.search.left + 34, g.search.top,
+                                          searchText_.empty() ? g.search.right - 10 : SearchClearRect(g).left - 4,
+                                          g.search.bottom);
     if (searchText_.empty()) {
         Text(L"Поиск", ui_.get(), field, kSecondary);
     } else {
@@ -6090,14 +6296,39 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
     }
     firstRow_ = ClampFirst(firstRow_, rows_.size(), SidebarRows(g));
     const size_t last = std::min(rows_.size(), firstRow_ + SidebarRows(g));
+    const bool sliding = !rowFrom_.empty();
+    if (sliding) {  // a row on its way stays within the list
+        target_->PushAxisAlignedClip(D2D1::RectF(g.sidebar.left, g.listTop, g.sidebar.right, g.listBottom),
+                                     D2D1_ANTIALIAS_MODE_ALIASED);
+    }
     for (size_t row = firstRow_; row < last; ++row) {
-        const D2D1_RECT_F r = SideRowRect(g, row);
+        D2D1_RECT_F r = SideRowRect(g, row);
+        if (sliding) {
+            const float off = RowSlide(row);
+            r.top += off;
+            r.bottom += off;
+        }
         // The lit rows keep a gap between them, so the open chat and a hovered head do not run into one.
         const auto lit = [](const D2D1_RECT_F& rect) { return D2D1::RectF(rect.left, rect.top + 2.f, rect.right, rect.bottom - 2.f); };
         const Project& project = projects_[rows_[row].project];
         const bool hovered = (hover_.target == Target::HistoryRow || hover_.target == Target::ProjectRow ||
-                              hover_.target == Target::ProjectNew) &&
+                              hover_.target == Target::ProjectNew || hover_.target == Target::ChatMore) &&
                              hover_.row == row;
+        // Who answers in a chat: a dot of the agent's colour before its title, as above a reply in the feed; a chat
+        // gone on with the other one has both, the one answering now in front, ringed in the row's colour.
+        const auto agent = [&](const D2D1_RECT_F& chat, bool grok, std::optional<bool> before, uint32_t ground) {
+            const float y = (chat.top + chat.bottom) / 2;
+            float x = chat.left + 13.f;
+            if (before) {
+                brush_->SetColor(Color(*before ? kGrokDot : kClaudeDot));
+                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(chat.left + 11.f, y), 3.f, 3.f), brush_.get());
+                brush_->SetColor(Color(ground));
+                x = chat.left + 16.f;
+                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 4.5f, 4.5f), brush_.get());
+            }
+            brush_->SetColor(Color(grok ? kGrokDot : kClaudeDot));
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 3.f, 3.f), brush_.get());
+        };
         if (rows_[row].session == kHead && project.folder == DefaultWorkspace()) {
             // The general chats, under the projects: a section of their own, labelled as "projects" is.
             Text(L"Общие чаты", ui_.get(), D2D1::RectF(g.sidebar.left + 16, r.top + 8, r.right - 10, r.bottom), kSecondary);
@@ -6138,7 +6369,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         const D2D1_RECT_F chat = D2D1::RectF(r.left + indent, r.top, r.right, r.bottom);
         if (rows_[row].session == kDraft) {  // the new chat that is open: lit, in its project
             Fill(lit(chat), 8.f, kRaised);
-            Text(L"Новый чат", ui_.get(), D2D1::RectF(chat.left + 10, chat.top, chat.right - 8, chat.bottom), kAccent);
+            agent(chat, GrokSelected(), std::nullopt, kRaised);
+            Text(L"Новый чат", ui_.get(), D2D1::RectF(chat.left + 24, chat.top, chat.right - 8, chat.bottom), kAccent);
             continue;
         }
         const SessionInfo& session = project.sessions[rows_[row].session];
@@ -6146,13 +6378,41 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             PaintRenameField(chat);
             continue;
         }
-        if (hovered || (searchFocus_ && row == selected_)) {
+        if (IsDoomed(project.folder, session)) {  // deleted: the row itself brings it back, while it can
+            const bool back = !doomed_->gone;
+            if (back && hovered) {
+                Fill(lit(chat), 8.f, kRaised);
+            }
+            const D2D1_RECT_F text = D2D1::RectF(chat.left + 24, chat.top, chat.right - 10, chat.bottom);
+            Text(L"Чат удалён", ui_.get(), text, kSecondary);
+            if (back) {
+                Text(L"Вернуть", uiRight_.get(), text, hovered ? kPrimary : kAccent);
+            }
+            continue;
+        }
+        const bool raised = hovered || (searchFocus_ && row == selected_);
+        if (raised) {
             Fill(lit(chat), 8.f, kRaised);
         }
-        const bool current = session.id == sessionId_ && project.folder == workspace_;
-        const bool parkedHere = ParkedChat(project.folder, session.id) != nullptr;
-        float titleRight = chat.right - (parkedHere ? 24.f : 8.f);
-        if (FileTicks(session.modified) != 0) {  // how old the chat is, so the newest-first order can be read
+        const bool current = IsOpenChat(project.folder, session);
+        const Parked* parked = ParkedChat(project.folder, session);
+        const bool grok = session.parts.empty() ? session.grok : session.parts.back().grok;
+        const bool both = std::ranges::any_of(session.parts, [&](const SessionPart& part) { return part.grok != grok; });
+        agent(chat, grok, both ? std::optional<bool>(!grok) : std::nullopt, raised ? kRaised : kPanel);
+        float titleRight = chat.right - (parked != nullptr ? 24.f : 8.f);
+        if (hovered) {  // in the age's place: the chat's menu, for those who do not right-click
+            const D2D1_RECT_F more = ChatMoreRect(row, r);
+            const bool on = hover_.target == Target::ChatMore;
+            if (on) {
+                Fill(more, 6.f, kLine);
+            }
+            brush_->SetColor(Color(on ? kPrimary : kSecondary));
+            const D2D1_POINT_2F c{(more.left + more.right) / 2, (more.top + more.bottom) / 2};
+            for (const float dx : {-5.f, 0.f, 5.f}) {
+                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x + dx, c.y), 1.4f, 1.4f), brush_.get());
+            }
+            titleRight = more.left - 4.f;
+        } else if (FileTicks(session.modified) != 0) {  // how old the chat is, so the newest-first order can be read
             const std::wstring age = Age(session.modified);
             const float ageWidth = TextWidth(age, uiRight_.get());
             const float ageLeft = titleRight - ageWidth;
@@ -6161,7 +6421,13 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 titleRight = ageLeft - 8.f;
             }
         }
-        if (const Parked* parked = ParkedChat(project.folder, session.id)) {
+        if (drafts_.contains(DraftKey(session)) && titleRight > chat.left + 60.f) {  // typed in it, not sent: a pencil
+            const D2D1_POINT_2F p{titleRight - 6.f, (chat.top + chat.bottom) / 2};
+            Line({p.x - 3.f, p.y + 3.f}, {p.x + 3.5f, p.y - 3.5f}, kAccent, 2.4f);
+            Line({p.x - 5.f, p.y + 5.f}, {p.x - 3.3f, p.y + 3.3f}, kAccent, 1.2f);
+            titleRight -= 18.f;
+        }
+        if (parked != nullptr) {
             const bool waiting = std::ranges::any_of(parked->feed, [](const FeedItem& item) {
                 return item.kind == Kind::Approval && item.verdict == Verdict::Pending;
             });
@@ -6178,7 +6444,10 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                                  brush_.get());
         }
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
-             D2D1::RectF(chat.left + 10, chat.top, titleRight, chat.bottom), current ? kAccent : kPrimary);
+             D2D1::RectF(chat.left + 24, chat.top, titleRight, chat.bottom), current ? kAccent : kPrimary);
+    }
+    if (sliding) {
+        target_->PopAxisAlignedClip();
     }
     PaintBar(g, Scroller::Sidebar);
 }
@@ -6194,6 +6463,33 @@ D2D1_RECT_F ChatWindow::SideRowRect(const Geometry& g, size_t row) const {
 // Clear of the scrollbar's strip, which takes the row's right end when the list scrolls.
 D2D1_RECT_F ChatWindow::ProjectNewRect(const D2D1_RECT_F& head) {
     return D2D1::RectF(head.right - 34, head.top + 5, head.right - 10, head.bottom - 5);
+}
+
+// Where the chat's age is (left of its dot while it answers aside): its menu, for those who do not right-click.
+D2D1_RECT_F ChatWindow::ChatMoreRect(size_t row, const D2D1_RECT_F& r) const {
+    const SessionInfo* session = RowSession(row);
+    if (session == nullptr || IsDoomed(projects_[rows_[row].project].folder, *session)) {
+        return {};
+    }
+    const float right = r.right - (ParkedChat(projects_[rows_[row].project].folder, *session) != nullptr ? 24.f : 8.f);
+    return D2D1::RectF(right - 26.f, r.top + 5.f, right, r.bottom - 5.f);
+}
+
+D2D1_RECT_F ChatWindow::SearchClearRect(const Geometry& g) {
+    return D2D1::RectF(g.search.right - 30.f, g.search.top + 4.f, g.search.right - 6.f, g.search.bottom - 4.f);
+}
+
+std::wstring ChatWindow::ChatAgents(const SessionInfo& session) {
+    std::wstring said;
+    bool last = false;
+    for (const SessionPart& part : session.parts) {
+        if (!said.empty() && part.grok == last) {
+            continue;
+        }
+        said += (said.empty() ? L"" : L", затем ") + std::wstring(part.grok ? L"Grok" : L"Claude");
+        last = part.grok;
+    }
+    return said.empty() ? std::wstring(session.grok ? L"Grok" : L"Claude") : said;
 }
 
 const ChatWindow::Project* ChatWindow::RowProject(size_t row) const {
@@ -6345,7 +6641,7 @@ std::optional<size_t> ChatWindow::RevealChat(const std::wstring& folder, const s
     const auto find = [&]() -> std::optional<size_t> {
         for (size_t row = 0; row < rows_.size(); ++row) {
             if (const SessionInfo* session = RowSession(row);
-                session != nullptr && session->id == id && projects_[rows_[row].project].folder == folder) {
+                session != nullptr && SameChat(*session, id) && projects_[rows_[row].project].folder == folder) {
                 return row;
             }
         }
@@ -6656,9 +6952,60 @@ void ChatWindow::FocusSearch() {
     Refresh();
 }
 
+void ChatWindow::ListChanged() {
+    if (!ListHeld()) {
+        RefreshSessions();
+        return;
+    }
+    listStale_ = true;
+    SetTimer(hwnd_, kListTimer, kListCheck, nullptr);
+}
+
+bool ChatWindow::ListHeld() const {
+    if (menusOpen_ > 0 || searchFocus_ || renaming_ == Rename::Chat || barDrag_ == Scroller::Sidebar ||
+        pan_ == Scroller::Sidebar) {
+        return true;
+    }
+    return Inside(Layout().sidebar, mouse_.x, mouse_.y);
+}
+
+std::wstring ChatWindow::RowKey(size_t row) const {
+    const Project& project = projects_[rows_[row].project];
+    std::wstring key = project.folder + L'|';
+    if (rows_[row].session == kHead || rows_[row].session == kDraft) {
+        return key + (rows_[row].session == kHead ? L"" : L"*");
+    }
+    // A chat by its first part alone, which stays as it goes on: one moved to another project slides there.
+    const SessionInfo& session = project.sessions[rows_[row].session];
+    return L'#' + ToWide(session.linked.empty() ? session.id : session.linked.front());
+}
+
+float ChatWindow::RowSlide(size_t row) const {
+    if (rowFrom_.empty()) {
+        return 0.f;
+    }
+    const auto found = rowFrom_.find(RowKey(row));
+    if (found == rowFrom_.end()) {
+        return 0.f;
+    }
+    const std::chrono::duration<float, std::milli> spent = std::chrono::steady_clock::now() - slideStart_;
+    const float left = 1.f - std::clamp(spent.count() / kSlideTime, 0.f, 1.f);
+    return found->second * left * left * left;  // ease-out: fast, then settling
+}
+
 void ChatWindow::RefreshSessions() {
     const size_t first = firstRow_;
     const size_t selected = selected_;
+    if (std::exchange(listStale_, false)) {
+        KillTimer(hwnd_, kListTimer);
+    }
+    if (doomed_ && doomed_->gone) {  // its files are gone: the row goes now
+        doomed_.reset();
+    }
+    std::map<std::wstring, float> was;  // where each row is drawn now, so a moved one slides from there
+    for (size_t row = 0; row < rows_.size(); ++row) {
+        was[RowKey(row)] = (static_cast<float>(row) - static_cast<float>(first)) * kHistoryRow + RowSlide(row);
+    }
     // The projects first, then the general chats (as in Claude's app: the projects, then the recent chats).
     const std::wstring general = DefaultWorkspace();
     std::vector<std::wstring> folders;
@@ -6678,10 +7025,12 @@ void ChatWindow::RefreshSessions() {
     for (const std::wstring& folder : folders) {
         built.push_back({folder, ProjectName(folder), ListSessions(folder)});
     }
-    for (const std::unique_ptr<Parked>& chat : parked_) {
+    for (const std::unique_ptr<Parked>& chat : parked_) {  // one answering in the background, not saved yet
         const auto project = std::ranges::find(built, chat->workspace, &Project::folder);
-        if (project == built.end() ||
-            std::ranges::find(project->sessions, ParkedKey(*chat), &SessionInfo::id) != project->sessions.end()) {
+        const std::string key = ParkedKey(*chat);
+        if (project == built.end() || std::ranges::any_of(project->sessions, [&](const SessionInfo& session) {
+                return SameChat(session, key);
+            })) {
             continue;
         }
         std::wstring title = chat->title;
@@ -6689,33 +7038,27 @@ void ChatWindow::RefreshSessions() {
             const auto said = std::ranges::find(chat->feed, Kind::User, &FeedItem::kind);
             title = said == chat->feed.end() ? L"Новый чат" : said->text.substr(0, said->text.find(L'\n'));
         }
-        project->sessions.insert(project->sessions.begin(), SessionInfo{ParkedKey(*chat), std::move(title), {}});
+        SessionInfo session{key, std::move(title)};
+        session.modified = FILETIME{static_cast<DWORD>(chat->lastSent), static_cast<DWORD>(chat->lastSent >> 32)};
+        session.grok = chat->runner->agent == &chat->runner->grok;
+        session.parts = {{key, session.grok}};
+        const auto place = std::ranges::find_if(project->sessions, [&](const SessionInfo& other) {
+            return FileTicks(other.modified) < chat->lastSent;
+        });
+        project->sessions.insert(place, std::move(session));
     }
-    // A chat that is answering, or a new one with no file yet, is newer than any saved chat.
-    constexpr uint64_t kLive = ~uint64_t{0} - 1;
+    // By the user's last message (29.10.2026): an answer, a chat opened, Grok rewriting its files move nothing.
     std::vector<ProjectPlace> places;
     places.reserve(built.size());
     for (const Project& project : built) {
-        uint64_t activity = 0;
-        bool live = project.folder == workspace_ && sessionId_.empty();
+        uint64_t activity = project.folder == workspace_ ? lastSent_ : 0;  // the open chat, maybe not saved yet
         for (const SessionInfo& session : project.sessions) {
-            const uint64_t ticks = FileTicks(session.modified);
-            if (ticks == 0) {
-                live = true;
-            } else {
-                activity = std::max(activity, ticks);
-            }
+            activity = std::max(activity, FileTicks(session.modified));
         }
-        if (std::ranges::any_of(parked_, [&](const std::unique_ptr<Parked>& chat) {
-                return chat->workspace == project.folder && chat->busy;
-            })) {
-            live = true;
-        }
-        places.push_back({project.folder, project.name, live ? kLive : activity});
+        places.push_back({project.folder, project.name, activity});
     }
-    const std::wstring open = workspace_ == general ? std::wstring() : workspace_;
     projects_.clear();
-    for (const ProjectPlace& place : OrderProjects(std::move(places), general, open, settings_.projectOrder)) {
+    for (const ProjectPlace& place : OrderProjects(std::move(places), general, settings_.projectOrder)) {
         const auto found = std::ranges::find(built, place.folder, &Project::folder);
         if (found != built.end()) {
             projects_.push_back(std::move(*found));
@@ -6725,6 +7068,20 @@ void ChatWindow::RefreshSessions() {
     const size_t most = rows_.empty() ? 0 : rows_.size() - 1;
     firstRow_ = std::min(first, most);
     selected_ = std::min(selected, most);
+    rowFrom_.clear();
+    for (size_t row = 0; row < rows_.size(); ++row) {
+        const auto before = was.find(RowKey(row));
+        const float now = (static_cast<float>(row) - static_cast<float>(firstRow_)) * kHistoryRow;
+        if (before != was.end() && std::abs(before->second - now) > 0.5f) {
+            rowFrom_[before->first] = before->second - now;
+        }
+    }
+    if (!rowFrom_.empty() && !gallery_) {
+        slideStart_ = std::chrono::steady_clock::now();
+        SetTimer(hwnd_, kSlideTimer, kSlideFrame, nullptr);
+    } else {
+        rowFrom_.clear();
+    }
 }
 
 void ChatWindow::OnSearchKey(WPARAM key) {
@@ -6784,6 +7141,16 @@ void ChatWindow::OnSearchKey(WPARAM key) {
         searchText_ += ClipboardText(hwnd_);
         std::erase_if(searchText_, [](wchar_t c) { return c == L'\r' || c == L'\n'; });
         FilterSessions(true);
+    } else if (key == VK_F2) {  // the chat the keys are on, as from its menu
+        BeginRename(Rename::Chat, selected_);
+    } else if (key == VK_DELETE) {  // it goes, "Вернуть" on its row; the keys stay in the list
+        if (const SessionInfo* session = RowSession(selected_)) {
+            const std::wstring folder = projects_[rows_[selected_].project].folder;
+            if (!IsDoomed(folder, *session)) {
+                const SessionInfo chat = *session;
+                DeleteChat(folder, chat);
+            }
+        }
     }
 }
 
@@ -6908,10 +7275,48 @@ void ChatWindow::PaintEffort(const Geometry& g) {
          kSecondary);
 }
 
+// Whatever scrolls the feed by itself (the bar, the middle button, a selection past its edge) takes over from a glide.
 void ChatWindow::ScrollBy(float delta) {
-    scroll_ = std::clamp(scroll_ + delta, 0.f, maxScroll_);
+    glide_.reset();
+    MoveFeed(scroll_ + delta);
+}
+
+void ChatWindow::MoveFeed(float to) {
+    scroll_ = std::clamp(to, 0.f, maxScroll_);
     stick_ = scroll_ >= maxScroll_ - 1.f;
     Refresh();
+}
+
+// Notches that come while it glides add up: the goal moves on from where it was going, not from where the feed is.
+// A goal at the end is the end itself, wherever a growing answer takes it by the time the feed gets there.
+void ChatWindow::GlideBy(float delta) {
+    if (!glide_) {
+        glideStep_ = std::chrono::steady_clock::now();
+        SetTimer(hwnd_, kGlideTimer, kGlideFrame, nullptr);
+    }
+    const float goal = std::clamp(std::min(glide_.value_or(scroll_), maxScroll_) + delta, 0.f, maxScroll_);
+    glide_ = goal >= maxScroll_ - 1.f ? std::numeric_limits<float>::infinity() : goal;
+}
+
+void ChatWindow::GlideStep() {
+    if (!glide_) {
+        KillTimer(hwnd_, kGlideTimer);
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const std::chrono::duration<float, std::milli> spent = now - glideStep_;
+    glideStep_ = now;
+    const float goal = std::clamp(*glide_, 0.f, maxScroll_);  // the feed may have got shorter meanwhile
+    float to = scroll_ + (goal - scroll_) * (1.f - std::exp(-spent.count() / kGlideTau));
+    if (std::abs(goal - to) < 0.5f) {
+        to = goal;
+        glide_.reset();
+        KillTimer(hwnd_, kGlideTimer);
+    }
+    MoveFeed(to);
+    if (trackingMouse_) {
+        hover_ = HitTest(mouse_.x, mouse_.y);  // the feed moved under the pointer
+    }
 }
 
 void ChatWindow::CopyItemAt(float y) {
@@ -7167,11 +7572,15 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
     }
     const SessionInfo session = *found;
     const std::wstring folder = projects_[rows_[row].project].folder;
+    if (IsDoomed(folder, session)) {  // deleted: its row has "Вернуть" and nothing else
+        return;
+    }
     wil::unique_hmenu menu(CreatePopupMenu());
     constexpr UINT kMoveTo = 100;  // + an index into projects_
     AppendMenuW(menu.get(), MF_STRING, 1, L"Открыть");
     AppendMenuW(menu.get(), MF_STRING, 3, L"Переименовать");
-    if (session.grok) {  // grok.exe keeps its chats by folder: one moved elsewhere is not known to go on
+    if (session.grok || std::ranges::any_of(session.parts, &SessionPart::grok)) {
+        // grok.exe keeps its chats by folder: one moved elsewhere is not known to go on
         AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 0, L"Перенести в проект (у Grok пока нет)");
     } else {  // to another project: the chat goes on there
         wil::unique_hmenu projects(CreatePopupMenu());
@@ -7206,30 +7615,73 @@ void ChatWindow::ShowChatMenu(size_t row, POINT screen) {
         SetFocus(input_);
         return;
     }
-    if (chosen != 2) {
-        return;
+    if (chosen == 2) {
+        DeleteChat(folder, session);
     }
-    const std::wstring title = session.title.empty() ? L"без названия" : session.title;
-    const std::wstring question = L"Удалить чат «" + title + L"»?\nОн уйдёт в корзину Windows, оттуда его можно вернуть.";
-    if (MessageBoxW(hwnd_, question.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
-        return;
-    }
-    const bool current = session.id == sessionId_ && folder == workspace_;
+}
+
+// No question first (29.10.2026): the row stays where it was, saying the chat is gone, with "Вернуть" for
+// kUndoTime; then its files go to the Windows recycle bin. One deleted before it goes for good at once.
+void ChatWindow::DeleteChat(const std::wstring& folder, const SessionInfo& session) {
+    FinishDelete();
+    const bool current = IsOpenChat(folder, session);
     if (current) {  // the CLI holds the file open: it goes first
+        StashDraft();  // with "Вернуть", what was typed in it comes back too
         ResetChat();
     }
-    DropParked(folder, session.id);
-    if (DeleteSession(folder, session.id)) {
+    DropParked(folder, session);
+    if (session.parts.empty()) {  // not saved yet: gone with its CLI, nothing to bring back
         Flash(L"Чат удалён");
     } else {
-        Flash(L"Не удалось удалить чат", 3000);
+        doomed_ = Doomed{folder, session, current};
+        SetTimer(hwnd_, kUndoTimer, kUndoTime, nullptr);
     }
     if (current) {
         StartClaude();
+        TakeDraft("*" + ToUtf8(workspace_));
     }
     RefreshSessions();
-    hover_ = {};
+    hover_ = HitTest(mouse_.x, mouse_.y);
     Refresh();
+}
+
+void ChatWindow::UndoDelete() {
+    if (!doomed_ || doomed_->gone) {
+        return;
+    }
+    KillTimer(hwnd_, kUndoTimer);
+    const Doomed back = std::move(*doomed_);
+    doomed_.reset();
+    if (back.open && !busy_ && !HasConversation()) {  // nothing begun in its place: it is open again
+        OpenChat(back.folder, back.session);
+    }
+    RefreshSessions();
+    hover_ = HitTest(mouse_.x, mouse_.y);
+    Refresh();
+}
+
+void ChatWindow::FinishDelete() {
+    KillTimer(hwnd_, kUndoTimer);
+    if (!doomed_ || doomed_->gone) {
+        return;
+    }
+    drafts_.erase(DraftKey(doomed_->session));
+    bool deleted = true;
+    for (const SessionPart& part : doomed_->session.parts) {  // a chat in parts goes whole
+        deleted = DeleteSession(doomed_->folder, part.id) && deleted;
+    }
+    if (!deleted) {
+        doomed_.reset();
+        Flash(L"Не удалось удалить чат", 3000);
+        RefreshSessions();
+        return;
+    }
+    doomed_->gone = true;
+    ListChanged();
+}
+
+bool ChatWindow::IsDoomed(const std::wstring& folder, const SessionInfo& session) const {
+    return doomed_ && doomed_->folder == folder && SameChat(session, doomed_->session.id);
 }
 
 // The whole chat as a Markdown file to send (28.10.2026, his: to share it, and so you and Grok can look at others):
@@ -7257,20 +7709,28 @@ void ChatWindow::ExportChat(const std::wstring& folder, const SessionInfo& sessi
 // A chat to another project (its transcript into that project's history). The open one is stopped first (the CLI
 // holds its file) and opened again there.
 void ChatWindow::MoveChat(std::wstring from, SessionInfo session, std::wstring to) {
-    const bool current = session.id == sessionId_ && from == workspace_;
-    const Parked* parked = ParkedChat(from, session.id);
+    const bool current = IsOpenChat(from, session);
+    const Parked* parked = ParkedChat(from, session);
     if (((current && busy_) || (parked != nullptr && parked->busy)) &&
         MessageBoxW(hwnd_, L"Этот чат сейчас отвечает. Остановить и перенести его?", L"AIControls",
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
     if (current) {
+        StashDraft();  // what was typed goes with it
         ResetChat();
     }
-    DropParked(from, session.id);
-    const bool moved = MoveSession(from, to, session.id);
+    DropParked(from, session);
+    bool moved = !session.parts.empty();
+    for (const SessionPart& part : session.parts) {
+        moved = MoveSession(from, to, part.id) && moved;
+    }
     if (moved) {
         Flash(L"Чат перенесён в «" + ProjectName(to) + L"»", 3000);
+        if (ProjectFolded(to)) {  // where it went stays in sight, not under a fold
+            std::erase(settings_.closedProjects, to);
+            SaveSettings(settings_);
+        }
     } else {
         Flash(L"Не удалось перенести чат", 3000);
     }
@@ -7278,8 +7738,25 @@ void ChatWindow::MoveChat(std::wstring from, SessionInfo session, std::wstring t
         sessionId_.clear();  // so OpenChat does not take it for the open one
         OpenChat(moved ? to : from, session);
     }
-    RefreshSessions();
-    hover_ = {};
+    RefreshSessions();  // its row slides from where it was to the project it went to
+    for (size_t row = 0; moved && row < rows_.size(); ++row) {
+        const SessionInfo* chat = RowSession(row);
+        if (chat == nullptr || projects_[rows_[row].project].folder != to || !SameChat(*chat, session.id)) {
+            continue;
+        }
+        const size_t first = firstRow_;
+        ShowSideRow(row);
+        if (firstRow_ != first && !gallery_) {  // the list scrolled to it: that slides too, so the row can be followed
+            const float shift = (static_cast<float>(firstRow_) - static_cast<float>(first)) * kHistoryRow;
+            for (size_t other = 0; other < rows_.size(); ++other) {
+                rowFrom_[RowKey(other)] += shift;
+            }
+            slideStart_ = std::chrono::steady_clock::now();
+            SetTimer(hwnd_, kSlideTimer, kSlideFrame, nullptr);
+        }
+        break;
+    }
+    hover_ = HitTest(mouse_.x, mouse_.y);
     Refresh();
 }
 
@@ -7640,6 +8117,7 @@ void ChatWindow::ToggleVoice() {
         }
         SetTimer(hwnd_, kVoiceTimer, 250, nullptr);
         stick_ = true;
+        glide_.reset();  // the end of the feed wins over a wheel still on its way
         Refresh();
         return;
     }
@@ -7834,7 +8312,7 @@ void ChatWindow::StartUpdate() {
         return;
     }
     updatePending_ = false;
-    settings_.reopen = sessionId_;
+    settings_.reopen = OpenId();
     SaveSettings(settings_);
     // Silent, and /RELAUNCH brings AIControls back once the files are in (installer\aicontrols.iss).
     const auto started = reinterpret_cast<INT_PTR>(ShellExecuteW(
@@ -8140,15 +8618,36 @@ std::wstring ChatWindow::TooltipText() {
             return L"Остановить ответ (Esc)";
         }
         return busy_ ? L"Отправить сейчас: " + AgentName() + L" учтёт по ходу (Enter)" : L"Отправить (Enter)";
-    case Target::HistoryRow: {  // the whole title, when the row cuts it
+    case Target::HistoryRow: {  // the whole title, when the row cuts it; who answered in it, when both did
         const SessionInfo* session = RowSession(hover_.row);
         if (session == nullptr) {
             return {};
         }
+        if (IsDoomed(projects_[rows_[hover_.row].project].folder, *session)) {  // which chat it was
+            return session->title.empty() ? std::wstring() : L"«" + session->title + L"»";
+        }
         const Geometry g = Layout();
-        const float room = (g.sidebar.right - 14.f) - (g.sidebar.left + 16.f + kProjectIndent) - 64.f;
-        return !session->title.empty() && TextWidth(session->title, ui_.get()) > room ? session->title : std::wstring();
+        const float room = (g.sidebar.right - 14.f) - (g.sidebar.left + 30.f + kProjectIndent) - 64.f;
+        std::wstring tip =
+            !session->title.empty() && TextWidth(session->title, ui_.get()) > room ? session->title : std::wstring();
+        if (const std::wstring agents = ChatAgents(*session); agents.find(L',') != std::wstring::npos) {
+            tip += (tip.empty() ? L"" : L"\n") + agents;
+        }
+        if (const auto draft = drafts_.find(DraftKey(*session)); draft != drafts_.end()) {  // what waits in it
+            std::wstring text = NormalizeNewlines(draft->second);
+            std::ranges::replace(text, L'\n', L' ');
+            constexpr size_t kLongest = 80;
+            if (text.size() > kLongest) {
+                text = text.substr(0, kLongest) + L"…";
+            }
+            tip += (tip.empty() ? L"" : L"\n") + (L"Черновик: " + text);
+        }
+        return tip;
     }
+    case Target::ChatMore:
+        return L"Меню чата: переименовать, перенести, удалить";
+    case Target::SearchClear:
+        return L"Сбросить поиск (Esc)";
     case Target::ProjectRow:
         return RowProject(hover_.row) != nullptr ? RowProject(hover_.row)->folder : std::wstring();
     case Target::ProjectNew:
@@ -8411,6 +8910,13 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
             return ProjectNewRect(r);
         }
         break;
+    case Target::ChatMore:
+        if (const D2D1_RECT_F r = SideRowRect(g, row); r.right > r.left) {
+            return ChatMoreRect(row, r);
+        }
+        break;
+    case Target::SearchClear:
+        return SearchClearRect(g);
     case Target::AddProject:
         return g.addProject;
     case Target::ProjectsLabel:
@@ -8436,7 +8942,7 @@ void ChatWindow::BeginRename(Rename what, size_t index) {
         SetTerminalOpen(true);
     } else if (what == Rename::Chat) {
         const SessionInfo* session = RowSession(index);
-        if (session == nullptr) {
+        if (session == nullptr || IsDoomed(projects_[rows_[index].project].folder, *session)) {
             return;
         }
         renameChat_ = session->id;
@@ -8479,7 +8985,10 @@ void ChatWindow::CommitRename() {
         }
     } else if (what == Rename::Chat && !text.empty()) {
         if (RenameSession(renameFolder_, renameChat_, text)) {
-            if (renameChat_ == sessionId_ && renameFolder_ == workspace_) {
+            const auto project = std::ranges::find(projects_, renameFolder_, &Project::folder);
+            if (project != projects_.end() && std::ranges::any_of(project->sessions, [&](const SessionInfo& session) {
+                    return session.id == renameChat_ && IsOpenChat(renameFolder_, session);
+                })) {
                 title_ = text;
             }
             RefreshSessions();
@@ -8652,11 +9161,11 @@ void ChatWindow::ShowAttachmentMenu(size_t index, POINT screen) {
 void ChatWindow::ShowTitleMenu(POINT screen) {
     constexpr UINT kRename = 1, kNew = 2;
     wil::unique_hmenu menu(CreatePopupMenu());
-    AppendMenuW(menu.get(), MF_STRING | (sessionId_.empty() ? MF_GRAYED : 0), kRename, L"Переименовать чат");
+    AppendMenuW(menu.get(), MF_STRING | (OpenId().empty() ? MF_GRAYED : 0), kRename, L"Переименовать чат");
     AppendMenuW(menu.get(), MF_STRING, kNew, L"Новый чат");
     switch (Menu(menu.get(), screen)) {
     case kRename: {
-        if (const auto row = RevealChat(workspace_, sessionId_)) {
+        if (const auto row = RevealChat(workspace_, OpenId())) {
             BeginRename(Rename::Chat, *row);
         } else {
             Flash(L"Чат ещё не сохранён: сначала напишите что-нибудь", 3000);
@@ -8747,16 +9256,18 @@ void ChatWindow::FilterSessions(bool pickFirst) {
             continue;
         }
         rows_.push_back({p, kHead});  // the general chats': their section's label, never folded
-        if (query.empty() && project.folder != DefaultWorkspace() && ProjectFolded(project.folder)) {
-            continue;
-        }
+        const bool folded = query.empty() && project.folder != DefaultWorkspace() && ProjectFolded(project.folder);
         // The open chat, new: first under its project (a new chat unfolds it), it says where the chat is.
         if (query.empty() && project.folder == workspace_ &&
-            std::ranges::find(project.sessions, sessionId_, &SessionInfo::id) == project.sessions.end()) {
+            std::ranges::none_of(project.sessions, [&](const SessionInfo& session) { return SameChat(session, OpenId()); })) {
             rows_.push_back({p, kDraft});
         }
         for (const size_t i : chats) {
-            rows_.push_back({p, i});
+            // Folded, a project still shows what must not go out of sight: the open chat, one answering aside.
+            const SessionInfo& session = project.sessions[i];
+            if (!folded || IsOpenChat(project.folder, session) || ParkedChat(project.folder, session) != nullptr) {
+                rows_.push_back({p, i});
+            }
         }
     }
     if (pickFirst) {
@@ -8859,26 +9370,30 @@ void ChatWindow::JumpProject(int delta) {
 
 void ChatWindow::OpenSession(size_t row) {
     if (const SessionInfo* session = RowSession(row)) {
+        if (IsDoomed(projects_[rows_[row].project].folder, *session)) {  // a deleted chat's row: "Вернуть"
+            UndoDelete();
+            return;
+        }
+        const bool found = !searchText_.empty();
         OpenChat(projects_[rows_[row].project].folder, *session);
+        if (found) {  // the whole list again, the chat in it: a search left on hid chats (29.10.2026)
+            RevealOpened();
+        }
     }
 }
 
+// The open chat's row in sight (a folded project shows it too): the search off, the list scrolled to it.
 void ChatWindow::RevealOpened() {
     if (!searchText_.empty()) {
         searchText_.clear();
         searchFocus_ = false;
     }
-    if (ProjectFolded(workspace_)) {
-        std::erase(settings_.closedProjects, workspace_);
-        SaveSettings(settings_);
-    }
     RefreshSessions();
     for (size_t row = 0; row < rows_.size(); ++row) {
-        const bool draft = rows_[row].session == kDraft && projects_[rows_[row].project].folder == workspace_ &&
-                           sessionId_.empty();
+        const std::wstring& folder = projects_[rows_[row].project].folder;
         const SessionInfo* session = RowSession(row);
-        if (draft || (session != nullptr && session->id == sessionId_ &&
-                      projects_[rows_[row].project].folder == workspace_)) {
+        if ((rows_[row].session == kDraft && folder == workspace_) ||
+            (session != nullptr && IsOpenChat(folder, *session))) {
             ShowSideRow(row);
             return;
         }
@@ -8886,33 +9401,31 @@ void ChatWindow::RevealOpened() {
     Refresh();
 }
 
+// Through the list as it is seen (29.10.2026): the next chat up or down, on into the next project, past the heads,
+// the folded projects' chats and a deleted one.
 void ChatWindow::StepChat(int delta) {
-    const auto found = std::ranges::find(projects_, workspace_, &Project::folder);
-    if (found == projects_.end()) {
-        return;
-    }
-    int index = -1;  // the new chat sits ahead of every saved one
-    if (!sessionId_.empty()) {
-        for (size_t i = 0; i < found->sessions.size(); ++i) {
-            if (found->sessions[i].id == sessionId_) {
-                index = static_cast<int>(i);
-                break;
-            }
+    const long long count = static_cast<long long>(rows_.size());
+    long long at = delta > 0 ? -1 : count;  // the open chat not in the list: from its end
+    for (size_t row = 0; row < rows_.size(); ++row) {
+        const std::wstring& folder = projects_[rows_[row].project].folder;
+        const SessionInfo* session = RowSession(row);
+        if ((rows_[row].session == kDraft && folder == workspace_) ||
+            (session != nullptr && IsOpenChat(folder, *session))) {
+            at = static_cast<long long>(row);
+            break;
         }
     }
-    const int next = index + delta;
-    if (next < 0) {
-        Flash(L"Выше чатов нет");
-        return;
+    for (long long row = at + delta; row >= 0 && row < count; row += delta) {
+        const SessionInfo* session = RowSession(static_cast<size_t>(row));
+        const std::wstring folder = projects_[rows_[static_cast<size_t>(row)].project].folder;
+        if (session != nullptr && !IsDoomed(folder, *session)) {
+            const SessionInfo next = *session;
+            OpenChat(folder, next);
+            RevealOpened();
+            return;
+        }
     }
-    if (next >= static_cast<int>(found->sessions.size())) {
-        Flash(L"Ниже чатов нет");
-        return;
-    }
-    const std::wstring folder = found->folder;
-    const SessionInfo session = found->sessions[static_cast<size_t>(next)];
-    OpenChat(folder, session);
-    RevealOpened();
+    Flash(delta < 0 ? L"Выше чатов нет" : L"Ниже чатов нет");
 }
 
 void ChatWindow::StepProject(int delta) {
@@ -8966,7 +9479,7 @@ void ChatWindow::ShowProjectOrderMenu() {
     constexpr UINT kRecent = 1, kName = 2, kAdded = 3;
     wil::unique_hmenu menu(CreatePopupMenu());
     const auto mark = [&](ProjectOrder order) { return settings_.projectOrder == order ? MF_CHECKED : 0; };
-    AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Recent), kRecent, L"Сначала недавние	открытый сверху");
+    AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Recent), kRecent, L"Сначала недавние	по последнему сообщению");
     AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Name), kName, L"По имени");
     AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Added), kAdded,
                 L"Как добавлены	правый клик — выше и ниже");
@@ -9007,12 +9520,12 @@ void ChatWindow::MoveProject(const std::wstring& folder, int delta) {
 // A chat of any project: its project becomes the chat's folder, and the CLI resumes it there.
 void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     ClosePopup();
-    if (session.id == sessionId_ && folder == workspace_) {
+    if (IsOpenChat(folder, session)) {
         return;
     }
     LeaveChat();
     if (const auto found = std::ranges::find_if(parked_, [&](const std::unique_ptr<Parked>& chat) {
-            return chat->workspace == folder && ParkedKey(*chat) == session.id;
+            return chat->workspace == folder && SameChat(session, ParkedKey(*chat));
         });
         found != parked_.end()) {
         const std::unique_ptr<Parked> chat = std::move(*found);
@@ -9021,6 +9534,7 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
         settings_.model = chat->model;
         settings_.effort = chat->effort;
         SetWorkspace(workspace_);  // saved as the open project, with the model
+        TakeDraft(DraftKey(session));
         hover_ = {};
         PlaceChildren();
         RefreshSessions();
@@ -9031,64 +9545,89 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
         SetWorkspace(folder);
         PlaceChildren();  // the folder's chip under the input
     }
+    // Its place in the list is its time now: opened, Grok rewrites its files, and the chat would jump up.
+    NoteChatOpened(session.id, FileTicks(session.modified));
+    // A chat in parts (Claude, then Grok…) is one feed: the newest entries, a line where the other CLI took over.
+    std::vector<SessionPart> parts = session.parts;
+    if (parts.empty()) {
+        parts.push_back({session.id, session.grok});
+    }
+    std::vector<std::pair<bool, std::vector<TranscriptEntry>>> loaded;  // grok's?, the part's entries
     bool truncated = false;
-    const std::vector<TranscriptEntry> entries = LoadTranscript(workspace_, session.id, kTranscriptLimit, truncated);
+    size_t budget = kTranscriptLimit;
+    for (auto part = parts.rbegin(); part != parts.rend() && !truncated; ++part) {
+        if (budget == 0) {
+            truncated = true;
+            break;
+        }
+        std::vector<TranscriptEntry> entries = LoadTranscript(workspace_, part->id, budget, truncated);
+        budget -= std::min(budget, entries.size());
+        loaded.emplace_back(part->grok, std::move(entries));
+    }
+    std::ranges::reverse(loaded);
     if (truncated) {
         Add(Kind::Notice, std::format(L"Показаны последние {} сообщений.", kTranscriptLimit));
     }
-    for (const TranscriptEntry& entry : entries) {
-        switch (entry.kind) {
-        case EntryKind::User:
-            Add(Kind::User, entry.text);
-            for (const TranscriptImage& picture : entry.images) {
-                if (FeedImage image = MakeFeedImage(SaveChatImage(picture.base64, picture.mediaType)); image.preview) {
-                    feed_.back().images.push_back(std::move(image));
+    for (size_t p = 0; p < loaded.size(); ++p) {
+        const bool grok = loaded[p].first;
+        if (p > 0) {
+            Add(Kind::Notice, std::format(L"Дальше отвечает {}, с перепиской выше", grok ? L"Grok" : L"Claude"));
+        }
+        for (const TranscriptEntry& entry : loaded[p].second) {
+            switch (entry.kind) {
+            case EntryKind::User:
+                Add(Kind::User, entry.text);
+                for (const TranscriptImage& picture : entry.images) {
+                    if (FeedImage image = MakeFeedImage(SaveChatImage(picture.base64, picture.mediaType));
+                        image.preview) {
+                        feed_.back().images.push_back(std::move(image));
+                    }
                 }
-            }
-            break;
-        case EntryKind::Assistant: {  // the history keeps no models: the CLI's name only
-            const bool first = !TurnWho().empty();
-            Add(Kind::Assistant, entry.text);
-            if (first) {
-                feed_.back().who = session.grok ? L"Grok" : L"Claude";
-            }
-            break;
-        }
-        case EntryKind::Compacted:
-            Add(Kind::Notice, session.grok ? L"Чат сжат: дальше Grok помнит начало по сводке; выше — без шагов"
-                                           : L"Чат сжат: дальше Claude помнит начало по сводке");
-            break;
-        case EntryKind::Tool: {
-            const std::string full = ToUtf8(entry.text);
-            const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
-            const Json input = Json::parse(entry.toolInput, nullptr, false);
-            if (own.empty() || !input.is_object()) {
-                Add(Kind::Notice, L"инструмент: " + entry.text, true);
+                break;
+            case EntryKind::Assistant: {  // the history keeps no models: the CLI's name only
+                const bool first = !TurnWho().empty();
+                Add(Kind::Assistant, entry.text);
+                if (first) {
+                    feed_.back().who = grok ? L"Grok" : L"Claude";
+                }
                 break;
             }
-            ToolSummary summary = SummarizeTool(own, input);
-            if (own == "web_search") {  // as it was shown: a line
-                Add(Kind::Notice, summary.title + L": " + summary.detail, true);
+            case EntryKind::Compacted:
+                Add(Kind::Notice, grok ? L"Чат сжат: дальше Grok помнит начало по сводке; выше — без шагов"
+                                       : L"Чат сжат: дальше Claude помнит начало по сводке");
+                break;
+            case EntryKind::Tool: {
+                const std::string full = ToUtf8(entry.text);
+                const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
+                const Json input = Json::parse(entry.toolInput, nullptr, false);
+                if (own.empty() || !input.is_object()) {
+                    Add(Kind::Notice, L"инструмент: " + entry.text, true);
+                    break;
+                }
+                ToolSummary summary = SummarizeTool(own, input);
+                if (own == "web_search") {  // as it was shown: a line
+                    Add(Kind::Notice, summary.title + L": " + summary.detail, true);
+                    break;
+                }
+                // Our own tools (and Grok's pictures) come back as the card they were: the call, and what it printed.
+                FeedItem item;
+                item.kind = Kind::Approval;
+                item.title = std::move(summary.title);
+                item.text = std::move(summary.detail);
+                item.tool = own;
+                item.input = input;
+                item.toolUseId = entry.toolId;
+                item.verdict = Verdict::Allowed;
+                item.output = entry.toolOutput;
+                item.outputError = entry.toolFailed;
+                item.done = entry.toolAnswered;
+                if (item.done && GrokOwnTool(own)) {
+                    SettleGrokTool(item);
+                }
+                feed_.push_back(std::move(item));
                 break;
             }
-            // Our own tools (and Grok's pictures) come back as the card they were: the call, and what it printed.
-            FeedItem item;
-            item.kind = Kind::Approval;
-            item.title = std::move(summary.title);
-            item.text = std::move(summary.detail);
-            item.tool = own;
-            item.input = input;
-            item.toolUseId = entry.toolId;
-            item.verdict = Verdict::Allowed;
-            item.output = entry.toolOutput;
-            item.outputError = entry.toolFailed;
-            item.done = entry.toolAnswered;
-            if (item.done && GrokOwnTool(own)) {
-                SettleGrokTool(item);
             }
-            feed_.push_back(std::move(item));
-            break;
-        }
         }
     }
     if (session.grok != GrokSelected()) {  // only the CLI that keeps the chat can go on with it
@@ -9110,7 +9649,9 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     }
     sessionId_ = session.id;
     title_ = session.title;
+    lastSent_ = FileTicks(session.modified);  // its place, while it answers aside
     StartClaude();
+    TakeDraft(DraftKey(session));
     RebuildRows();  // no new chat under the project any more
 }
 
@@ -9342,6 +9883,7 @@ void ChatWindow::Apply(const Settings& next) {
         runner_->agent->Stop();
         running_ = false;
         busy_ = false;
+        chainFrom_ = OpenId();  // the list keeps one chat (29.10.2026: it showed two, and a "new" one in between)
         sessionId_.clear();
         lastContext_ = 0;
         currentMessageId_.clear();
@@ -9447,6 +9989,8 @@ void ChatWindow::ResetChat() {
     busy_ = false;
     sessionId_.clear();
     handoff_.clear();
+    chainFrom_.clear();
+    lastSent_ = 0;
     title_.clear();
     lastContext_ = 0;
     currentMessageId_.clear();
@@ -9455,10 +9999,12 @@ void ChatWindow::ResetChat() {
     ClearFeedSelection();
     scroll_ = 0;
     stick_ = true;
+    glide_.reset();
 }
 
 void ChatWindow::SwapChat(Parked& chat) {
     using std::swap;
+    glide_.reset();  // the wheel was moving the chat that leaves, not the one that comes
     swap(runner_, chat.runner);
     swap(feed_, chat.feed);
     swap(scroll_, chat.scroll);
@@ -9473,6 +10019,8 @@ void ChatWindow::SwapChat(Parked& chat) {
     swap(currentMessageId_, chat.currentMessageId);
     swap(streamed_, chat.streamed);
     swap(handoff_, chat.handoff);
+    swap(chainFrom_, chat.chainFrom);
+    swap(lastSent_, chat.lastSent);
     swap(workspace_, chat.workspace);
     swap(folderName_, chat.folderName);
     swap(autoModel_, chat.autoModel);
@@ -9483,6 +10031,7 @@ void ChatWindow::SwapChat(Parked& chat) {
 }
 
 void ChatWindow::LeaveChat() {
+    StashDraft();
     if (!running_ || !busy_) {
         ResetChat();
         return;
@@ -9502,6 +10051,51 @@ void ChatWindow::LeaveChat() {
     Flash(L"Тот чат отвечает дальше в фоне: точка слева", 4000);
     ResetChat();
     RefreshSessions();
+}
+
+// What was typed stays with its chat (29.10.2026: it went on to the next one opened, and was sent there): put
+// aside when another chat takes the window, back when it is open again; its row shows a pencil meanwhile.
+std::string ChatWindow::DraftKey(const SessionInfo& session) {
+    return session.linked.empty() ? session.id : session.linked.front();
+}
+
+std::string ChatWindow::OpenDraftKey() const {
+    if (const auto project = std::ranges::find(projects_, workspace_, &Project::folder); project != projects_.end()) {
+        for (const SessionInfo& session : project->sessions) {
+            if (IsOpenChat(workspace_, session)) {
+                return DraftKey(session);
+            }
+        }
+    }
+    return "*" + ToUtf8(workspace_);  // a new chat: the next new one in its project gets it
+}
+
+void ChatWindow::StashDraft() {
+    const std::wstring text = WindowText(input_);
+    const std::string key = OpenDraftKey();
+    if (text.find_first_not_of(L" \t\r\n") == std::wstring::npos) {
+        if (running_ || !OpenId().empty()) {  // a chat is open (not one just ended): its draft was wiped
+            drafts_.erase(key);
+        }
+    } else {
+        drafts_[key] = text;
+    }
+    if (!text.empty()) {
+        SetWindowTextW(input_, L"");
+        PlaceChildren();
+    }
+}
+
+void ChatWindow::TakeDraft(const std::string& key) {
+    const auto found = drafts_.find(key);
+    if (found == drafts_.end()) {
+        return;
+    }
+    SetWindowTextW(input_, found->second.c_str());
+    const int end = GetWindowTextLengthW(input_);
+    SendMessageW(input_, EM_SETSEL, end, end);  // the caret where the typing stopped
+    drafts_.erase(found);
+    PlaceChildren();
 }
 
 void ChatWindow::OnParked(Parked& chat, const std::function<void()>& handle) {
@@ -9525,7 +10119,7 @@ void ChatWindow::OnParked(Parked& chat, const std::function<void()>& handle) {
     SwapChat(chat);
     feedSelecting_ = selecting;
     if (done || asks || renamed) {
-        RefreshSessions();
+        ListChanged();
     }
     const std::wstring name = chat.title.empty() ? std::wstring(L"чат в фоне") : L"«" + chat.title + L"»";
     if (asks) {
@@ -9546,20 +10140,24 @@ ChatWindow::Parked* ChatWindow::ParkedAt(WPARAM generation) {
     return found != parked_.end() ? found->get() : nullptr;
 }
 
-const ChatWindow::Parked* ChatWindow::ParkedChat(const std::wstring& folder, const std::string& key) const {
+const ChatWindow::Parked* ChatWindow::ParkedChat(const std::wstring& folder, const SessionInfo& session) const {
     const auto found = std::ranges::find_if(parked_, [&](const std::unique_ptr<Parked>& chat) {
-        return chat->workspace == folder && ParkedKey(*chat) == key;
+        return chat->workspace == folder && SameChat(session, ParkedKey(*chat));
     });
     return found != parked_.end() ? found->get() : nullptr;
 }
 
 std::string ChatWindow::ParkedKey(const Parked& chat) {
-    return chat.sessionId.empty() ? "aic-parked-" + std::to_string(chat.generation) : chat.sessionId;
+    if (!chat.sessionId.empty()) {
+        return chat.sessionId;
+    }
+    // Switched to the other CLI and not answered yet: still the chat it went on from.
+    return chat.chainFrom.empty() ? "aic-parked-" + std::to_string(chat.generation) : chat.chainFrom;
 }
 
-void ChatWindow::DropParked(const std::wstring& folder, const std::string& key) {
+void ChatWindow::DropParked(const std::wstring& folder, const SessionInfo& session) {
     const auto gone = std::ranges::remove_if(parked_, [&](const std::unique_ptr<Parked>& chat) {
-        if (chat->workspace != folder || ParkedKey(*chat) != key) {
+        if (chat->workspace != folder || !SameChat(session, ParkedKey(*chat))) {
             return false;
         }
         chat->runner->host.CancelAll();
@@ -9577,11 +10175,8 @@ void ChatWindow::NewChat() {
     ClosePopup();
     LeaveChat();
     StartClaude();
-    if (ProjectFolded(workspace_)) {  // the new chat shows under its project
-        std::erase(settings_.closedProjects, workspace_);
-        SaveSettings(settings_);
-    }
-    RebuildRows();
+    TakeDraft("*" + ToUtf8(workspace_));
+    RebuildRows();  // the new chat shows under its project, folded or not
 }
 
 void ChatWindow::Submit() {
@@ -9638,6 +10233,12 @@ void ChatWindow::Submit() {
     PlaceChildren();
     busy_ = true;
     stick_ = true;
+    glide_.reset();
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    lastSent_ = FileTicks(now);
+    NoteChatActive(sessionId_, lastSent_);  // up the list, as a messenger does; a new Claude chat: at its init
+    ListChanged();
     StartPuff();
     Refresh();
 }
@@ -9648,6 +10249,10 @@ void ChatWindow::OnClaude(const Json& message) {
         const std::string subtype = JsonStr(message, "subtype");
         if (subtype == "init") {
             sessionId_ = JsonStr(message, "session_id");
+            if (!chainFrom_.empty() && !sessionId_.empty()) {
+                LinkChats(std::exchange(chainFrom_, {}), sessionId_);
+            }
+            NoteChatActive(sessionId_, lastSent_);  // Claude's first message: its id comes only now
         } else if (subtype == "session_state_changed") {
             stateEvents_ = true;
             busy_ = JsonStr(message, "state") != "idle";
@@ -9755,10 +10360,12 @@ void ChatWindow::OnClaude(const Json& message) {
             }
         }
         if (!sessionId_.empty()) {
-            if (std::wstring title = SessionTitle(workspace_, sessionId_); !title.empty()) {
-                title_ = std::move(title);
+            const std::vector<SessionInfo> listed = ListSessions(workspace_);  // a chat in parts: its first part's title
+            const auto chat = std::ranges::find_if(listed, [&](const SessionInfo& s) { return SameChat(s, sessionId_); });
+            if (chat != listed.end() && !chat->title.empty()) {
+                title_ = chat->title;
             }
-            RefreshSessions();  // a new chat appears in the list, a title may have changed
+            ListChanged();  // a new chat appears in the list, a title may have changed
         }
     } else if (type == "aic_usage") {  // Grok's plan: what _x.ai/billing answered
         const PlanUsage usage = ParseGrokBilling(JsonAt(message, "billing").dump());
@@ -9902,6 +10509,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     }
     feed_.push_back(std::move(item));
     stick_ = true;
+    glide_.reset();
 }
 
 // A tool's result, as the CLI echoes it back: the card of that call shows it.
@@ -10136,6 +10744,7 @@ void ChatWindow::FillGallery() {
     SetTimer(hwnd_, kParkedTimer, kParkedFrame, nullptr);
     RefreshSessions();
     stick_ = true;
+    glide_.reset();
     Refresh();
 }
 

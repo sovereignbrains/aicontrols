@@ -626,6 +626,170 @@ fs::path SettingsFile() {
     return fs::path(KnownFolder(FOLDERID_RoamingAppData)) / L"AIControls" / L"settings.json";
 }
 
+bool g_settingsReadOnly = false;
+
+// ---- chats.json: {"chats":[{"sessions":[id…],"title":"…","active":ticks}]}. Kept by session id alone (a UUID either
+// CLI gives), so a chat moved to another project keeps its line.
+
+struct ChatRecord {
+    std::vector<std::string> sessions;  // oldest first
+    std::wstring title;                 // given in the sidebar
+    uint64_t active = 0;                // the last message sent, FILETIME ticks; 0: not known
+};
+
+struct ChatIndex {
+    std::vector<ChatRecord> records;
+    uint64_t stamp = 0;  // the file's, as last read or written
+    uint64_t size = 0;
+    bool read = false;
+};
+
+std::mutex g_chatsMutex;  // list_chats and read_chat list the chats on their threads
+ChatIndex g_chats;
+std::wstring g_chatsFile;  // tests: their own
+
+fs::path ChatIndexFile() {
+    return !g_chatsFile.empty() ? fs::path(g_chatsFile) : SettingsFile().parent_path() / L"chats.json";
+}
+
+// The index as the file has it now. Under g_chatsMutex.
+ChatIndex& Chats() {
+    const fs::path file = ChatIndexFile();
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data)) {
+        return g_chats;  // none yet: what this run has noted, if anything
+    }
+    const uint64_t stamp = ToTicks(data.ftLastWriteTime);
+    const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    if (g_chats.read && g_chats.stamp == stamp && g_chats.size == size) {
+        return g_chats;
+    }
+    g_chats = {};
+    g_chats.read = true;
+    g_chats.stamp = stamp;
+    g_chats.size = size;
+    std::ifstream in(file, std::ios::binary);
+    const Json parsed = Json::parse(in, nullptr, false);
+    for (const Json& chat : JsonAt(parsed, "chats")) {
+        ChatRecord record;
+        for (const Json& id : JsonAt(chat, "sessions")) {
+            if (id.is_string() && !id.get<std::string>().empty()) {
+                record.sessions.push_back(id.get<std::string>());
+            }
+        }
+        record.title = ToWide(JsonStr(chat, "title"));
+        if (const Json& active = JsonAt(chat, "active"); active.is_number_unsigned()) {
+            record.active = active.get<uint64_t>();
+        }
+        if (!record.sessions.empty()) {
+            g_chats.records.push_back(std::move(record));
+        }
+    }
+    return g_chats;
+}
+
+// Under g_chatsMutex. Written whole to a file beside it, then put in its place: a crash leaves the old one.
+void SaveChats(ChatIndex& index) {
+    if (g_settingsReadOnly) {
+        return;
+    }
+    Json chats = Json::array();
+    for (const ChatRecord& record : index.records) {
+        Json item{{"sessions", record.sessions}};
+        if (!record.title.empty()) {
+            item["title"] = ToUtf8(record.title);
+        }
+        if (record.active != 0) {
+            item["active"] = record.active;
+        }
+        chats.push_back(std::move(item));
+    }
+    const fs::path file = ChatIndexFile();
+    fs::path temp = file;
+    temp += L".tmp";
+    std::error_code error;
+    fs::create_directories(file.parent_path(), error);
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        out << Json{{"chats", std::move(chats)}}.dump(1, '\t', false, Json::error_handler_t::replace) << "\n";
+        if (!out.good()) {
+            return;
+        }
+    }
+    if (!MoveFileExW(temp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data)) {
+        index.stamp = ToTicks(data.ftLastWriteTime);
+        index.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    }
+}
+
+ChatRecord* RecordOf(ChatIndex& index, const std::string& id) {
+    for (ChatRecord& record : index.records) {
+        if (std::ranges::find(record.sessions, id) != record.sessions.end()) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+FILETIME FromTicks(uint64_t ticks) {
+    return FILETIME{static_cast<DWORD>(ticks & 0xFFFFFFFF), static_cast<DWORD>(ticks >> 32)};
+}
+
+// The sessions found in a workspace's folders, each its own chat, made into the chats the index says they are.
+std::vector<SessionInfo> JoinChats(std::vector<SessionInfo> found) {
+    std::vector<ChatRecord> records;
+    {
+        const std::lock_guard lock(g_chatsMutex);
+        records = Chats().records;
+    }
+    std::map<std::string, size_t> recordOf;
+    for (size_t r = 0; r < records.size(); ++r) {
+        for (const std::string& id : records[r].sessions) {
+            recordOf.emplace(id, r);
+        }
+    }
+    std::vector<SessionInfo> chats;
+    std::map<size_t, std::vector<SessionInfo>> parts;  // a record's sessions found here
+    for (SessionInfo& session : found) {
+        if (const auto r = recordOf.find(session.id); r != recordOf.end()) {
+            parts[r->second].push_back(std::move(session));
+            continue;
+        }
+        session.parts = {{session.id, session.grok}};
+        session.linked = {session.id};
+        chats.push_back(std::move(session));
+    }
+    for (auto& [r, list] : parts) {
+        const ChatRecord& record = records[r];
+        const auto place = [&](const SessionInfo& session) { return std::ranges::find(record.sessions, session.id); };
+        std::ranges::sort(list, [&](const SessionInfo& a, const SessionInfo& b) { return place(a) < place(b); });
+        std::wstring title = record.title;
+        for (const SessionInfo& session : list) {  // else the first part's: the later ones open with the handoff
+            if (title.empty()) {
+                title = session.title;
+            }
+        }
+        SessionInfo chat = list.back();
+        for (const SessionInfo& session : list) {
+            chat.parts.push_back({session.id, session.grok});
+        }
+        chat.linked = record.sessions;
+        chat.title = std::move(title);
+        if (record.active != 0) {
+            chat.modified = FromTicks(record.active);
+        }
+        chats.push_back(std::move(chat));
+    }
+    std::ranges::sort(chats, [](const SessionInfo& a, const SessionInfo& b) {
+        return ToTicks(a.modified) > ToTicks(b.modified);
+    });
+    return chats;
+}
+
 }  // namespace
 
 std::wstring DefaultWorkspace() {
@@ -682,10 +846,67 @@ std::vector<SessionInfo> ListSessions(const std::wstring& workspace) {
         session.grok = true;
         sessions.push_back(std::move(session));
     }
-    std::ranges::sort(sessions, [](const SessionInfo& a, const SessionInfo& b) {
-        return ToTicks(a.modified) > ToTicks(b.modified);
+    return JoinChats(std::move(sessions));
+}
+
+void NoteChatActive(const std::string& id, uint64_t ticks) {
+    if (id.empty() || ticks == 0) {
+        return;
+    }
+    const std::lock_guard lock(g_chatsMutex);
+    ChatIndex& index = Chats();
+    if (ChatRecord* record = RecordOf(index, id)) {
+        if (record->active == ticks) {
+            return;
+        }
+        record->active = ticks;
+    } else {
+        index.records.push_back({{id}, {}, ticks});
+    }
+    SaveChats(index);
+}
+
+void NoteChatOpened(const std::string& id, uint64_t ticks) {
+    if (id.empty() || ticks == 0) {
+        return;
+    }
+    const std::lock_guard lock(g_chatsMutex);
+    ChatIndex& index = Chats();
+    if (ChatRecord* record = RecordOf(index, id)) {
+        if (record->active != 0) {
+            return;
+        }
+        record->active = ticks;
+    } else {
+        index.records.push_back({{id}, {}, ticks});
+    }
+    SaveChats(index);
+}
+
+void LinkChats(const std::string& from, const std::string& to) {
+    if (from.empty() || to.empty() || from == to) {
+        return;
+    }
+    const std::lock_guard lock(g_chatsMutex);
+    ChatIndex& index = Chats();
+    std::erase_if(index.records, [&](const ChatRecord& record) {  // `to` is new; a line of its own would be stale
+        return record.sessions.size() == 1 && record.sessions.front() == to;
     });
-    return sessions;
+    ChatRecord* record = RecordOf(index, from);
+    if (record == nullptr) {
+        index.records.push_back({{from}, {}, 0});
+        record = &index.records.back();
+    }
+    const auto at = std::ranges::find(record->sessions, from);
+    record->sessions.erase(at + 1, record->sessions.end());
+    record->sessions.push_back(to);
+    SaveChats(index);
+}
+
+void SetChatIndexFile(const std::wstring& file) {
+    const std::lock_guard lock(g_chatsMutex);
+    g_chatsFile = file;
+    g_chats = {};
 }
 
 bool DeleteSession(const std::wstring& workspace, const std::string& id) {
@@ -711,8 +932,17 @@ bool DeleteSession(const std::wstring& workspace, const std::string& id) {
     operation.wFunc = FO_DELETE;
     operation.pFrom = paths.c_str();
     operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
-    return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted && !fs::exists(file, error) &&
-           !fs::exists(grok, error);
+    const bool deleted = SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted &&
+                         !fs::exists(file, error) && !fs::exists(grok, error);
+    if (deleted) {
+        const std::lock_guard lock(g_chatsMutex);
+        ChatIndex& index = Chats();
+        if (const ChatRecord* record = RecordOf(index, id)) {
+            index.records.erase(index.records.begin() + (record - index.records.data()));
+            SaveChats(index);
+        }
+    }
+    return deleted;
 }
 
 bool MoveSession(const std::wstring& from, const std::wstring& to, const std::string& id) {
@@ -741,6 +971,14 @@ bool MoveSession(const std::wstring& from, const std::wstring& to, const std::st
 bool RenameSession(const std::wstring& workspace, const std::string& id, const std::wstring& title) {
     if (id.empty() || id.find_first_of("/\\.:") != std::string::npos || title.empty()) {
         return false;
+    }
+    {
+        const std::lock_guard lock(g_chatsMutex);
+        ChatIndex& index = Chats();
+        if (ChatRecord* record = RecordOf(index, id); record != nullptr && record->title != title) {
+            record->title = title;
+            SaveChats(index);
+        }
     }
     const fs::path file = SessionFile(workspace, id);
     std::error_code error;
@@ -886,7 +1124,7 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
 }
 
 std::vector<ProjectPlace> OrderProjects(std::vector<ProjectPlace> projects, const std::wstring& general,
-                                        const std::wstring& open, ProjectOrder order) {
+                                        ProjectOrder order) {
     const size_t count = projects.size();
     std::vector<size_t> index(count);
     for (size_t i = 0; i < count; ++i) {
@@ -906,15 +1144,8 @@ std::vector<ProjectPlace> OrderProjects(std::vector<ProjectPlace> projects, cons
                                                  projects[b].name.c_str(), -1);
             return compared == CSTR_LESS_THAN;
         }
-        if (order == ProjectOrder::Recent) {
-            const bool aOpen = !open.empty() && projects[a].folder == open;
-            const bool bOpen = !open.empty() && projects[b].folder == open;
-            if (aOpen != bOpen) {
-                return aOpen;  // the project on screen stays where the eye already is
-            }
-            if (projects[a].activity != projects[b].activity) {
-                return projects[a].activity > projects[b].activity;
-            }
+        if (order == ProjectOrder::Recent && projects[a].activity != projects[b].activity) {
+            return projects[a].activity > projects[b].activity;
         }
         return false;  // Added, and any tie: the order they were given
     });
@@ -999,10 +1230,6 @@ Settings LoadSettings() {
     settings.projectOrder = ParseProjectOrder(JsonStr(data, "projectOrder"));
     return settings;
 }
-
-namespace {
-bool g_settingsReadOnly = false;
-}  // namespace
 
 void SetSettingsReadOnly(bool readOnly) {
     g_settingsReadOnly = readOnly;

@@ -35,6 +35,9 @@ int main() {
     std::error_code error;
     fs::remove_all(historyA, error);
     fs::remove_all(historyB, error);
+    const fs::path chatIndex = temp / L"aic_store_test_chats.json";  // not the user's chats.json
+    fs::remove(chatIndex, error);
+    aic::SetChatIndexFile(chatIndex.wstring());
     fs::create_directories(historyA / L"chat-1", error);
     std::ofstream(historyA / L"chat-1.jsonl") << R"({"type":"user","message":{"role":"user","content":"hello"}})" << "\n";
     std::ofstream(historyA / L"chat-1" / L"result.txt") << "x";
@@ -213,9 +216,51 @@ This session is being continued
                markdown->find("Прочитать файл") != std::string::npos && markdown->find("```\nhello\n```") != std::string::npos,
            "a chat as Markdown: its title, who said what, the tool's card and output");
     Expect(!aic::ChatMarkdown(a, "nope"), "no Markdown for a chat that is not there");
+
+    // A chat in parts: a switch from Claude to Grok goes on in a session of Grok's, chats.json makes them one.
+    const auto ticks = [](const FILETIME& time) {
+        return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    };
+    const auto chatOf = [](const std::vector<aic::SessionInfo>& list, const std::string& id) {
+        return std::ranges::find_if(list, [&](const aic::SessionInfo& chat) { return aic::SameChat(chat, id); });
+    };
+    aic::LinkChats("chat-2", "g-new");  // nothing said in Grok's session yet
+    listed = aic::ListSessions(a);
+    auto chain = chatOf(listed, "g-new");
+    Expect(chain != listed.end() && chain->id == "chat-2" && !chain->grok && chain->parts.size() == 1 &&
+               chain->linked == std::vector<std::string>{"chat-2", "g-new"},
+           "switched before anything was said: the chat as it was, its new session known");
+    aic::LinkChats("chat-2", "g-2");  // switched again, and said: the empty session is dropped
+    aic::NoteChatActive("g-2", 5);
+    listed = aic::ListSessions(a);
+    chain = chatOf(listed, "chat-2");
+    Expect(chain != listed.end() && chain->id == "g-2" && chain->grok && chain->parts.size() == 2 &&
+               chain->parts[0].id == "chat-2" && !chain->parts[0].grok && chain->parts[1].grok &&
+               chain->linked == std::vector<std::string>{"chat-2", "g-2"} && chain->title == L"remember pelican" &&
+               ticks(chain->modified) == 5,
+           "one row: Grok's session goes on, the first part's title, the time of the last message");
+    Expect(std::ranges::count_if(listed, [&](const aic::SessionInfo& chat) { return aic::SameChat(chat, "g-2"); }) == 1,
+           "and no row of its own for either part");
+    Expect(aic::RenameSession(a, "g-2", L"Пеликан") && chatOf(aic::ListSessions(a), "g-2")->title == L"Пеликан",
+           "a chat in parts renamed");
+    const std::optional<std::string> both = aic::ChatMarkdown(a, "chat-2");
+    Expect(both && both->find("remember pelican") != std::string::npos && both->find("Дальше отвечал Grok") != std::string::npos &&
+               both->find("нарисуй рыбу") != std::string::npos && both->find("Claude и Grok") != std::string::npos,
+           "a chat in parts as Markdown: both, one after the other");
+    aic::NoteChatOpened("g-1", 7);
+    aic::NoteChatOpened("g-1", 9);  // grok.exe rewrote its files on opening: the time as it was listed stays
+    Expect(ticks(chatOf(aic::ListSessions(a), "g-1")->modified) == 7, "an opened chat keeps its place");
+    aic::NoteChatActive("g-1", 11);
+    Expect(ticks(chatOf(aic::ListSessions(a), "g-1")->modified) == 11, "a message moves it up");
+    aic::SetChatIndexFile(chatIndex.wstring());  // read back from the file
+    listed = aic::ListSessions(a);
+    Expect(chatOf(listed, "g-2") != listed.end() && chatOf(listed, "g-2")->parts.size() == 2 &&
+               ticks(chatOf(listed, "g-1")->modified) == 11,
+           "chats.json read back");
+    fs::remove(chatIndex, error);
     fs::remove_all(grokA, error);
 
-    // The sidebar's order: the open project first when sorting by recent, the general chats always last.
+    // The sidebar's order: the general chats always last; by recent, the open project is not pulled up.
     const std::wstring general = L"general";
     const std::vector<aic::ProjectPlace> places = {
         {L"sov", L"Sovereign", 10},
@@ -231,13 +276,13 @@ This session is being continued
         }
         return names;
     };
-    Expect(foldersOf(aic::OrderProjects(places, general, L"sov", aic::ProjectOrder::Recent)) ==
-               std::vector<std::wstring>{L"sov", L"dpi", L"aic", L"old", general},
-           "recent: the open project, then the newest, ties keep the added order, general last");
-    Expect(foldersOf(aic::OrderProjects(places, general, L"aic", aic::ProjectOrder::Name)) ==
+    Expect(foldersOf(aic::OrderProjects(places, general, aic::ProjectOrder::Recent)) ==
+               std::vector<std::wstring>{L"dpi", L"aic", L"sov", L"old", general},
+           "recent: the newest first, ties keep the added order, general last");
+    Expect(foldersOf(aic::OrderProjects(places, general, aic::ProjectOrder::Name)) ==
                std::vector<std::wstring>{L"aic", L"dpi", L"sov", L"old", general},
            "name: A to Z, ignoring case, general still last");
-    Expect(foldersOf(aic::OrderProjects(places, general, L"sov", aic::ProjectOrder::Added)) ==
+    Expect(foldersOf(aic::OrderProjects(places, general, aic::ProjectOrder::Added)) ==
                std::vector<std::wstring>{L"sov", L"dpi", L"aic", L"old", general},
            "added: the given order, general pulled out to the end");
     Expect(aic::ParseProjectOrder("") == aic::ProjectOrder::Recent &&

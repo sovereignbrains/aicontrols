@@ -18,6 +18,27 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << (markdown ? *markdown : std::string("no such chat\n"));
         return markdown ? 0 : 1;
     }
+    if (argc > 3 && std::wstring(argv[1]) == L"--handoff") {  // what a switch of CLI would pass on: its size, its start
+        for (const auto& session : aic::ListSessions(argv[2])) {
+            if (!aic::SameChat(session, aic::ToUtf8(argv[3]))) {
+                continue;
+            }
+            auto parts = session.parts;
+            if (parts.empty()) {
+                parts.push_back({session.id, session.grok});
+            }
+            std::vector<std::pair<bool, std::vector<aic::TranscriptEntry>>> loaded;
+            for (const auto& part : parts) {
+                bool truncated = false;
+                loaded.emplace_back(part.grok, aic::LoadTranscript(argv[2], part.id, SIZE_MAX, truncated));
+            }
+            const std::string said = aic::ToUtf8(aic::ChatSoFar(loaded, 40'000));
+            std::cout << said.size() << " bytes\n" << said.substr(0, 600) << "\n…\n" << said.substr(said.size() - 300) << "\n";
+            return 0;
+        }
+        std::cout << "no such chat\n";
+        return 1;
+    }
     if (argc > 2 && std::wstring(argv[1]) == L"--grok") {  // a project's Grok chats, and what opening one shows
         for (const auto& session : aic::ListSessions(argv[2])) {
             if (!session.grok) {

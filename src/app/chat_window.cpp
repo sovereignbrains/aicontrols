@@ -9979,19 +9979,45 @@ void ChatWindow::Apply(const Settings& next) {
     if (otherCli) {
         // A conversation is the CLI's own: the other one starts its own, and the chat so far goes with the first
         // message (28.10.2026, his: a switch opened a new chat). The words stay in the feed.
+        // From its files, not the feed: a compacted chat goes as the CLI's summary and what was said after it
+        // (29.10.2026, his: make the handoff cheaper with the compaction).
         const std::wstring before = GrokSelected() ? L"Claude" : L"Grok";
+        constexpr size_t kLongest = 40'000;  // the words after the summary, the latest of them
         std::wstring said;
-        for (const FeedItem& item : feed_) {
-            if (item.kind == Kind::User || item.kind == Kind::Assistant) {
-                said += (item.kind == Kind::User ? L"\n\nUser: " : L"\n\n" + before + L": ") + item.text;
+        const std::vector<SessionInfo> listed = ListSessions(workspace_);
+        if (const auto chat = std::ranges::find_if(listed, [&](const SessionInfo& s) { return SameChat(s, OpenId()); });
+            chat != listed.end()) {
+            std::vector<SessionPart> parts = chat->parts;
+            if (parts.empty()) {
+                parts.push_back({chat->id, chat->grok});
+            }
+            std::vector<std::pair<bool, std::vector<TranscriptEntry>>> loaded;  // newest first, then turned
+            for (auto part = parts.rbegin(); part != parts.rend(); ++part) {
+                bool truncated = false;
+                loaded.emplace_back(part->grok, LoadTranscript(workspace_, part->id, SIZE_MAX, truncated));
+                const auto& entries = loaded.back().second;
+                if (std::ranges::any_of(entries, [](const TranscriptEntry& e) {
+                        return e.kind == EntryKind::Compacted && !e.text.empty();
+                    })) {
+                    break;  // the parts before it are in its summary
+                }
+            }
+            std::ranges::reverse(loaded);
+            said = ChatSoFar(loaded, kLongest);
+        }
+        if (said.empty()) {  // not in the list yet: what the feed shows
+            for (const FeedItem& item : feed_) {
+                if (item.kind == Kind::User || item.kind == Kind::Assistant) {
+                    said += (item.kind == Kind::User ? L"\n\nUser: " : L"\n\n" + before + L": ") + item.text;
+                }
+            }
+            if (said.size() > kLongest) {
+                said = L"\n\n…" + said.substr(said.size() - kLongest);
             }
         }
-        constexpr size_t kLongest = 80'000;  // the latest of a long chat
-        if (said.size() > kLongest) {
-            said = L"…" + said.substr(said.size() - kLongest);
-        }
-        handoff_ = "<earlier_chat>\nThis chat began with " + ToUtf8(before) +
-                   ", another assistant of this client; the user switched it to you. What was said so far:" +
+        handoff_ = "<earlier_chat>\nUntil now " + ToUtf8(before) +
+                   ", another assistant of this client, answered in this chat; the user switched it to you. "
+                   "The chat so far:" +
                    ToUtf8(said) + "\n</earlier_chat>";
         generation_ = ++generations_;
         runner_->host.CancelAll();

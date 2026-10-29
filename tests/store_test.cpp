@@ -60,13 +60,24 @@ int main() {
     std::ofstream(historyA / L"chat-2.jsonl")
         << R"({"type":"user","message":{"role":"user","content":"remember pelican"}})" << "\n"
         << R"({"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":3972,"post_tokens":743}})" << "\n"
-        << R"({"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}})" << "\n"
+        << R"({"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued )"
+        << R"(from a previous conversation.\n\n<system-reminder>x</system-reminder>\nSummary:\n1. the word is pelican\n\n)"
+        << R"(Continue the conversation from where it left off without asking."}})" << "\n"
         << R"({"type":"user","message":{"role":"user","content":"which word?"}})" << "\n";
     bool truncated = false;
     const std::vector<aic::TranscriptEntry> entries = aic::LoadTranscript(a, "chat-2", 100, truncated);
     Expect(entries.size() == 3 && entries[0].kind == aic::EntryKind::User && entries[1].kind == aic::EntryKind::Compacted &&
                entries[2].kind == aic::EntryKind::User && entries[2].text == L"which word?",
            "a compacted chat: the mark, no summary");
+    Expect(entries.size() == 3 && entries[1].text == L"Summary:\n1. the word is pelican",
+           "the summary kept on the mark, without the CLI's words to itself");
+    // A switch after it: the summary and what came after, not what it sums up; each part's words by its CLI.
+    const std::wstring handoff = aic::ChatSoFar({{false, entries}, {true, {{aic::EntryKind::Assistant, L"pelican"}}}}, 100);
+    Expect(handoff.find(L"remember pelican") == std::wstring::npos && handoff.find(L"the word is pelican") != std::wstring::npos &&
+               handoff.ends_with(L"User: which word?\n\nGrok: pelican"),
+           "the chat so far: the summary, then the words after it");
+    Expect(aic::ChatSoFar({{false, {{aic::EntryKind::User, L"0123456789"}}}}, 5) == L"\n\n…56789",
+           "without a summary: the latest words");
 
     // Grok's chats: a folder each under ~\.grok\sessions\<workspace, %-encoded>, listed beside Claude's.
     const fs::path grokA = aic::GrokHistoryFolder(a);
@@ -186,6 +197,8 @@ This session is being continued
                whole[1].text == L"Сейчас посмотрю." && whole[2].text == L"вот снимок\n\n📎 фото" &&
                whole[4].text == L"Нашёл." && whole[5].text == L"чини" && whole[7].text == L"починил",
            "a compacted grok transcript: the segments' words, a mark at each compaction, its prompt once");
+    Expect(whole.size() == 8 && whole[3].text.empty() && whole[6].text == L"This session is being continued",
+           "grok's summary on the newest mark; its rules are not one");
     const std::vector<aic::TranscriptEntry> kept = aic::LoadTranscript(a, "g-4", 100, truncated);
     Expect(kept.size() == 3 && kept[0].kind == aic::EntryKind::Compacted && kept[1].text == L"дальше" && kept[2].text == L"ок",
            "a compacted grok transcript without segments: the mark, then what is left");

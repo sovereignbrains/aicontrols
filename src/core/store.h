@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aic {
@@ -34,7 +35,8 @@ inline bool SameChat(const SessionInfo& chat, const std::string& id) {
     return !id.empty() && (chat.id == id || std::ranges::find(chat.linked, id) != chat.linked.end());
 }
 
-enum class EntryKind { User, Assistant, Tool, Compacted };  // Compacted: the CLI summed up what came before
+// Compacted: the CLI summed up what came before (its summary in text, if it was found).
+enum class EntryKind { User, Assistant, Tool, Compacted };
 
 struct TranscriptImage {
     std::string mediaType;
@@ -152,6 +154,11 @@ void SetChatIndexFile(const std::wstring& file);
 // The last `limit` entries of a chat, for showing it again before it is resumed.
 std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
                                             bool& truncated);
+// The chat so far, for the other CLI after a switch (its parts oldest first, each Grok's or not): the newest summary
+// of a compaction (its text on the mark), which holds all before it, then the words said after it as they were, the
+// oldest of them left out past `longest` characters (29.10.2026: not the last 80 000 characters whatever they were).
+// Empty: nothing was said.
+std::wstring ChatSoFar(const std::vector<std::pair<bool, std::vector<TranscriptEntry>>>& parts, size_t longest);
 
 Settings LoadSettings();
 void SaveSettings(const Settings& settings);

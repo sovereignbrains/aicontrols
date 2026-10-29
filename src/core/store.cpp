@@ -218,6 +218,26 @@ void KeepLatest(std::vector<TranscriptEntry>& entries, size_t limit, bool& trunc
     }
 }
 
+// The summary a CLI wrote for itself at a compaction goes with its mark, the newest one, for a switch to the other
+// CLI. Kept from "Summary:" (Claude's own notes come before it) up to where it tells itself to go on.
+void KeepSummary(std::vector<TranscriptEntry>& entries, std::wstring text) {
+    const auto mark = std::ranges::find(entries.rbegin(), entries.rend(), EntryKind::Compacted, &TranscriptEntry::kind);
+    if (mark == entries.rend()) {
+        return;
+    }
+    if (const size_t start = text.find(L"Summary:"); start != std::wstring::npos) {
+        text.erase(0, start);
+    }
+    for (const wchar_t* tail : {L"\nContinue the conversation from where", L"\nPlease continue the conversation"}) {
+        if (const size_t end = text.find(tail); end != std::wstring::npos) {
+            text.erase(end);
+        }
+    }
+    const size_t first = text.find_first_not_of(L" \t\r\n");
+    const size_t last = text.find_last_not_of(L" \t\r\n");
+    mark->text = first == std::wstring::npos ? std::wstring() : text.substr(first, last - first + 1);
+}
+
 // ---- Grok's chats (grok 1.0.62, 27.10.2026): a folder each, its messages a line each in chat_history.jsonl:
 // {"type":"user","content":[blocks],"prompt_index":N} what the user sent (without prompt_index: Grok's rules and
 // reminders), {"type":"assistant","content":"…","tool_calls":[{id,name,arguments}]}, {"type":"tool_result",
@@ -557,9 +577,17 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
     while (std::getline(in, line)) {
         const Json entry = Json::parse(line, nullptr, false);
         const std::string type = JsonStr(entry, "type");
-        if (!compacted && JsonStr(entry, "synthetic_reason") == "compaction_meta") {
-            compacted = true;
-            MarkGrokCompaction(entries, repeated);
+        if (JsonStr(entry, "synthetic_reason") == "compaction_meta") {
+            if (!compacted) {
+                compacted = true;
+                MarkGrokCompaction(entries, repeated);
+            }
+            // Its rules come in tags (<user_info>, <rules>); its summary is words.
+            const std::wstring text = TextOf(JsonAt(entry, "content"), false);
+            if (const size_t first = text.find_first_not_of(L" \t\r\n");
+                first != std::wstring::npos && text[first] != L'<') {
+                KeepSummary(entries, text);
+            }
         } else if (type == "user" && IsGrokPrompt(entry)) {
             const Json& content = JsonAt(entry, "content");
             TranscriptEntry said{EntryKind::User, GrokPromptText(content), GrokPromptImages(content)};
@@ -1045,7 +1073,8 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
             return;
         }
         if (type == "user" && IsTrue(JsonAt(entry, "isCompactSummary"))) {
-            return;  // the summary the CLI wrote for itself, not the user's words
+            KeepSummary(entries, TextOf(JsonAt(message, "content"), false));  // the CLI's for itself, not the user's words
+            return;
         }
         if (type == "user") {
             lastAssistant.clear();
@@ -1121,6 +1150,30 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
     });
     KeepLatest(entries, limit, truncated);
     return entries;
+}
+
+std::wstring ChatSoFar(const std::vector<std::pair<bool, std::vector<TranscriptEntry>>>& parts, size_t longest) {
+    std::wstring summary;
+    std::wstring said;
+    for (const auto& [grok, entries] : parts) {
+        for (const TranscriptEntry& entry : entries) {
+            if (entry.kind == EntryKind::Compacted && !entry.text.empty()) {
+                summary = entry.text;  // all before it is in it
+                said.clear();
+            } else if (entry.kind == EntryKind::User || entry.kind == EntryKind::Assistant) {
+                said += (entry.kind == EntryKind::User ? L"\n\nUser: " : grok ? L"\n\nGrok: " : L"\n\nClaude: ") +
+                        entry.text;
+            }
+        }
+    }
+    if (said.size() > longest) {
+        said = L"\n\n…" + said.substr(said.size() - longest);
+    }
+    if (summary.empty()) {
+        return said;
+    }
+    return L"\n\nA summary of the chat up to a compaction, as the assistant wrote it for itself:\n\n" + summary +
+           (said.empty() ? L"" : L"\n\nWhat was said after it:" + said);
 }
 
 std::vector<ProjectPlace> OrderProjects(std::vector<ProjectPlace> projects, const std::wstring& general,

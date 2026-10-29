@@ -9055,7 +9055,8 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
             break;
         }
         case EntryKind::Compacted:
-            Add(Kind::Notice, L"Чат сжат: дальше Claude помнит начало по сводке");
+            Add(Kind::Notice, session.grok ? L"Чат сжат: дальше Grok помнит начало по сводке; выше — без шагов"
+                                           : L"Чат сжат: дальше Claude помнит начало по сводке");
             break;
         case EntryKind::Tool: {
             const std::string full = ToUtf8(entry.text);

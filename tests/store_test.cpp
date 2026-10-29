@@ -91,7 +91,101 @@ int main() {
         << R"({"type":"tool_result","tool_call_id":"i2","content":"Tool `image_to_video` failed: no video"})" << "\n";
     std::ofstream(grokA / L"g-empty" / L"chat_history.jsonl")
         << R"({"type":"user","content":[{"type":"text","text":"<rules>be brief</rules>"}]})" << "\n";
+    // Compacted twice (grok 1.0.62): the turns before each compaction in a segment, the history left with Grok's rules
+    // (compaction_meta), the prompt the compaction fell into, without its prompt_index, and what came after.
+    fs::create_directories(grokA / L"g-3" / L"compaction", error);
+    std::ofstream(grokA / L"g-3" / L"compaction" / L"segment_000.md") << R"seg(# HISTORICAL -- DO NOT EDIT
+
+## Summary (curated by compaction step)
+<user_query>
+not a turn
+</user_query>
+
+## Verbatim turns
+
+### Turn 0 (System)
+You are Grok.
+
+### Turn 1 (Human)
+<user_info>
+OS Version: windows
+</user_info>
+
+### Turn 2 (Human)
+<user_query>
+почему пропал чат
+</user_query>
+
+### Turn 3 (Assistant)
+Сейчас посмотрю.
+[tool_request: use_tool]
+- tool_name: aic__read_file
+- tool_input: {"path":"a.txt"}
+
+### Turn 4 (Function)
+[tool_response]
+hello
+
+### Turn 5 (Human)
+<image_files>
+1.png
+</image_files>
+
+<user_query>
+вот снимок
+</user_query>
+[image]
+)seg";
+    std::ofstream(grokA / L"g-3" / L"compaction" / L"segment_001.md") << R"seg(## Verbatim turns
+
+### Turn 0 (System)
+You are Grok.
+
+### Turn 1 (Human)
+<user_query>
+вот снимок
+</user_query>
+[image]
+
+### Turn 2 (Human)
+This session is being continued
+
+### Turn 3 (Assistant)
+Нашёл.
+
+### Turn 4 (Human)
+<user_query>
+чини
+</user_query>
+)seg";
+    std::ofstream(grokA / L"g-3" / L"chat_history.jsonl")
+        << R"({"type":"system","content":"You are Grok."})" << "\n"
+        << R"({"type":"user","content":[{"type":"text","text":"<user_info>x</user_info>"}],"synthetic_reason":"compaction_meta"})" << "\n"
+        << R"({"type":"user","content":[{"type":"text","text":"<user_query>\nчини\n</user_query>"}]})" << "\n"
+        << R"({"type":"user","content":[{"type":"text","text":"This session is being continued"}],"synthetic_reason":"compaction_meta"})" << "\n"
+        << R"({"type":"assistant","content":"починил"})" << "\n";
+    fs::create_directories(grokA / L"g-4", error);  // compacted, its segments gone
+    std::ofstream(grokA / L"g-4" / L"chat_history.jsonl")
+        << R"({"type":"user","content":[{"type":"text","text":"<user_info>x</user_info>"}],"synthetic_reason":"compaction_meta"})" << "\n"
+        << R"({"type":"user","content":[{"type":"text","text":"<user_query>\nдальше\n</user_query>"}]})" << "\n"
+        << R"({"type":"assistant","content":"ок"})" << "\n";
     std::vector<aic::SessionInfo> listed = aic::ListSessions(a);
+    const auto compacted = std::ranges::find(listed, std::string("g-3"), &aic::SessionInfo::id);
+    Expect(compacted != listed.end() && compacted->grok && compacted->title == L"почему пропал чат",
+           "a compacted grok chat: listed, named after its first message in the first segment");
+    const auto lost = std::ranges::find(listed, std::string("g-4"), &aic::SessionInfo::id);
+    Expect(lost != listed.end() && lost->title == L"дальше", "a compacted grok chat without segments: the prompt it kept");
+    const std::vector<aic::TranscriptEntry> whole = aic::LoadTranscript(a, "g-3", 100, truncated);
+    const std::vector<aic::EntryKind> kinds = {aic::EntryKind::User,      aic::EntryKind::Assistant, aic::EntryKind::User,
+                                               aic::EntryKind::Compacted, aic::EntryKind::Assistant, aic::EntryKind::User,
+                                               aic::EntryKind::Compacted, aic::EntryKind::Assistant};
+    Expect(std::ranges::equal(whole, kinds, {}, &aic::TranscriptEntry::kind) && whole[0].text == L"почему пропал чат" &&
+               whole[1].text == L"Сейчас посмотрю." && whole[2].text == L"вот снимок\n\n📎 фото" &&
+               whole[4].text == L"Нашёл." && whole[5].text == L"чини" && whole[7].text == L"починил",
+           "a compacted grok transcript: the segments' words, a mark at each compaction, its prompt once");
+    const std::vector<aic::TranscriptEntry> kept = aic::LoadTranscript(a, "g-4", 100, truncated);
+    Expect(kept.size() == 3 && kept[0].kind == aic::EntryKind::Compacted && kept[1].text == L"дальше" && kept[2].text == L"ок",
+           "a compacted grok transcript without segments: the mark, then what is left");
     const auto grokChat = std::ranges::find(listed, std::string("g-1"), &aic::SessionInfo::id);
     Expect(grokChat != listed.end() && grokChat->grok && grokChat->title == L"сделай навигацию",
            "a grok chat: listed, named after its first message");

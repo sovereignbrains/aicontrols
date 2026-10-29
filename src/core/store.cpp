@@ -285,9 +285,22 @@ fs::path GrokSessionDir(const std::wstring& workspace, const std::string& id) {
     return GrokProjectDir(workspace) / ToWide(id);
 }
 
+// What the user sent. The prompt Grok's compaction keeps loses its prompt_index; its <user_query> still tells it from
+// Grok's rules, which have neither.
 bool IsGrokPrompt(const Json& entry) {
-    return JsonStr(entry, "type") == "user" && JsonAt(entry, "prompt_index").is_number() &&
-           !entry.contains("synthetic_reason");
+    if (JsonStr(entry, "type") != "user" || entry.contains("synthetic_reason")) {
+        return false;
+    }
+    if (JsonAt(entry, "prompt_index").is_number()) {
+        return true;
+    }
+    const Json& content = JsonAt(entry, "content");
+    if (content.is_string()) {
+        return content.get<std::string>().find("<user_query>") != std::string::npos;
+    }
+    return content.is_array() && std::ranges::any_of(content, [](const Json& block) {
+        return JsonStr(block, "type") == "text" && JsonStr(block, "text").find("<user_query>") != std::string::npos;
+    });
 }
 
 // The words as they were typed: Grok puts them in <user_query>, after its list of the pictures it saved; a switch's
@@ -338,13 +351,121 @@ std::vector<TranscriptImage> GrokPromptImages(const Json& content) {
     return images;
 }
 
-// A Grok chat is named after its first message (Grok's own titles come in English). nullopt: nothing was sent, the
-// session is a start of grok.exe and no chat. The lines before it are Grok's rules, a few.
-std::optional<std::wstring> ReadGrokTitle(const fs::path& history) {
-    std::ifstream in(history, std::ios::binary);
+// ---- What Grok's compaction took out of the history (grok 1.0.62, 29.10.2026): compaction\segment_NNN.md, one per
+// compaction, its turns verbatim. "### Turn N (Human)" holds the words in <user_query>…</user_query> (Grok's own
+// insertions have none) and "[image]" after them if pictures came; "### Turn N (Assistant)" its words, then a
+// "[tool_request: …]" line per call; "(Function)" and "(System)" the rest. The part after a compaction opens with the
+// prompt it fell into once more.
+
+std::vector<fs::path> GrokSegments(const fs::path& folder) {
+    std::vector<fs::path> segments;
+    std::error_code error;
+    for (const fs::directory_entry& item : fs::directory_iterator(folder / L"compaction", error)) {
+        const std::wstring name = item.path().filename().wstring();
+        if (name.starts_with(L"segment_") && item.path().extension() == L".md") {
+            segments.push_back(item.path());
+        }
+    }
+    std::ranges::sort(segments);
+    return segments;
+}
+
+// "### Turn 12 (Assistant)" -> "Assistant"; anything else, empty.
+std::string_view SegmentTurn(std::string_view line) {
+    constexpr std::string_view kTurn = "### Turn ";
+    if (!line.starts_with(kTurn) || !line.ends_with(")")) {
+        return {};
+    }
+    const size_t open = line.find(" (", kTurn.size());
+    const std::string_view number = line.substr(kTurn.size(), open == std::string_view::npos ? 0 : open - kTurn.size());
+    if (number.empty() || !std::ranges::all_of(number, [](char c) { return c >= '0' && c <= '9'; })) {
+        return {};
+    }
+    return line.substr(open + 2, line.size() - open - 3);
+}
+
+// The user's words and Grok's in one segment; the calls are left out, the segment keeps them as text only. firstOnly:
+// up to the first prompt, for the title.
+std::vector<TranscriptEntry> ReadGrokSegment(const fs::path& file, bool firstOnly) {
+    std::vector<TranscriptEntry> entries;
+    std::ifstream in(file, std::ios::binary);
+    std::string line;
+    std::string_view turn;
+    std::string text;
+    bool query = false;     // inside <user_query>
+    bool asked = false;     // the turn had one
+    bool pictures = false;  // "[image]"
+    bool calls = false;     // past the turn's first call
+    const auto flush = [&] {
+        if (turn == "Human" && asked) {
+            std::wstring words = GrokPromptText(Json(text));
+            if (pictures) {
+                words += (words.empty() ? L"" : L"\n\n") + std::wstring(L"📎 фото");
+            }
+            if (!words.empty()) {
+                entries.push_back({EntryKind::User, std::move(words)});
+            }
+        } else if (turn == "Assistant") {
+            const size_t first = text.find_first_not_of(" \t\r\n");
+            const size_t last = text.find_last_not_of(" \t\r\n");
+            if (first != std::string::npos) {
+                entries.push_back({EntryKind::Assistant, ToWide(std::string_view(text).substr(first, last - first + 1))});
+            }
+        }
+        text.clear();
+        query = asked = pictures = calls = false;
+    };
+    while (std::getline(in, line)) {
+        if (line.ends_with('\r')) {
+            line.pop_back();
+        }
+        if (const std::string_view next = SegmentTurn(line); !next.empty()) {
+            flush();
+            if (firstOnly && !entries.empty() && entries.back().kind == EntryKind::User) {
+                return entries;
+            }
+            turn = next == "Human" ? "Human" : next == "Assistant" ? "Assistant" : "Other";
+            continue;
+        }
+        if (turn == "Human") {
+            if (line == "<user_query>") {
+                query = asked = true;
+                text.clear();
+            } else if (line == "</user_query>") {
+                query = false;
+            } else if (query) {
+                text += line + '\n';
+            } else if (line == "[image]") {
+                pictures = true;
+            }
+        } else if (turn == "Assistant" && !calls) {
+            if (line.starts_with("[tool_request:")) {
+                calls = true;
+            } else {
+                text += line + '\n';
+            }
+        }
+    }
+    flush();
+    return entries;
+}
+
+// A Grok chat is named after its first message (Grok's own titles come in English); after a compaction that is in
+// its first segment. nullopt: nothing was sent, the session is a start of grok.exe and no chat. The lines before it
+// are Grok's rules, a few.
+std::optional<std::wstring> ReadGrokTitle(const fs::path& folder) {
+    const std::vector<fs::path> segments = GrokSegments(folder);
+    if (!segments.empty()) {
+        for (const TranscriptEntry& entry : ReadGrokSegment(segments.front(), true)) {
+            if (entry.kind == EntryKind::User) {
+                return PromptTitle(entry.text);
+            }
+        }
+    }
+    std::ifstream in(folder / kGrokHistory, std::ios::binary);
     std::string line;
     while (std::getline(in, line)) {
-        if (line.find("\"prompt_index\"") == std::string::npos) {
+        if (line.find("\"prompt_index\"") == std::string::npos && line.find("<user_query>") == std::string::npos) {
             continue;
         }
         const Json entry = Json::parse(line, nullptr, false);
@@ -361,6 +482,9 @@ std::optional<std::wstring> ReadGrokTitle(const fs::path& history) {
         }
         return PromptTitle(words);
     }
+    if (!segments.empty()) {
+        return std::wstring(L"Чат Grok");  // compacted, so a chat, though its words were not found
+    }
     return std::nullopt;
 }
 
@@ -370,14 +494,15 @@ struct CachedGrokTitle {
     std::optional<std::wstring> title;
 };
 
-std::optional<std::wstring> GrokTitle(const fs::path& history, const WIN32_FILE_ATTRIBUTE_DATA& data) {
+// data: the history's; a compaction rewrites it too.
+std::optional<std::wstring> GrokTitle(const fs::path& folder, const WIN32_FILE_ATTRIBUTE_DATA& data) {
     static std::map<std::wstring, CachedGrokTitle> cache;
     const std::lock_guard lock(g_titlesMutex);
     const uint64_t modified = ToTicks(data.ftLastWriteTime);
     const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    CachedGrokTitle& entry = cache[history.wstring()];
+    CachedGrokTitle& entry = cache[folder.wstring()];
     if (entry.modified != modified || entry.size != size) {
-        entry = {modified, size, ReadGrokTitle(history)};
+        entry = {modified, size, ReadGrokTitle(folder)};
     }
     return entry.title;
 }
@@ -392,18 +517,54 @@ std::wstring GrokOwnTitle(const fs::path& folder) {
     return ToWide(text);
 }
 
-std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& history) {
+// After a compaction: the mark, and the prompt it fell into is not said twice.
+void MarkGrokCompaction(std::vector<TranscriptEntry>& entries, std::wstring& repeated) {
+    repeated.clear();
+    for (auto said = entries.rbegin(); said != entries.rend(); ++said) {
+        if (said->kind == EntryKind::User) {
+            repeated = said->text;
+            break;
+        }
+    }
+    entries.push_back({EntryKind::Compacted});
+}
+
+std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
     std::vector<TranscriptEntry> entries;
-    std::ifstream in(history, std::ios::binary);
+    std::wstring repeated;  // the first prompt after a compaction, if it is the one before it
+    const auto add = [&](TranscriptEntry said) {
+        if (!repeated.empty() && said.kind == EntryKind::User) {
+            // A segment marks pictures in the words ("📎 фото"); the history keeps them apart.
+            const bool again = !said.text.empty() && repeated.starts_with(said.text);
+            repeated.clear();
+            if (again) {
+                return;
+            }
+        }
+        entries.push_back(std::move(said));
+    };
+    for (const fs::path& segment : GrokSegments(folder)) {
+        if (!entries.empty()) {
+            MarkGrokCompaction(entries, repeated);
+        }
+        for (TranscriptEntry& said : ReadGrokSegment(segment, false)) {
+            add(std::move(said));
+        }
+    }
+    bool compacted = false;  // the history's own mark: its rules come back with synthetic_reason "compaction_meta"
+    std::ifstream in(folder / kGrokHistory, std::ios::binary);
     std::string line;
     while (std::getline(in, line)) {
         const Json entry = Json::parse(line, nullptr, false);
         const std::string type = JsonStr(entry, "type");
-        if (type == "user" && IsGrokPrompt(entry)) {
+        if (!compacted && JsonStr(entry, "synthetic_reason") == "compaction_meta") {
+            compacted = true;
+            MarkGrokCompaction(entries, repeated);
+        } else if (type == "user" && IsGrokPrompt(entry)) {
             const Json& content = JsonAt(entry, "content");
             TranscriptEntry said{EntryKind::User, GrokPromptText(content), GrokPromptImages(content)};
             if (!said.text.empty() || !said.images.empty()) {
-                entries.push_back(std::move(said));
+                add(std::move(said));
             }
         } else if (type == "assistant") {
             if (std::wstring text = ToWide(JsonStr(entry, "content")); !text.empty()) {
@@ -507,7 +668,7 @@ std::vector<SessionInfo> ListSessions(const std::wstring& workspace) {
         if (!item.is_directory(error) || !GetFileAttributesExW(history.c_str(), GetFileExInfoStandard, &data)) {
             continue;
         }
-        const std::optional<std::wstring> prompt = GrokTitle(history, data);
+        const std::optional<std::wstring> prompt = GrokTitle(item.path(), data);
         if (!prompt) {
             continue;
         }
@@ -612,7 +773,7 @@ std::wstring SessionTitle(const std::wstring& workspace, const std::string& id) 
         return {};
     }
     std::wstring title = GrokOwnTitle(grok);
-    return !title.empty() ? title : GrokTitle(grok / kGrokHistory, data).value_or(std::wstring());
+    return !title.empty() ? title : GrokTitle(grok, data).value_or(std::wstring());
 }
 
 std::wstring GrokHistoryFolder(const std::wstring& workspace) {
@@ -627,7 +788,7 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
     const uint64_t size = fs::file_size(file, error);
     if (error) {
         if (const fs::path grok = GrokSessionDir(workspace, id); !grok.empty()) {
-            entries = LoadGrokTranscript(grok / kGrokHistory);
+            entries = LoadGrokTranscript(grok);
         }
         KeepLatest(entries, limit, truncated);
         return entries;

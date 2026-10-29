@@ -3998,6 +3998,39 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
             Fill(panel, 8.f, kCard);
             brush_->SetColor(Color(kLine));
             target_->DrawRoundedRectangle(D2D1::RoundedRect(panel, 8.f, 8.f), brush_.get(), 1.f);
+            if ((span.flags & kMdTable) != 0) {
+                // The grid is drawn here, not by the font: a box character is shorter than its line, and the
+                // dividers broke between the rows (30.10.2026, his screenshot). The characters stay for copying.
+                wil::com_ptr<ID2D1SolidColorBrush> hidden;
+                target_->CreateSolidColorBrush(Color(kCodeText), hidden.put());
+                hidden->SetOpacity(0.f);
+                const float pixel = 96.f / Dpi();  // one device pixel, in DIPs
+                const auto snap = [&](float v) { return (std::floor(v / pixel) + 0.5f) * pixel; };
+                const size_t end = std::min(span.start + span.length, item.shown.size());
+                for (size_t i = span.start; i < end; ++i) {
+                    const wchar_t c = item.shown[i];
+                    if (c != L'│' && c != L'─' && c != L'┼' && c != L'┴') {
+                        continue;
+                    }
+                    FLOAT atX = 0, atY = 0;
+                    DWRITE_HIT_TEST_METRICS cell{};
+                    if (FAILED(item.layout->HitTestTextPosition(static_cast<UINT32>(i), FALSE, &atX, &atY, &cell))) {
+                        continue;
+                    }
+                    const float cellLeft = x + cell.left;
+                    const float cellTop = y + cell.top;
+                    const float centerX = snap(cellLeft + cell.width / 2.f);
+                    const float centerY = snap(cellTop + cell.height / 2.f);
+                    if (c != L'│') {
+                        target_->DrawLine({cellLeft, centerY}, {cellLeft + cell.width, centerY}, code.get(), pixel);
+                    }
+                    if (c != L'─') {
+                        target_->DrawLine({centerX, cellTop}, {centerX, c == L'┴' ? centerY : cellTop + cell.height},
+                                          code.get(), pixel);
+                    }
+                    item.layout->SetDrawingEffect(hidden.get(), DWRITE_TEXT_RANGE{static_cast<UINT32>(i), 1});
+                }
+            }
         } else {
             for (const DWRITE_HIT_TEST_METRICS& box : boxes) {
                 Fill(D2D1::RectF(x + box.left - 2.f, y + box.top, x + box.left + box.width + 2.f, y + box.top + box.height),

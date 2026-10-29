@@ -3306,7 +3306,7 @@ Hit ChatWindow::HitTest(float x, float y) const {
                                                                                 : Hit{Target::HistoryRow, row};
                 }
                 if (projects_[rows_[row].project].folder == DefaultWorkspace()) {
-                    return {};  // the general chats' label: no fold, no "+" (the top "new chat" is theirs)
+                    return {Target::ProjectRow, row};  // the general chats' label folds; no "+" (the top "new chat")
                 }
                 return Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
                                                                           : Hit{Target::ProjectRow, row};
@@ -6483,8 +6483,19 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 3.f, 3.f), brush_.get());
         };
         if (rows_[row].session == kHead && project.folder == DefaultWorkspace()) {
-            // The general chats, under the projects: a section of their own, labelled as "projects" is.
-            Text(L"Общие чаты", ui_.get(), D2D1::RectF(g.sidebar.left + 16, r.top + 8, r.right - 10, r.bottom), kSecondary);
+            // The general chats, under the projects: a section of their own, labelled as "projects" is; it folds.
+            if (hovered) {
+                Fill(lit(r), 8.f, kRaised);
+            }
+            const D2D1_POINT_2F c{r.left + 14.f, (r.top + r.bottom) / 2};
+            if (!searchText_.empty() || !ProjectFolded(project.folder)) {
+                Line({c.x - 4.f, c.y - 2.f}, {c.x, c.y + 2.f}, kSecondary, 1.4f);
+                Line({c.x, c.y + 2.f}, {c.x + 4.f, c.y - 2.f}, kSecondary, 1.4f);
+            } else {
+                Line({c.x - 2.f, c.y - 4.f}, {c.x + 2.f, c.y}, kSecondary, 1.4f);
+                Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.4f);
+            }
+            Text(L"Общие чаты", ui_.get(), D2D1::RectF(r.left + 28, r.top + 8, r.right - 10, r.bottom), kSecondary);
             continue;
         }
         if (rows_[row].session == kHead) {
@@ -9408,8 +9419,8 @@ void ChatWindow::FilterSessions(bool pickFirst) {
         if (!query.empty() && !named && chats.empty()) {
             continue;
         }
-        rows_.push_back({p, kHead});  // the general chats': their section's label, never folded
-        const bool folded = query.empty() && project.folder != DefaultWorkspace() && ProjectFolded(project.folder);
+        rows_.push_back({p, kHead});  // the general chats': their section's label, it folds too
+        const bool folded = query.empty() && ProjectFolded(project.folder);
         // The open chat, new: first under its project (a new chat unfolds it), it says where the chat is.
         if (query.empty() && project.folder == workspace_ &&
             std::ranges::none_of(project.sessions, [&](const SessionInfo& session) { return SameChat(session, OpenId()); })) {

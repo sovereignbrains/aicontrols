@@ -19,6 +19,8 @@ inline constexpr const char* kToolServer = "aic";  // the MCP server name: tools
 struct ToolResult {
     std::string text;
     bool isError = false;
+    std::string imageBase64;  // a picture sent along as an MCP image block (screenshot); empty if none
+    std::string imageType;    // image/png or image/jpeg
 };
 
 // What the approval card shows for a call.
@@ -72,6 +74,7 @@ private:
     ToolResult WriteFile(const Json& input) const;
     ToolResult EditFile(const Json& input) const;
     ToolResult ListDirectory(const Json& input) const;
+    ToolResult Screenshot(const Json& input) const;
     ToolResult ListChats(const Json& input) const;
     ToolResult ReadChat(const Json& input) const;
     std::vector<std::wstring> Projects(const std::string& project) const;  // the given one, else all known

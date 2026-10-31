@@ -30,6 +30,11 @@ std::optional<Attachment> LoadAttachment(IWICImagingFactory* wic, const std::wst
 std::optional<Attachment> ClipboardImage(IWICImagingFactory* wic, HWND owner, std::wstring& error);
 bool ClipboardHasImage();
 
+// A screenshot as PNG (JPEG when too big) in base64, scaled to the API's 1568 px: the window whose title holds
+// `window` (case-insensitive), else the whole virtual screen when `window` is empty. Initializes COM itself, so any
+// thread. On failure: empty and a message in `error`.
+std::string CaptureScreenBase64(const std::wstring& window, std::wstring& error);
+
 // The message content block the API expects for it.
 Json ContentBlock(const Attachment& attachment);
 

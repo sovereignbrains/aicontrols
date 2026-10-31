@@ -473,4 +473,98 @@ bool CopyImageToClipboard(IWICImagingFactory* wic, HWND owner, const std::wstrin
     return bitmap || encoded;
 }
 
+namespace {
+
+struct WindowSearch {
+    std::wstring needle;  // lower case
+    HWND found = nullptr;
+};
+
+BOOL CALLBACK FindWindowByTitle(HWND hwnd, LPARAM param) {
+    auto* search = reinterpret_cast<WindowSearch*>(param);
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+        return TRUE;
+    }
+    std::wstring title(256, L'\0');
+    title.resize(static_cast<size_t>(GetWindowTextW(hwnd, title.data(), static_cast<int>(title.size()))));
+    if (!title.empty() && Lower(title).find(search->needle) != std::wstring::npos) {
+        search->found = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+}  // namespace
+
+std::string CaptureScreenBase64(const std::wstring& window, std::wstring& error) {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const auto uninit = wil::scope_exit([&] {
+        if (SUCCEEDED(com)) {
+            CoUninitialize();
+        }
+    });
+    try {
+        int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        HWND target = nullptr;
+        if (!window.empty()) {
+            WindowSearch search;
+            search.needle = Lower(window);
+            EnumWindows(FindWindowByTitle, reinterpret_cast<LPARAM>(&search));
+            if (!search.found) {
+                error = L"Нет видимого окна с «" + window + L"» в заголовке";
+                return {};
+            }
+            target = search.found;
+            RECT rect{};
+            GetWindowRect(target, &rect);
+            x = rect.left;
+            y = rect.top;
+            width = rect.right - rect.left;
+            height = rect.bottom - rect.top;
+        }
+        if (width <= 0 || height <= 0) {
+            error = L"Пустая область";
+            return {};
+        }
+        const wil::unique_hdc_window screen(GetDC(nullptr));
+        const wil::unique_hdc memory(CreateCompatibleDC(screen.get()));
+        const wil::unique_hbitmap bitmap(CreateCompatibleBitmap(screen.get(), width, height));
+        if (!memory || !bitmap) {
+            error = L"Не удалось создать битмап";
+            return {};
+        }
+        const HGDIOBJ old = SelectObject(memory.get(), bitmap.get());
+        bool ok = false;
+        if (target) {  // PW_RENDERFULLCONTENT: also what other windows cover or DirectComposition draws
+            ok = PrintWindow(target, memory.get(), 2) != FALSE;
+        }
+        if (!ok) {
+            ok = BitBlt(memory.get(), 0, 0, width, height, screen.get(), x, y, SRCCOPY | CAPTUREBLT) != FALSE;
+        }
+        SelectObject(memory.get(), old);
+        if (!ok) {
+            error = L"Снимок не удался";
+            return {};
+        }
+        wil::com_ptr<IWICImagingFactory> wic;
+        THROW_IF_FAILED(
+            CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put())));
+        wil::com_ptr<IWICBitmap> source;
+        THROW_IF_FAILED(wic->CreateBitmapFromHBITMAP(bitmap.get(), nullptr, WICBitmapIgnoreAlpha, source.put()));
+        const wil::com_ptr<IWICBitmapSource> fitted =
+            Convert(wic.get(), Fit(wic.get(), source.get(), kImageSide).get(), GUID_WICPixelFormat24bppBGR);
+        std::vector<uint8_t> bytes = Encode(wic.get(), fitted.get(), GUID_ContainerFormatPng);
+        if (bytes.size() > kImageBytes) {
+            bytes = Encode(wic.get(), fitted.get(), GUID_ContainerFormatJpeg);
+        }
+        return Base64(bytes);
+    } catch (const wil::ResultException& e) {
+        error = std::format(L"Снимок не удался (0x{:08X})", static_cast<unsigned>(e.GetErrorCode()));
+        return {};
+    }
+}
+
 }  // namespace aic

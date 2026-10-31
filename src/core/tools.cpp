@@ -18,6 +18,7 @@
 
 #include <wil/resource.h>
 
+#include "core/attachment.h"
 #include "core/chat_export.h"
 #include "core/gdrive.h"
 #include "core/store.h"
@@ -717,6 +718,10 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
         return {L"Показать папку", path.empty() ? L"." : path};
     }
     const std::wstring project = ToWide(StringArg(input, "project"));
+    if (name == "screenshot") {
+        const std::wstring window = ToWide(StringArg(input, "window"));
+        return {L"Снимок экрана", window.empty() ? L"весь экран" : L"окно «" + window + L"»"};
+    }
     if (name == "list_chats") {
         return {L"Список чатов", project.empty() ? L"все проекты" : project};
     }
@@ -853,6 +858,16 @@ Json Tools::Definitions() const {
         Json{{"name", "list_directory"},
              {"description", "List a folder on this computer (default: the chat's working directory)."},
              {"inputSchema", Schema({{"on", on}, {"path", str}}, Json::array())}},
+        Json{{"name", "screenshot"},
+             {"description",
+              "A screenshot of this computer, returned as a picture: the window whose title contains `window` "
+              "(case-insensitive), else the whole screen. Use it to see what the user sees, e.g. to check the "
+              "client's own window or a page you built. The user is asked first."},
+             {"inputSchema",
+              Schema({{"window",
+                       {{"type", "string"},
+                        {"description", "Part of the window's title; empty or absent: the whole screen"}}}},
+                     Json::array())}},
         Json{{"name", "list_chats"},
              {"description",
               "List this client's chats, Claude's and Grok's, newest first: id, who answers, last change, title. "
@@ -906,6 +921,8 @@ ToolResult Tools::Execute(const std::string& name, const Json& input, const std:
             result = EditFile(input);
         } else if (name == "list_directory") {
             result = ListDirectory(input);
+        } else if (name == "screenshot") {
+            result = Screenshot(input);
         } else if (name == "list_chats") {
             result = ListChats(input);
         } else if (name == "read_chat") {
@@ -1120,6 +1137,19 @@ std::vector<std::wstring> Tools::Projects(const std::string& project) const {
     return unique;
 }
 
+ToolResult Tools::Screenshot(const Json& input) const {
+    std::wstring error;
+    const std::string data = CaptureScreenBase64(ToWide(StringArg(input, "window")), error);
+    if (data.empty()) {
+        return Error(ToUtf8(error.empty() ? L"Снимок не удался" : error));
+    }
+    ToolResult result;
+    result.text = StringArg(input, "window").empty() ? "Screenshot of the whole screen." : "Screenshot of the window.";
+    result.imageBase64 = data;
+    result.imageType = data.starts_with("iVBOR") ? "image/png" : "image/jpeg";
+    return result;
+}
+
 ToolResult Tools::ListChats(const Json& input) const {
     const std::string project = StringArg(input, "project");
     const size_t most = project.empty() ? 20 : 200;
@@ -1285,13 +1315,15 @@ void ToolHost::HandleMcp(const std::string& requestId, const Json& request) {
         Json arguments = JsonAt(params, "arguments");
         job.thread = std::thread([this, &job, requestId, id, name, arguments = std::move(arguments)] {
             const ToolResult result = tools_.Execute(name, arguments, job.cancel);
+            Json content = Json::array({Json{{"type", "text"}, {"text", result.text}}});
+            if (!result.imageBase64.empty()) {
+                content.push_back(Json{{"type", "image"}, {"data", result.imageBase64}, {"mimeType", result.imageType}});
+            }
             reply_(requestId,
                    Json{{"mcp_response",
                          {{"jsonrpc", "2.0"},
                           {"id", id},
-                          {"result",
-                           {{"content", Json::array({Json{{"type", "text"}, {"text", result.text}}})},
-                            {"isError", result.isError}}}}}});
+                          {"result", {{"content", std::move(content)}, {"isError", result.isError}}}}}});
             job.done = true;
         });
     } else {

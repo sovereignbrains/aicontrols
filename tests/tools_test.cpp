@@ -138,6 +138,12 @@ int main() {
                "a secret named with Cyrillic and a space", r.text);
         const std::string listed = tools.Definitions().dump(-1, ' ', false);
         Expect(Has(listed, "\\\"" + spaced + "\\\""), "such a name is quoted in the list", listed);
+        Expect(Has(listed, "\"screenshot\"") && aic::ToolNeedsApproval("screenshot"), "screenshot is listed and asks first");
+        r = run("screenshot", {{"window", "no such window title 7f3a9"}});
+        Expect(r.isError && r.imageBase64.empty(), "a screenshot of a missing window is an error", r.text);
+        r = run("screenshot", aic::Json::object());
+        Expect(!r.isError && r.imageBase64.size() > 1000 && r.imageType == "image/png", "a screenshot of the screen is a PNG",
+               r.text);
         r = run("run_command", {{"command", "id"}, {"on", "root@example.invalid"}, {"env_secrets", {spaced}}});
         Expect(r.isError && Has(r.text, "{{secret:") && !Has(r.text, "[exit code"),
                "a server cannot have it as a variable: told, nothing run", r.text);
@@ -189,7 +195,7 @@ int main() {
             if (id == "r1") {
                 Expect(body["result"]["protocolVersion"] == "2025-06-18", "initialize echoes the version");
             } else if (id == "r2") {
-                Expect(body["result"]["tools"].size() == 9, "tools/list has nine tools");
+                Expect(body["result"]["tools"].size() == 10, "tools/list has ten tools");
             } else if (id == "r3") {
                 Expect(body["id"] == 2 && body["result"]["isError"] == false &&
                            Has(body["result"]["content"][0]["text"], "crlf.txt"),

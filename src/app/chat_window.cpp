@@ -434,6 +434,47 @@ std::wstring ExistingPath(std::wstring path) {
     return {};
 }
 
+std::wstring KnownFolderPath(const KNOWNFOLDERID& id) {
+    PWSTR raw = nullptr;
+    std::wstring folder;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &raw))) {
+        folder = raw;
+    }
+    CoTaskMemFree(raw);
+    return folder;
+}
+
+// A path written without a drive (Desktop\a.txt, src/a.cpp:12, ~\x, %APPDATA%\x): the file it names, found under the chat's
+// folder, then the Desktop, Documents, Downloads and the profile. Empty if there is none (then it is not a link).
+std::wstring FindRelative(std::wstring path, const std::wstring& workspace) {
+    if (path.starts_with(L"~\\") || path.starts_with(L"~/")) {
+        path = KnownFolderPath(FOLDERID_Profile) + path.substr(1);
+    }
+    if (path.find(L'%') != std::wstring::npos) {
+        wchar_t expanded[MAX_PATH * 2]{};
+        if (const DWORD n = ExpandEnvironmentStringsW(path.c_str(), expanded, static_cast<DWORD>(std::size(expanded)));
+            n > 0 && n <= std::size(expanded)) {
+            path = expanded;
+        }
+    }
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    if (IsLocalPath(path)) {
+        return ExistingPath(path);
+    }
+    const std::wstring roots[] = {workspace, KnownFolderPath(FOLDERID_Desktop), KnownFolderPath(FOLDERID_Documents),
+                                  KnownFolderPath(FOLDERID_Downloads), KnownFolderPath(FOLDERID_Profile)};
+    for (const std::wstring& root : roots) {
+        if (root.empty()) {
+            continue;
+        }
+        const std::wstring found = ExistingPath((std::filesystem::path(root) / path).lexically_normal().wstring());
+        if (!found.empty()) {
+            return found;
+        }
+    }
+    return {};
+}
+
 std::wstring LowerExtension(const std::wstring& path) {
     std::wstring extension = std::filesystem::path(path).extension().wstring();
     for (wchar_t& c : extension) {
@@ -4049,6 +4090,13 @@ void ChatWindow::MeasureItem(FeedItem& item, float column) {
         const float advance = cellW_ * kCodeSize / 12.5f;
         const size_t tableChars = static_cast<size_t>(std::max(width / advance - 1.f, 1.f));
         MdText md = ParseMarkdown(item.text, tableChars);
+        for (MdSpan& span : md.spans) {  // a drive-less path is a link only where a file by that name is found
+            if ((span.flags & kMdRelative) != 0) {
+                span.url = FindRelative(span.url, workspace_);
+                span.flags = span.url.empty() ? 0 : kMdLink;
+            }
+        }
+        std::erase_if(md.spans, [](const MdSpan& span) { return span.flags == 0; });
         shown = std::move(md.text);
         item.spans = std::move(md.spans);
         source = &shown;
@@ -11806,6 +11854,7 @@ void ChatWindow::FillGallery() {
     grokCard("image_gen", Json{{"prompt", "картинку уже убрали с диска"}},
              L"{\"type\":\"ImageGen\",\"path\":\"C:\\\\no\\\\such\\\\1.jpg\"}", false);
     Add(Kind::Assistant, L"Скриншот: `C:\\Users\\user\\gallery1.png` и PDF `C:\\Users\\user\\a.pdf`, страница `C:\\Users\\user\\a.html`.");
+    Add(Kind::Assistant, L"Без диска: настройки лежат в `AppData\\Roaming\\AIControls\\settings.json` (ссылка, если файл есть), а `Desktop\\нет-такого.txt` и `git add src/a.cpp` — просто код.");
     Add(Kind::Assistant, L"Финальный короткий ответ.");
     feed_[2].who = L"Claude Opus 5.5";  // the first answer of a turn is signed: one of each agent
     Add(Kind::User, L"А у тебя так же?");

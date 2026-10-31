@@ -56,8 +56,10 @@ void Inline(std::wstring_view s, MdText& out) {
                     inner = inner.substr(1, inner.size() - 2);
                 }
                 styled(inner, kMdCode, false);
-                if (IsLocalPath(inner) && inner.find(L'\n') == std::wstring_view::npos) {
-                    MdSpan link{out.text.size() - inner.size(), inner.size(), kMdLink, 1.f, false};
+                const bool absolute = IsLocalPath(inner);
+                if ((absolute || IsRelativePath(inner)) && inner.find(L'\n') == std::wstring_view::npos) {
+                    MdSpan link{out.text.size() - inner.size(), inner.size(), absolute ? kMdLink : kMdLink | kMdRelative, 1.f,
+                                false};
                     link.url = inner;
                     out.spans.push_back(std::move(link));
                 }
@@ -297,6 +299,49 @@ bool IsLocalPath(std::wstring_view text) {
         return true;
     }
     return text.size() >= 3 && text.starts_with(L"\\\\") && IsWordChar(text[2]);
+}
+
+bool IsRelativePath(std::wstring_view text) {
+    const auto isSeparator = [](wchar_t c) { return c == L'\\' || c == L'/'; };
+    if (text.size() < 3 || text.size() > 260 || IsLocalPath(text) || text.find(L"://") != std::wstring_view::npos ||
+        text.find_first_of(L"<>\"|*?=\t\n") != std::wstring_view::npos || text.front() == L' ' || text.front() == L'-' ||
+        isSeparator(text.front())) {
+        return false;
+    }
+    const size_t firstSeparator = text.find_first_of(L"\\/");
+    if (firstSeparator == std::wstring_view::npos) {
+        return false;
+    }
+    const std::wstring_view head = text.substr(0, firstSeparator);
+    constexpr std::wstring_view kPlaces[] = {L"~", L".", L"..", L"Desktop", L"Documents", L"Downloads", L"AppData",
+                                             L"Рабочий стол", L"Документы", L"Загрузки"};
+    bool place = head.find(L'%') != std::wstring_view::npos;
+    for (const std::wstring_view known : kPlaces) {
+        place = place || (head.size() == known.size() &&
+                          std::equal(head.begin(), head.end(), known.begin(),
+                                     [](wchar_t a, wchar_t b) { return std::towlower(a) == std::towlower(b); }));
+    }
+    if (place) {
+        return true;
+    }
+    // A command is not a path: its first word has to carry a separator (git add src/a.cpp does not).
+    if (head.find(L' ') != std::wstring_view::npos) {
+        return false;
+    }
+    // Elsewhere a file's name has an extension: the last part, :12 or :12:5 cut off, ends in .ext
+    std::wstring_view name = text.substr(text.find_last_of(L"\\/") + 1);
+    for (int i = 0; i < 2; ++i) {
+        const size_t colon = name.find_last_of(L':');
+        if (colon != std::wstring_view::npos && colon + 1 < name.size() &&
+            name.find_first_not_of(L"0123456789", colon + 1) == std::wstring_view::npos) {
+            name = name.substr(0, colon);
+        }
+    }
+    const size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring_view::npos || dot + 1 >= name.size() || name.size() - dot - 1 > 10) {
+        return false;
+    }
+    return std::ranges::all_of(name.substr(dot + 1), [](wchar_t c) { return std::iswalnum(c) != 0; });
 }
 
 MdText ParseMarkdown(std::wstring_view source, size_t tableWidth) {

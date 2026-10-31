@@ -164,11 +164,30 @@ int main() {
                 urls.push_back(span.url);
             }
         }
-        Expect(urls.size() == 2 && urls[0] == L"C:\\Users\\me\\page.html" && urls[1] == L"D:\\work\\a.txt",
-               "paths become links, relative ones and words with a colon do not", std::to_string(urls.size()));
+        Expect(urls.size() == 3 && urls[0] == L"C:\\Users\\me\\page.html" && urls[1] == L"D:\\work\\a.txt" &&
+                   urls[2] == L"src\\a.cpp",
+               "paths become links (a drive-less one in code only as a guess), words with a colon do not",
+               std::to_string(urls.size()));
         Expect(Find(md, aic::kMdCode) != nullptr, "a path in code stays code too");
         Expect(aic::IsLocalPath(L"\\\\nas\\share") && aic::IsLocalPath(L"c:/x") && !aic::IsLocalPath(L"http://x"),
                "what a local path is");
+    }
+    {
+        using aic::IsRelativePath;
+        Expect(IsRelativePath(L"Desktop\\packetlab-подписка.txt") && IsRelativePath(L"src/app/a.cpp:12:5") &&
+                   IsRelativePath(L"~\\x") && IsRelativePath(L".\\run.bat") && IsRelativePath(L"%APPDATA%\\AIControls") &&
+                   IsRelativePath(L"Desktop\\my file.txt") && IsRelativePath(L"Рабочий стол\\заметка"),
+               "relative paths");
+        Expect(!IsRelativePath(L"git add src/a.cpp") && !IsRelativePath(L"a.txt") && !IsRelativePath(L"/etc/hosts") &&
+                   !IsRelativePath(L"https://x.y/z.html") && !IsRelativePath(L"and/or") && !IsRelativePath(L"C:\\a\\b.txt") &&
+                   !IsRelativePath(L"--flag=a/b.c"),
+               "not paths: commands, bare names, unix roots, addresses, words");
+        const auto md = ParseMarkdown(L"in `Desktop\\a.txt` and `git add src/a.cpp`");
+        size_t relative = 0;
+        for (const aic::MdSpan& span : md.spans) {
+            relative += (span.flags & aic::kMdRelative) != 0 && span.url == L"Desktop\\a.txt";
+        }
+        Expect(relative == 1, "a relative path in code is marked a guess", std::to_string(relative));
     }
     std::cout << (failures == 0 ? "all passed\n" : "FAILED\n");
     return failures == 0 ? 0 : 1;

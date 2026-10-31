@@ -18,6 +18,7 @@ enum MdFlag : unsigned {
     kMdHeading = 32,
     kMdToken = 64,   // a colored part of a fenced block (see MdSpan::token)
     kMdTable = 128,  // with kMdCode and block: a table, aligned in the code font
+    kMdRelative = 256,  // with kMdLink: a path without a drive, a guess until the app finds the file (see IsRelativePath)
 };
 
 struct MdSpan {
@@ -32,6 +33,10 @@ struct MdSpan {
 
 // A path on this computer: C:\..., C:/... or \\server\share. Such `code` and bare ones become links to the file.
 bool IsLocalPath(std::wstring_view text);
+
+// `code` that may name a file without a drive: Desktop\a.txt, src/a.cpp:12, ~\x, .\x, %APPDATA%\x. Only a guess:
+// the parser marks such code kMdRelative, and the app drops the link unless a file is found by that name.
+bool IsRelativePath(std::wstring_view text);
 
 // The text to show, without the markup, and how its runs are styled.
 struct MdText {

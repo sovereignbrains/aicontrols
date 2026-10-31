@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -391,8 +392,15 @@ bool Relay(SOCKET client, SOCKET upstream) {
     }
 }
 
+// An IPv4 address, network order, that is no public one (LocalTarget).
+bool LocalV4(const uint8_t* a) {
+    return a[0] == 0 || a[0] == 10 || a[0] == 127 || a[0] >= 224 || (a[0] == 100 && (a[1] & 0xc0) == 64) ||
+           (a[0] == 169 && a[1] == 254) || (a[0] == 172 && (a[1] & 0xf0) == 16) || (a[0] == 192 && a[1] == 168);
+}
+
 // One CLI connection: "CONNECT host:443 HTTP/1.1", the only request a CLI sends a proxy for an https:// API, then
-// the bytes both ways. Other ports are refused: this is no open proxy for whatever runs on the computer.
+// the bytes both ways. Other ports and local targets are refused: this is no open proxy for whatever runs on the
+// computer, and no way into a network - the local one, or the SSH server's.
 void Serve(SOCKET client) {
     SetReceiveTimeout(client, 15000);
     std::string buffer;
@@ -422,6 +430,11 @@ void Serve(SOCKET client) {
     }
     if (line.substr(0, space) != "CONNECT" || host.empty() || port != 443) {
         SendAll(client, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        closesocket(client);
+        return;
+    }
+    if (LocalTarget(host)) {  // at once: trying the ways out first would cost seconds, and could start a tunnel
+        SendAll(client, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         closesocket(client);
         return;
     }
@@ -486,6 +499,47 @@ std::wstring BridgeUrl() {
 
 void BridgeWithoutDirect() {
     g_withoutDirect = true;
+}
+
+bool LocalTarget(std::string_view host) {
+    std::string name(host.substr(0, host.find('%')));  // fe80::1%3: the zone is no part of the address
+    std::ranges::transform(name, name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    while (!name.empty() && name.back() == '.') {
+        name.pop_back();
+    }
+    in_addr v4{};
+    if (InetPtonA(AF_INET, name.c_str(), &v4) == 1) {
+        // 010.0.0.1 is 8.0.0.1 to some resolvers: only the usual spelling is the address it looks like.
+        std::array<char, INET_ADDRSTRLEN> usual{};
+        return LocalV4(reinterpret_cast<const uint8_t*>(&v4)) ||
+               InetNtopA(AF_INET, &v4, usual.data(), usual.size()) == nullptr || name != usual.data();
+    }
+    in6_addr v6{};
+    if (InetPtonA(AF_INET6, name.c_str(), &v6) == 1) {
+        const uint8_t* b = v6.u.Byte;
+        const auto zero = [](uint8_t x) { return x == 0; };
+        // ::a.b.c.d (and so :: and ::1), ::ffff:a.b.c.d, NAT64's 64:ff9b::a.b.c.d
+        const bool v4Inside =
+            (std::all_of(b, b + 10, zero) && ((b[10] == 0 && b[11] == 0) || (b[10] == 0xff && b[11] == 0xff))) ||
+            (b[0] == 0 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b && std::all_of(b + 4, b + 12, zero));
+        // fc00::/7 unique local, ff00::/8 multicast, fe80::/10 link-local and fec0::/10 site-local
+        return (v4Inside && LocalV4(b + 12)) || (b[0] & 0xfe) == 0xfc || b[0] == 0xff ||
+               (b[0] == 0xfe && (b[1] & 0x80) != 0);
+    }
+    const size_t dot = name.rfind('.');
+    if (dot == std::string::npos) {
+        return true;  // one label: localhost, the router, a LAN's own names; 2130706433
+    }
+    // An address in a resolver's loose forms ends in a number: 127.1, 0x7f.1, 1.0x2
+    const std::string_view last = std::string_view(name).substr(dot + 1);
+    if (last.empty() || last.starts_with("0x") ||
+        std::ranges::all_of(last, [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        return true;
+    }
+    constexpr std::array<std::string_view, 7> kLocal = {".localhost", ".local", ".lan", ".home", ".home.arpa",
+                                                        ".internal", ".intranet"};
+    const std::string dotted = "." + name;
+    return std::ranges::any_of(kLocal, [&](std::string_view suffix) { return dotted.ends_with(suffix); });
 }
 
 }  // namespace aic

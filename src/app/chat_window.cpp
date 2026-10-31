@@ -11854,7 +11854,7 @@ void ChatWindow::FillGallery() {
     grokCard("image_gen", Json{{"prompt", "картинку уже убрали с диска"}},
              L"{\"type\":\"ImageGen\",\"path\":\"C:\\\\no\\\\such\\\\1.jpg\"}", false);
     Add(Kind::Assistant, L"Скриншот: `C:\\Users\\user\\gallery1.png` и PDF `C:\\Users\\user\\a.pdf`, страница `C:\\Users\\user\\a.html`.");
-    Add(Kind::Assistant, L"Без диска: настройки лежат в `AppData\\Roaming\\AIControls\\settings.json` (ссылка, если файл есть), а `Desktop\\нет-такого.txt` и `git add src/a.cpp` — просто код.");
+    Add(Kind::Assistant, L"Без диска: настройки лежат в `AppData\\Roaming\\AIControls\\settings.json` (ссылка, если файл есть), а `Desktop\\нет-такого.txt` и `git add src/a.cpp` — просто код. Голый путь в тексте: AppData\\Roaming\\AIControls\\settings.json.");
     Add(Kind::Assistant, L"Финальный короткий ответ.");
     feed_[2].who = L"Claude Opus 5.5";  // the first answer of a turn is signed: one of each agent
     Add(Kind::User, L"А у тебя так же?");

@@ -188,6 +188,16 @@ int main() {
             relative += (span.flags & aic::kMdRelative) != 0 && span.url == L"Desktop\\a.txt";
         }
         Expect(relative == 1, "a relative path in code is marked a guess", std::to_string(relative));
+        const auto bare = ParseMarkdown(L"see Desktop\\a.txt, then ~/x/b.md. Also and/or, 3.5 and v1.2/readme here (src\\c.cpp:7).");
+        std::vector<std::wstring> guesses;
+        for (const aic::MdSpan& span : bare.spans) {
+            if ((span.flags & aic::kMdRelative) != 0) {
+                guesses.push_back(span.url);
+            }
+        }
+        Expect(guesses.size() == 3 && guesses[0] == L"Desktop\\a.txt" && guesses[1] == L"~/x/b.md" &&
+                   guesses[2] == L"src\\c.cpp:7",
+               "bare relative paths are guesses too", std::to_string(guesses.size()));
     }
     std::cout << (failures == 0 ? "all passed\n" : "FAILED\n");
     return failures == 0 ? 0 : 1;

@@ -149,6 +149,21 @@ void Inline(std::wstring_view s, MdText& out) {
                 continue;
             }
         }
+        if ((std::iswalpha(c) != 0 || c == L'~' || c == L'.' || c == L'%') && (i == 0 || !IsWordChar(s[i - 1])) &&
+            (i == 0 || std::wstring_view(L"\\/:.%~").find(s[i - 1]) == std::wstring_view::npos)) {
+            size_t end = i;  // a bare path without a drive: the same, and only a guess until a file is found
+            while (end < s.size() && !IsSpace(s[end]) && std::wstring_view(L"<>\"|*?=`").find(s[end]) == std::wstring_view::npos) {
+                ++end;
+            }
+            while (end > i + 3 && std::wstring_view(L".,;:!?')*]").find(s[end - 1]) != std::wstring_view::npos) {
+                --end;
+            }
+            if (end > i + 3 && IsRelativePath(s.substr(i, end - i))) {
+                styled(s.substr(i, end - i), kMdLink | kMdRelative, false, s.substr(i, end - i));
+                i = end;
+                continue;
+            }
+        }
         out.text += c;
         ++i;
     }
